@@ -212,7 +212,7 @@ pub fn list() -> Value {
                 },
                 "required": []
             },
-            "annotations": { "readOnlyHint": true, "destructiveHint": false }
+            "annotations": { "readOnlyHint": false, "destructiveHint": false }
         },
         {
             "name": "cargo_check",
@@ -1191,6 +1191,9 @@ fn call_update(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
     let mut argv: Vec<&str> = vec!["update"];
     let pkg = opt_str(args, "package").map(String::from);
     let precise = opt_str(args, "precise").map(String::from);
+    if precise.is_some() && pkg.is_none() {
+        return Err("`precise` requires `package` — specify the crate name to pin".into());
+    }
     if let Some(ref p) = pkg {
         argv.push("--package");
         argv.push(p);

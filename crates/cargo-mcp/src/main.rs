@@ -26,11 +26,11 @@ use serde_json::Value;
 /// Controls how the server handles suggestions that need human approval.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ElicitationMode {
-    /// Present a multi-select form to the user (default).
+    /// Present a multi-select form to the user.
     Prompt,
     /// Automatically accept all suggestions without prompting.
     AlwaysAccept,
-    /// Automatically skip all suggestions without prompting.
+    /// Automatically skip all suggestions without prompting (default).
     AlwaysSkip,
 }
 

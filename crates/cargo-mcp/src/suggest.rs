@@ -80,6 +80,13 @@ pub struct Suggestion {
     pub replacement: Option<String>,
     /// Span of the text to replace (only present when `replacement` is `Some`).
     pub replacement_span: Option<Span>,
+    /// All replacement spans for this suggestion.
+    ///
+    /// When this has more than one entry the spans form a multi-span suggestion
+    /// that must be applied atomically. `replacement` and `replacement_span`
+    /// point to the first span for backward compatibility with single-span
+    /// display code.
+    pub replacements: Vec<SpanReplacement>,
     /// Trust level of this suggestion.
     pub applicability: Applicability,
 }
@@ -92,6 +99,18 @@ pub struct Span {
     pub line_end: usize,
     pub column_start: usize,
     pub column_end: usize,
+}
+
+/// A single replacement action within a multi-span suggestion.
+///
+/// Multi-span suggestions contain several [`SpanReplacement`]s that must be
+/// applied atomically; applying only a subset leaves the source invalid.
+#[derive(Debug, Clone)]
+pub struct SpanReplacement {
+    /// The source location to replace.
+    pub span: Span,
+    /// Text to write into the span (empty string = deletion).
+    pub text: String,
 }
 
 /// Parse NDJSON output and return all actionable suggestions.
@@ -218,12 +237,22 @@ fn try_extract_from_span(
         column_start,
         replacement: Some(replacement.to_owned()),
         replacement_span: Some(Span {
-            file,
+            file: file.clone(),
             line_start,
             line_end,
             column_start,
             column_end,
         }),
+        replacements: vec![SpanReplacement {
+            span: Span {
+                file,
+                line_start,
+                line_end,
+                column_start,
+                column_end,
+            },
+            text: replacement.to_owned(),
+        }],
         applicability,
     })
 }
@@ -233,6 +262,12 @@ fn try_extract_from_span(
 /// Children often carry the actual suggested replacement while the parent has
 /// the high-level message. We use the child's message but fall back to the
 /// parent code/level if the child doesn't have them.
+///
+/// A single child may carry multiple spans that together form one atomic
+/// suggestion (e.g. a rename that must touch both ends of a pair). We collect
+/// all replacement spans into a single [`Suggestion`] so they are presented as
+/// one unit and must be applied together. Splitting them into separate
+/// suggestions and applying only some would leave the source invalid.
 fn collect_from_child(
     child: &Value,
     parent_message: &str,
@@ -257,16 +292,69 @@ fn collect_from_child(
         .unwrap_or(parent_level);
 
     if let Some(spans) = child.get("spans").and_then(|v| v.as_array()) {
+        // Collect all replacement spans for this child into a single Suggestion.
+        let mut replacements: Vec<SpanReplacement> = Vec::new();
+        let mut applicability_opt: Option<Applicability> = None;
+
         for span in spans {
-            if let Some(suggestion) = try_extract_from_span(
-                span,
-                child_message,
-                &child_code,
-                child_level,
-                origin_message,
-            ) {
-                out.push(suggestion);
+            let replacement_text = match span.get("suggested_replacement").and_then(|v| v.as_str())
+            {
+                Some(t) => t,
+                None => continue,
+            };
+            let applicability_str = span
+                .get("suggestion_applicability")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Unspecified");
+            let applicability = match Applicability::from_str(applicability_str) {
+                Some(a) => a,
+                None => continue,
+            };
+            let file = span
+                .get("file_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_owned();
+            let line_start = span.get("line_start").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            let line_end = span.get("line_end").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            let column_start = span
+                .get("column_start")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as usize;
+            let column_end = span.get("column_end").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+
+            if applicability_opt.is_none() {
+                applicability_opt = Some(applicability);
             }
+            replacements.push(SpanReplacement {
+                span: Span {
+                    file,
+                    line_start,
+                    line_end,
+                    column_start,
+                    column_end,
+                },
+                text: replacement_text.to_owned(),
+            });
+        }
+
+        if !replacements.is_empty() {
+            let applicability = applicability_opt.unwrap();
+            let first = &replacements[0];
+            out.push(Suggestion {
+                id: 0, // assigned later
+                message: child_message.to_owned(),
+                parent_message: origin_message.to_owned(),
+                code: child_code.clone(),
+                level: child_level.to_owned(),
+                file: first.span.file.clone(),
+                line_start: first.span.line_start,
+                column_start: first.span.column_start,
+                replacement: Some(first.text.clone()),
+                replacement_span: Some(first.span.clone()),
+                replacements,
+                applicability,
+            });
         }
     }
 
@@ -343,7 +431,8 @@ pub fn format_numbered_list(suggestions: &[Suggestion]) -> String {
             } else if repl.len() <= 80 {
                 format!("     replacement: {repl:?}")
             } else {
-                format!("     replacement: {:?}...", &repl[..77])
+                let truncated: String = repl.chars().take(77).collect();
+                format!("     replacement: {truncated:?}...")
             };
             buf.push_str(&display);
             buf.push('\n');
@@ -422,6 +511,7 @@ mod tests {
             column_start: 5,
             replacement: Some(String::new()),
             replacement_span: None,
+            replacements: vec![],
             applicability: Applicability::MachineApplicable,
         };
         let label = suggestion_label(&s);
@@ -442,6 +532,7 @@ mod tests {
             column_start: 20,
             replacement: Some(",".into()),
             replacement_span: None,
+            replacements: vec![],
             applicability: Applicability::MachineApplicable,
         };
         let label = suggestion_label(&s);
@@ -464,6 +555,7 @@ mod tests {
                 column_start: 1,
                 replacement: Some("fix_a".into()),
                 replacement_span: None,
+                replacements: vec![],
                 applicability: Applicability::MachineApplicable,
             },
             Suggestion {
@@ -477,6 +569,7 @@ mod tests {
                 column_start: 3,
                 replacement: None,
                 replacement_span: None,
+                replacements: vec![],
                 applicability: Applicability::MaybeIncorrect,
             },
         ];
@@ -518,6 +611,7 @@ mod tests {
             column_start: 1,
             replacement: Some(String::new()),
             replacement_span: None,
+            replacements: vec![],
             applicability: Applicability::MachineApplicable,
         };
         let text = format_numbered_list(&[s]);
@@ -610,6 +704,7 @@ mod tests {
             column_start: 1,
             replacement: Some("x".into()),
             replacement_span: None,
+            replacements: vec![],
             applicability: Applicability::MaybeIncorrect,
         };
         let label = suggestion_label(&s);
@@ -630,6 +725,7 @@ mod tests {
             column_start: 1,
             replacement: Some("y".into()),
             replacement_span: None,
+            replacements: vec![],
             applicability: Applicability::MachineApplicable,
         };
         let label = suggestion_label(&s);
@@ -694,6 +790,7 @@ mod tests {
             column_start: 5,
             replacement: Some("map_or_else(...)".into()),
             replacement_span: None,
+            replacements: vec![],
             applicability: Applicability::MaybeIncorrect,
         };
         let label = elicitation_label(&s);
@@ -717,6 +814,7 @@ mod tests {
             column_start: 5,
             replacement: Some(String::new()),
             replacement_span: None,
+            replacements: vec![],
             applicability: Applicability::MachineApplicable,
         };
         let label = elicitation_label(&s);
@@ -740,6 +838,7 @@ mod tests {
             column_start: 1,
             replacement: Some("T".into()),
             replacement_span: None,
+            replacements: vec![],
             applicability: Applicability::HasPlaceholders,
         };
         let label = elicitation_label(&s);

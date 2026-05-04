@@ -24,7 +24,7 @@ The extension bundles the pre-built `cargo-mcp` binary and registers the MCP ser
 automatically. No manual configuration is needed — Copilot Chat will discover the
 tools as soon as the extension activates.
 
-> **Requires:** VS Code 1.99 or later and GitHub Copilot Chat.
+> **Requires:** VS Code 1.101 or later and GitHub Copilot Chat.
 
 ---
 
@@ -141,6 +141,12 @@ per line). Tools without a stable JSON mode return plain text.
 | `cargo_tree` | text | no | Dependency tree (use `cargo_metadata` for structured data) |
 | `cargo_doc` | NDJSON | yes | Build HTML documentation; returns build warnings |
 | `cargo_clean` | text | yes | Remove build artefacts (destructive) |
+| `cargo_update` | text | yes | Update Cargo.lock to latest compatible versions |
+| `cargo_fix` | text | yes | Auto-apply compiler and Clippy machine-applicable fixes |
+| `cargo_add` | text | yes | Add a dependency to Cargo.toml |
+| `cargo_remove` | text | yes | Remove a dependency from Cargo.toml |
+| `cargo_publish` | text | yes | Package and upload to crates.io (irreversible — use `dry_run: true` first) |
+| `cargo_setup` | text | no | Return the canonical cargo-mcp instruction text for Copilot setup |
 
 ### Common parameters
 

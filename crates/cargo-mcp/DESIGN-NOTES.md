@@ -116,9 +116,9 @@ that need human approval. Three modes are supported:
 
 | Mode | Behaviour |
 |---|---|
-| `prompt` (default) | Present a multi-select form to the user |
+| `always-skip` (default) | Automatically skip all suggestions without prompting |
+| `prompt` | Present a multi-select form to the user |
 | `always-accept` | Automatically accept all suggestions without prompting |
-| `always-skip` | Automatically skip all suggestions without prompting |
 
 The mode is parsed at startup and applies to all `tools/call` invocations for the
 lifetime of the server. It requires the client to support elicitation (`prompt` and

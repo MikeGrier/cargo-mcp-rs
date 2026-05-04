@@ -87,12 +87,17 @@ jobs:
           # we'd publish an extension whose advertised version disagrees with
           # the tag the operator pushed. `github.ref_name` is the tag name
           # (e.g. `cargo-mcp-v0.1.0`) on a tag push.
+          #
+          # For `workflow_dispatch` the ref is not a tag, so we reject it here
+          # to prevent accidentally publishing from an untagged commit.
           $tag = "${{ github.ref_name }}"
-          if ($tag -like "cargo-mcp-v*") {
-              $tagVer = $tag.Substring("cargo-mcp-v".Length)
-              if ($tagVer -ne $ver) {
-                  throw "Tag '$tag' implies version '$tagVer' but Cargo.toml has '$ver'. Bump the crate, retag, and try again."
-              }
+          if ($tag -notlike "cargo-mcp-v*") {
+              throw "Publishing requires a 'cargo-mcp-v*' tag but the current ref is '$tag'. " +
+                    "Push a tag (e.g. 'cargo-mcp-v$ver') instead of using workflow_dispatch from a branch."
+          }
+          $tagVer = $tag.Substring("cargo-mcp-v".Length)
+          if ($tagVer -ne $ver) {
+              throw "Tag '$tag' implies version '$tagVer' but Cargo.toml has '$ver'. Bump the crate, retag, and try again."
           }
           Set-Content -NoNewline -Encoding ascii `
               -Path crates/cargo-mcp/extension/bin/VERSION -Value $ver

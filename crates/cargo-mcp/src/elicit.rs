@@ -79,6 +79,28 @@ enum GroupedSelection {
 /// without hitting the dialog close button.
 const SKIP_ALL_CONST: &str = "skip:all";
 
+/// Send a `notifications/message` log entry over the JSON-RPC writer.
+///
+/// Using the MCP notification channel instead of `eprintln!` ensures VS Code
+/// displays the message at the correct severity level in the server output
+/// channel rather than tagging every line as `[warning]`.
+fn send_log_notification(writer: &mut impl Write, level: &str, message: &str) {
+    let msg = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/message",
+        "params": {
+            "level": level,
+            "logger": "cargo-mcp",
+            "data": message,
+        }
+    });
+    if let Ok(mut s) = serde_json::to_string(&msg) {
+        s.push('\n');
+        let _ = writer.write_all(s.as_bytes());
+        let _ = writer.flush();
+    }
+}
+
 /// Build a `TitledMultiSelectEnumSchema` for the given suggestions.
 ///
 /// Each suggestion becomes a selectable option with:
@@ -126,7 +148,7 @@ fn build_elicit_request(request_id: u64, suggestions: &[Suggestion]) -> Value {
         "method": "elicitation/create",
         "params": {
             "message": format!(
-                "Clippy found {} suggestion(s) that need human review. \
+                "Cargo found {} suggestion(s) that need human review. \
                  Safe, machine-verified fixes were already reported. \
                  Check the ones you\u{2019}d like applied:",
                 suggestions.len()
@@ -289,7 +311,7 @@ fn build_grouped_elicit_request(
         "method": "elicitation/create",
         "params": {
             "message": format!(
-                "Clippy found {} suggestion(s) that need human review{mode_desc}. \
+                "Cargo found {} suggestion(s) that need human review{mode_desc}. \
                  Safe, machine-verified fixes were already reported. \
                  Check the ones you\u{2019}d like applied:",
                 suggestions.len()
@@ -320,6 +342,12 @@ fn parse_grouped_response(
         if *s == "view:by-path" {
             return GroupedSelection::ModeSwitch(GroupMode::ByPath);
         }
+    }
+
+    // If the user chose "skip all", return an empty selection immediately
+    // rather than falling through to ID expansion.
+    if selected.contains(&SKIP_ALL_CONST) {
+        return GroupedSelection::Selected(Vec::new());
     }
 
     let groups = match mode {
@@ -400,9 +428,13 @@ fn elicit_grouped(
 
         match parse_grouped_response(&str_refs, suggestions, mode) {
             GroupedSelection::ModeSwitch(new_mode) => {
-                eprintln!(
-                    "cargo-mcp: user switched elicitation view to {:?}",
-                    new_mode
+                send_log_notification(
+                    writer,
+                    "info",
+                    &format!(
+                        "cargo-mcp: user switched elicitation view to {:?}",
+                        new_mode
+                    ),
                 );
                 mode = new_mode;
                 continue;
@@ -449,7 +481,11 @@ fn send_and_read_strings(
     let mut payload = match serde_json::to_string(request) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("cargo-mcp: elicitation serialization error: {e}");
+            send_log_notification(
+                writer,
+                "warning",
+                &format!("cargo-mcp: elicitation serialization error: {e}"),
+            );
             return None;
         }
     };
@@ -465,9 +501,13 @@ fn send_and_read_strings(
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            eprintln!(
-                "cargo-mcp: elicitation timed out after {}s — declining automatically",
-                ELICITATION_TIMEOUT.as_secs()
+            send_log_notification(
+                writer,
+                "warning",
+                &format!(
+                    "cargo-mcp: elicitation timed out after {}s — declining automatically",
+                    ELICITATION_TIMEOUT.as_secs()
+                ),
             );
             send_cancel_notification(writer, expected_id);
             return None;
@@ -476,9 +516,13 @@ fn send_and_read_strings(
         let line = match reader.read_line_timeout(remaining) {
             Some(l) => l,
             None => {
-                eprintln!(
-                    "cargo-mcp: elicitation timed out after {}s — declining automatically",
-                    ELICITATION_TIMEOUT.as_secs()
+                send_log_notification(
+                    writer,
+                    "warning",
+                    &format!(
+                        "cargo-mcp: elicitation timed out after {}s — declining automatically",
+                        ELICITATION_TIMEOUT.as_secs()
+                    ),
                 );
                 send_cancel_notification(writer, expected_id);
                 return None;
@@ -497,11 +541,19 @@ fn send_and_read_strings(
 
         let msg_id = msg.get("id").and_then(|v| v.as_str());
         if msg_id != Some(expected_id) {
-            eprintln!(
-                "cargo-mcp: ignoring message while waiting for elicitation response: {}",
-                msg.get("method")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("(response)")
+            // A message for a different request arrived while waiting for the
+            // elicitation response. We cannot re-queue it into the shared
+            // LineReader, so we forward it as an info-level log notification
+            // to preserve visibility rather than silently dropping it.
+            send_log_notification(
+                writer,
+                "info",
+                &format!(
+                    "cargo-mcp: received unrelated message while waiting for elicitation response: {}",
+                    msg.get("method")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("(response)")
+                ),
             );
             continue;
         }
@@ -509,7 +561,11 @@ fn send_and_read_strings(
         let result = match msg.get("result") {
             Some(r) => r,
             None => {
-                eprintln!("cargo-mcp: elicitation request returned error");
+                send_log_notification(
+                    writer,
+                    "warning",
+                    "cargo-mcp: elicitation request returned error",
+                );
                 return None;
             }
         };
@@ -545,6 +601,11 @@ fn send_and_read_raw(
     expected_id: &str,
 ) -> Option<Vec<usize>> {
     let strings = send_and_read_strings(reader, writer, request, expected_id)?;
+    // If the user chose "skip all", return an empty selection rather than
+    // falling through to numeric parsing (which would silently discard it).
+    if strings.contains(&SKIP_ALL_CONST.to_owned()) {
+        return Some(Vec::new());
+    }
     let ids: Vec<usize> = strings
         .iter()
         .filter_map(|s| s.parse::<usize>().ok())
@@ -570,7 +631,28 @@ pub fn format_selected_summary(selected: &[Suggestion]) -> String {
     let mut buf = format!("{} suggestion(s) selected:\n\n", selected.len());
     for s in selected {
         buf.push_str(&format!("{}. {}\n", s.id, suggest::suggestion_label(s)));
-        if let (Some(repl), Some(span)) = (&s.replacement, &s.replacement_span) {
+        if s.replacements.len() > 1 {
+            buf.push_str(&format!(
+                "   Multi-span fix ({} locations — apply all atomically):\n",
+                s.replacements.len()
+            ));
+            for (k, r) in s.replacements.iter().enumerate() {
+                buf.push_str(&format!(
+                    "   ({}) {} lines {}-{}, cols {}-{}: {}\n",
+                    k + 1,
+                    r.span.file,
+                    r.span.line_start,
+                    r.span.line_end,
+                    r.span.column_start,
+                    r.span.column_end,
+                    if r.text.is_empty() {
+                        "(remove text)".to_owned()
+                    } else {
+                        format!("{:?}", r.text)
+                    },
+                ));
+            }
+        } else if let (Some(repl), Some(span)) = (&s.replacement, &s.replacement_span) {
             buf.push_str(&format!(
                 "   File: {} lines {}-{}, columns {}-{}\n",
                 span.file, span.line_start, span.line_end, span.column_start, span.column_end,
@@ -615,6 +697,16 @@ mod tests {
                     column_start: 1,
                     column_end: 5,
                 }),
+                replacements: vec![crate::suggest::SpanReplacement {
+                    span: crate::suggest::Span {
+                        file: format!("src/f{i}.rs"),
+                        line_start: i * 10,
+                        line_end: i * 10,
+                        column_start: 1,
+                        column_end: 5,
+                    },
+                    text: format!("fix_{i}"),
+                }],
                 applicability: crate::suggest::Applicability::MachineApplicable,
             })
             .collect()
@@ -827,6 +919,7 @@ mod tests {
                     column_start: 1,
                     replacement: Some(format!("fix_{id}")),
                     replacement_span: None,
+                    replacements: vec![],
                     applicability: crate::suggest::Applicability::MaybeIncorrect,
                 });
                 id += 1;
@@ -844,6 +937,7 @@ mod tests {
                 column_start: 1,
                 replacement: Some(format!("solo_fix_{id}")),
                 replacement_span: None,
+                replacements: vec![],
                 applicability: crate::suggest::Applicability::MaybeIncorrect,
             });
             id += 1;
@@ -892,6 +986,7 @@ mod tests {
                 column_start: 1,
                 replacement: None,
                 replacement_span: None,
+                replacements: vec![],
                 applicability: crate::suggest::Applicability::MaybeIncorrect,
             });
             id += 1;
@@ -908,6 +1003,7 @@ mod tests {
                 column_start: 1,
                 replacement: None,
                 replacement_span: None,
+                replacements: vec![],
                 applicability: crate::suggest::Applicability::MaybeIncorrect,
             });
             id += 1;
@@ -923,6 +1019,7 @@ mod tests {
             column_start: 1,
             replacement: None,
             replacement_span: None,
+            replacements: vec![],
             applicability: crate::suggest::Applicability::MaybeIncorrect,
         });
         let groups = group_by_lint(&suggestions);
@@ -949,6 +1046,7 @@ mod tests {
                 column_start: 1,
                 replacement: None,
                 replacement_span: None,
+                replacements: vec![],
                 applicability: crate::suggest::Applicability::MaybeIncorrect,
             },
             Suggestion {
@@ -962,6 +1060,7 @@ mod tests {
                 column_start: 1,
                 replacement: None,
                 replacement_span: None,
+                replacements: vec![],
                 applicability: crate::suggest::Applicability::MaybeIncorrect,
             },
         ];
@@ -988,6 +1087,7 @@ mod tests {
                 column_start: 1,
                 replacement: None,
                 replacement_span: None,
+                replacements: vec![],
                 applicability: crate::suggest::Applicability::MaybeIncorrect,
             },
             Suggestion {
@@ -1001,6 +1101,7 @@ mod tests {
                 column_start: 1,
                 replacement: None,
                 replacement_span: None,
+                replacements: vec![],
                 applicability: crate::suggest::Applicability::MaybeIncorrect,
             },
             Suggestion {
@@ -1014,6 +1115,7 @@ mod tests {
                 column_start: 1,
                 replacement: None,
                 replacement_span: None,
+                replacements: vec![],
                 applicability: crate::suggest::Applicability::MaybeIncorrect,
             },
         ];
@@ -1231,6 +1333,7 @@ mod tests {
                 column_start: 1,
                 replacement: None,
                 replacement_span: None,
+                replacements: vec![],
                 applicability: crate::suggest::Applicability::MaybeIncorrect,
             },
             Suggestion {
@@ -1244,6 +1347,7 @@ mod tests {
                 column_start: 1,
                 replacement: None,
                 replacement_span: None,
+                replacements: vec![],
                 applicability: crate::suggest::Applicability::MaybeIncorrect,
             },
         ];
@@ -1341,9 +1445,14 @@ mod tests {
         let ids = elicit_selection(&reader, &mut writer, &suggestions);
         assert_eq!(ids, Some(vec![4, 5]));
 
-        // Two requests should have been written.
+        // Two elicitation requests should have been written (log notifications
+        // from send_log_notification may also appear but are not counted).
         let written = String::from_utf8(writer).unwrap();
-        let requests: Vec<&str> = written.trim().split('\n').collect();
+        let requests: Vec<&str> = written
+            .trim()
+            .split('\n')
+            .filter(|l| l.contains("\"elicitation/create\""))
+            .collect();
         assert_eq!(requests.len(), 2, "expected 2 requests for mode switch");
         // First request: by-lint (default), switch entry = view:by-path.
         assert!(requests[0].contains("view:by-path"));

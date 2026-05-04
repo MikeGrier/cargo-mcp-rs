@@ -40,7 +40,7 @@ $Patterns = @(
 $TextExtensions = @(
     '.rs', '.toml', '.md', '.txt', '.json', '.yaml', '.yml',
     '.ps1', '.psm1', '.psd1', '.sh', '.cfg', '.ini', '.ts',
-    '.gitignore', '.gitattributes', '.vscodeignore'
+    '.lock', '.gitignore', '.gitattributes', '.vscodeignore'
 )
 
 function Test-IsTextFile([string]$file) {

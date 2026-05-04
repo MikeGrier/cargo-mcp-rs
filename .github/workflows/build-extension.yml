@@ -12,10 +12,14 @@ on:
     paths:
       - "crates/cargo-mcp/**"
       - ".github/workflows/build-extension.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
   pull_request:
     paths:
       - "crates/cargo-mcp/**"
       - ".github/workflows/build-extension.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
   workflow_dispatch:
 
 permissions:
