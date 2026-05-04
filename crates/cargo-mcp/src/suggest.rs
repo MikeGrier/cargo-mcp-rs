@@ -173,14 +173,73 @@ fn collect_suggestions_from_message(msg: &Value, out: &mut Vec<Suggestion>) {
         .and_then(|v| v.as_str())
         .map(|s| s.to_owned());
 
-    // Check the primary span and all spans for suggestions.
+    // Collect all root-level replacement spans into a single Suggestion.
+    // Rustc can represent a single multipart fix as several root spans with
+    // suggested_replacement; splitting them into separate Suggestions would
+    // let the caller apply only part of the fix and leave the source invalid.
     if let Some(spans) = msg.get("spans").and_then(|v| v.as_array()) {
+        let mut replacements: Vec<SpanReplacement> = Vec::new();
+        let mut applicability_opt: Option<Applicability> = None;
+
         for span in spans {
-            if let Some(suggestion) =
-                try_extract_from_span(span, &message_text, &code, &level, &message_text)
-            {
-                out.push(suggestion);
+            let replacement_text =
+                match span.get("suggested_replacement").and_then(|v| v.as_str()) {
+                    Some(t) => t,
+                    None => continue,
+                };
+            let applicability_str = span
+                .get("suggestion_applicability")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Unspecified");
+            let applicability = match Applicability::from_str(applicability_str) {
+                Some(a) => a,
+                None => continue,
+            };
+            let file = span
+                .get("file_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_owned();
+            let line_start =
+                span.get("line_start").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            let line_end =
+                span.get("line_end").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            let column_start =
+                span.get("column_start").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            let column_end =
+                span.get("column_end").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            if applicability_opt.is_none() {
+                applicability_opt = Some(applicability);
             }
+            replacements.push(SpanReplacement {
+                span: Span {
+                    file,
+                    line_start,
+                    line_end,
+                    column_start,
+                    column_end,
+                },
+                text: replacement_text.to_owned(),
+            });
+        }
+
+        if !replacements.is_empty() {
+            let applicability = applicability_opt.unwrap();
+            let first = &replacements[0];
+            out.push(Suggestion {
+                id: 0, // assigned later
+                message: message_text.clone(),
+                parent_message: message_text.clone(),
+                code: code.clone(),
+                level: level.clone(),
+                file: first.span.file.clone(),
+                line_start: first.span.line_start,
+                column_start: first.span.column_start,
+                replacement: Some(first.text.clone()),
+                replacement_span: Some(first.span.clone()),
+                replacements,
+                applicability,
+            });
         }
     }
 
@@ -190,71 +249,6 @@ fn collect_suggestions_from_message(msg: &Value, out: &mut Vec<Suggestion>) {
             collect_from_child(child, &message_text, &code, &level, &message_text, out);
         }
     }
-}
-
-/// Try to extract a suggestion from a single span object.
-///
-/// `message` is the message from the closest enclosing diagnostic (child or root).
-/// `origin_message` is the root diagnostic message (more descriptive for child spans).
-fn try_extract_from_span(
-    span: &Value,
-    message: &str,
-    parent_code: &Option<String>,
-    parent_level: &str,
-    origin_message: &str,
-) -> Option<Suggestion> {
-    let replacement = span.get("suggested_replacement").and_then(|v| v.as_str())?;
-
-    let applicability_str = span
-        .get("suggestion_applicability")
-        .and_then(|v| v.as_str())
-        .unwrap_or("Unspecified");
-
-    // Only include suggestions that are reasonably safe to apply.
-    let applicability = Applicability::from_str(applicability_str)?;
-
-    let file = span
-        .get("file_name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_owned();
-    let line_start = span.get("line_start").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-    let line_end = span.get("line_end").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-    let column_start = span
-        .get("column_start")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as usize;
-    let column_end = span.get("column_end").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-
-    Some(Suggestion {
-        id: 0, // assigned later
-        message: message.to_owned(),
-        parent_message: origin_message.to_owned(),
-        code: parent_code.clone(),
-        level: parent_level.to_owned(),
-        file: file.clone(),
-        line_start,
-        column_start,
-        replacement: Some(replacement.to_owned()),
-        replacement_span: Some(Span {
-            file: file.clone(),
-            line_start,
-            line_end,
-            column_start,
-            column_end,
-        }),
-        replacements: vec![SpanReplacement {
-            span: Span {
-                file,
-                line_start,
-                line_end,
-                column_start,
-                column_end,
-            },
-            text: replacement.to_owned(),
-        }],
-        applicability,
-    })
 }
 
 /// Extract suggestions from a child diagnostic (e.g. "help:" messages).
@@ -865,6 +859,21 @@ mod tests {
         assert_eq!(suggestions.len(), 1);
         assert_eq!(suggestions[0].message, "root message");
         assert_eq!(suggestions[0].parent_message, "root message");
+    }
+
+    #[test]
+    fn root_multispan_forms_single_atomic_suggestion() {
+        // A rename fix that touches two locations: rustc emits both as root spans
+        // with suggested_replacement. They must be one atomic Suggestion, not two.
+        let ndjson = r#"{"reason":"compiler-message","package_id":"test","manifest_path":"test","target":{"kind":["lib"],"crate_types":["lib"],"name":"test","src_path":"src/lib.rs","edition":"2021","doc":true,"doctest":true,"test":true},"message":{"rendered":"warning\n","children":[],"code":{"code":"test_rename","explanation":null},"level":"warning","message":"rename foo to bar","spans":[{"byte_end":10,"byte_start":7,"column_end":4,"column_start":1,"expansion":null,"file_name":"src/lib.rs","is_primary":true,"label":null,"line_end":1,"line_start":1,"suggested_replacement":"bar","suggestion_applicability":"MachineApplicable","text":[]},{"byte_end":30,"byte_start":27,"column_end":4,"column_start":1,"expansion":null,"file_name":"src/lib.rs","is_primary":false,"label":null,"line_end":5,"line_start":5,"suggested_replacement":"bar","suggestion_applicability":"MachineApplicable","text":[]}]}}"#;
+        let suggestions = extract_suggestions(ndjson);
+        // Both spans belong to the same atomic rename — must be a single Suggestion.
+        assert_eq!(suggestions.len(), 1, "multipart root-span fix must not be split");
+        assert_eq!(suggestions[0].replacements.len(), 2);
+        // First replacement is from span 1 (line 1).
+        assert_eq!(suggestions[0].replacements[0].span.line_start, 1);
+        // Second replacement is from span 2 (line 5).
+        assert_eq!(suggestions[0].replacements[1].span.line_start, 5);
     }
 
     #[test]
