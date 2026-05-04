@@ -204,10 +204,11 @@ pub fn list() -> Value {
                     "output_file": {
                         "type": "string",
                         "description":
-                            "Absolute path to write the JSON output to. When provided, \
-                             the metadata is written to this file and a short confirmation \
-                             is returned instead of the full blob. Useful for large \
-                             workspaces where the output would be too large to inline."
+                            "Relative path (under the working directory) to write the JSON \
+                             output to. Absolute paths and '..' components are rejected. \
+                             When provided, the metadata is written to this file and a short \
+                             confirmation is returned instead of the full blob. Useful for \
+                             large workspaces where the output would be too large to inline."
                     }
                 },
                 "required": []
@@ -938,9 +939,15 @@ fn call_metadata(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
         .into());
     }
     if let Some(ref path) = output_file {
-        // Reject path traversal sequences — an AI agent could otherwise be
-        // tricked via prompt injection into overwriting arbitrary user files.
+        // Constrain to relative paths under the working directory — an AI agent
+        // could otherwise be tricked via prompt injection into overwriting
+        // arbitrary user files (e.g. /home/user/.ssh/authorized_keys).
         let pb = std::path::Path::new(path);
+        if pb.is_absolute() {
+            return Err(
+                "output_file must be a relative path; absolute paths are not permitted".into(),
+            );
+        }
         if pb.components().any(|c| c == std::path::Component::ParentDir) {
             return Err(
                 "output_file must not contain '..' path traversal components".into(),

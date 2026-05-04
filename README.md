@@ -167,7 +167,7 @@ These parameters are available on most tools:
 {
   "working_dir": "/path/to/project",  // optional
   "no_deps": true,                    // optional: omit resolved dependency graph (faster)
-  "output_file": "/path/to/meta.json" // optional: write metadata JSON to a file
+  "output_file": "target/meta.json"   // optional: relative path to write metadata JSON to
 }
 ```
 
