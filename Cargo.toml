@@ -1,0 +1,22 @@
+# Copyright (c) 2026, Michael Grier
+
+[workspace]
+members = [
+    "crates/cargo-mcp",
+]
+resolver = "2"
+
+[workspace.dependencies]
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+
+# Release profile: tuned for shipped binary size (bundled inside the VS Code
+# extension VSIX).
+#
+# - `strip = "symbols"` removes debug symbols; typically halves a Rust Windows binary.
+# - `lto = "thin"` enables cross-crate inlining/dead-code elimination at link time.
+# - `codegen-units = 1` lets LLVM see the whole crate at once for better optimisation.
+[profile.release]
+strip         = "symbols"
+lto           = "thin"
+codegen-units = 1

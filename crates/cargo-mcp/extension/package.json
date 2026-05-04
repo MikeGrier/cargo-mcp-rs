@@ -1,0 +1,89 @@
+{
+    "name": "cargo-mcp",
+    "displayName": "cargo-mcp \u2014 Cargo build tools for Copilot",
+    "description": "MCP server for Cargo workspace operations: check, build, test, clippy, fmt, tree, doc, and clean — callable directly from Copilot Chat with structured JSON output.",
+    "version": "0.1.0",
+    "publisher": "MikeGrierTools",
+    "license": "MIT",
+    "author": {
+        "name": "Michael Grier"
+    },
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/MikeGrier/cargo-mcp-rs.git",
+        "directory": "crates/cargo-mcp/extension"
+    },
+    "bugs": {
+        "url": "https://github.com/MikeGrier/cargo-mcp-rs/issues"
+    },
+    "homepage": "https://github.com/MikeGrier/cargo-mcp-rs/tree/main/crates/cargo-mcp",
+    "engines": {
+        "vscode": "^1.101.0"
+    },
+    "categories": [
+        "AI",
+        "Chat",
+        "Other"
+    ],
+    "keywords": [
+        "mcp",
+        "model-context-protocol",
+        "copilot",
+        "cargo",
+        "rust",
+        "build",
+        "ai-tools"
+    ],
+    "activationEvents": [
+        "onStartupFinished"
+    ],
+    "main": "./out/extension.js",
+    "contributes": {
+        "mcpServerDefinitionProviders": [
+            {
+                "id": "cargo-mcp",
+                "label": "cargo-mcp"
+            }
+        ],
+        "commands": [
+            {
+                "command": "cargo-mcp.copyServerPath",
+                "title": "cargo-mcp: Copy bundled server binary path",
+                "category": "cargo-mcp"
+            },
+            {
+                "command": "cargo-mcp.showServerVersion",
+                "title": "cargo-mcp: Show bundled server version",
+                "category": "cargo-mcp"
+            }
+        ],
+        "configuration": {
+            "title": "cargo-mcp",
+            "properties": {
+                "cargo-mcp.binaryPath": {
+                    "type": "string",
+                    "default": "",
+                    "markdownDescription": "Override the path to the `cargo-mcp` binary. Leave blank to use the binary bundled with the extension. Intended for development against a locally-built `cargo-mcp`."
+                },
+                "cargo-mcp.extraArgs": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    },
+                    "default": [],
+                    "markdownDescription": "Extra command-line arguments passed to the `cargo-mcp` server on startup (e.g. `[\"--elicitation-mode=always-accept\"]`)."
+                }
+            }
+        }
+    },
+    "scripts": {
+        "compile": "tsc -p ./",
+        "package": "vsce package"
+    },
+    "devDependencies": {
+        "@types/node": "^22.0.0",
+        "@types/vscode": "^1.101.0",
+        "typescript": "^5.4.0",
+        "@vscode/vsce": "^3.0.0"
+    }
+}
