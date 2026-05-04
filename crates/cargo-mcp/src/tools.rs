@@ -31,6 +31,8 @@ use crate::{
     suggest::{self, Suggestion},
 };
 
+use std::sync::{atomic::AtomicBool, Arc};
+
 /// The section appended to (or used to create) `.github/copilot-instructions.md`
 /// during `cargo_setup`. Kept here so the tool description and the written
 /// content stay in sync.
@@ -895,6 +897,20 @@ pub fn tool_names() -> Vec<&'static str> {
 /// compilation tools. Pass `None` to buffer all output and return it only
 /// at the end.
 pub fn call(
+    name: &str,
+    args: &Value,
+    on_progress: Option<&mut dyn FnMut(&str)>,
+    cancel: Option<Arc<AtomicBool>>,
+) -> Result<ToolResult, Box<dyn std::error::Error>> {
+    // Install the cancel token for the duration of the tool call so that the
+    // invoke functions can kill the child process if the client cancels.
+    invoke::set_cancel_token(cancel);
+    let result = call_inner(name, args, on_progress);
+    invoke::set_cancel_token(None);
+    result
+}
+
+fn call_inner(
     name: &str,
     args: &Value,
     on_progress: Option<&mut dyn FnMut(&str)>,

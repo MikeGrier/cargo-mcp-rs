@@ -200,6 +200,7 @@ fn main() {
                 elicitation_mode,
                 &line_reader,
                 &mut out,
+                &id,
             ),
             other => dispatch(other, msg.params),
         };
@@ -320,6 +321,7 @@ fn handle_tool_call(
     elicitation_mode: ElicitationMode,
     reader: &LineReader,
     writer: &mut impl Write,
+    request_id: &Value,
 ) -> ResponseBody {
     let params = match params {
         Some(p) => p,
@@ -353,9 +355,15 @@ fn handle_tool_call(
                 notification_count += 1;
             }
         };
-        tools::call(name, &args, Some(&mut cb))
+        let cancel_token = reader.register_cancel(request_id.clone());
+        let r = tools::call(name, &args, Some(&mut cb), Some(cancel_token));
+        reader.clear_cancel();
+        r
     } else {
-        tools::call(name, &args, None)
+        let cancel_token = reader.register_cancel(request_id.clone());
+        let r = tools::call(name, &args, None, Some(cancel_token));
+        reader.clear_cancel();
+        r
     };
 
     match result {
@@ -464,6 +472,13 @@ fn handle_tool_call(
                 }
             }
         }
+
+        Err(e) if e.downcast_ref::<invoke::CancelledError>().is_some() => ResponseBody::Ok {
+            result: serde_json::json!({
+                "content": [{ "type": "text", "text": "Operation cancelled by client request." }],
+                "isError": true
+            }),
+        },
 
         Err(e) => {
             log_warn(writer, format!("tool '{name}' failed: {e}"));
