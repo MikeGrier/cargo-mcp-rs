@@ -929,16 +929,12 @@ fn call_metadata(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
     if opt_bool(args, "no_deps") {
         argv.push("--no-deps");
     }
-    let out = invoke::run_cargo(&argv, wd)?;
-    if out.exit_code != 0 {
-        return Err(format!(
-            "cargo metadata failed (exit {}): {}",
-            out.exit_code,
-            out.stderr.trim()
-        )
-        .into());
-    }
+
     if let Some(ref path) = output_file {
+        // ── streaming path: stdout piped directly to the file ────────────────
+        // Validate the path *before* spawning so we never create a partial file
+        // that would then be rejected mid-run.
+        //
         // Constrain to relative paths under the working directory — an AI agent
         // could otherwise be tricked via prompt injection into overwriting
         // arbitrary user files (e.g. /home/user/.ssh/authorized_keys).
@@ -964,12 +960,35 @@ fn call_metadata(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
             )
             .into());
         }
-        std::fs::write(path, &out.stdout)?;
-        Ok(format!(
-            "Metadata written to {path} ({} bytes)",
-            out.stdout.len()
-        ))
+        // Create the destination file and hand it to the subprocess as its
+        // stdout fd. The OS pipes cargo's output straight to disk without
+        // buffering the JSON blob in the server's heap — the whole point of
+        // the output_file escape hatch for large workspaces.
+        let dest = std::fs::File::create(path)?;
+        let out = invoke::run_cargo_to_file(&argv, wd, dest)?;
+        if out.exit_code != 0 {
+            // Best-effort cleanup: remove the partial/empty file on failure.
+            let _ = std::fs::remove_file(path);
+            return Err(format!(
+                "cargo metadata failed (exit {}): {}",
+                out.exit_code,
+                out.stderr.trim()
+            )
+            .into());
+        }
+        let file_size = std::fs::metadata(path)?.len();
+        Ok(format!("Metadata written to {path} ({file_size} bytes)"))
     } else {
+        // ── buffered path: return the JSON directly in the tool result ────────
+        let out = invoke::run_cargo(&argv, wd)?;
+        if out.exit_code != 0 {
+            return Err(format!(
+                "cargo metadata failed (exit {}): {}",
+                out.exit_code,
+                out.stderr.trim()
+            )
+            .into());
+        }
         Ok(out.stdout)
     }
 }

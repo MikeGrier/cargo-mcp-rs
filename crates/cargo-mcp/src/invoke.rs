@@ -99,3 +99,51 @@ pub fn run_cargo(
 ) -> Result<CargoOutput, Box<dyn std::error::Error>> {
     run_cargo_streaming(args, working_dir, &mut |_| {})
 }
+
+/// Run `cargo <args>`, piping stdout **directly** into `dest_file` at the OS
+/// level instead of buffering it in memory.
+///
+/// Use this for commands whose stdout can be very large (e.g. `cargo metadata`
+/// in a workspace with thousands of transitive dependencies). Because the OS
+/// plumbs the pipe straight to the file, the Rust process's heap is never
+/// charged for the output.
+///
+/// `CargoOutput::stdout` is always empty when this function is used; only
+/// `stderr` and `exit_code` are meaningful in the returned value.
+pub fn run_cargo_to_file(
+    args: &[&str],
+    working_dir: Option<&str>,
+    dest_file: std::fs::File,
+) -> Result<CargoOutput, Box<dyn std::error::Error>> {
+    let mut cmd = Command::new("cargo");
+    cmd.args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(dest_file)) // OS-level pipe → file, no heap buffer
+        .stderr(Stdio::piped())
+        .env("CARGO_TERM_COLOR", "never")
+        .env("NO_COLOR", "1");
+
+    if let Some(dir) = working_dir {
+        cmd.current_dir(dir);
+    }
+
+    let mut child = cmd.spawn()?;
+    let stderr_pipe = child.stderr.take().expect("stderr is piped");
+
+    // Drain stderr on a background thread to avoid deadlock when stdout
+    // fills the pipe buffer while stderr is also accumulating.
+    let stderr_thread = thread::spawn(move || -> String {
+        let mut buf = String::new();
+        let _ = BufReader::new(stderr_pipe).read_to_string(&mut buf);
+        buf
+    });
+
+    let status = child.wait()?;
+    let stderr_buf = stderr_thread.join().unwrap_or_default();
+
+    Ok(CargoOutput {
+        stdout: String::new(), // nothing buffered; caller reads from dest_file
+        stderr: stderr_buf,
+        exit_code: status.code().unwrap_or(-1),
+    })
+}
