@@ -1,0 +1,116 @@
+{
+    "name": "cargo-mcp",
+    "displayName": "Cargo MCP",
+    "description": "MCP server for Cargo workspace operations: check, build, test, clippy, fmt, tree, doc, and clean — callable directly from Copilot Chat with structured JSON output.",
+    "version": "0.1.0",
+    "publisher": "MikeGrierTools",
+    "license": "MIT",
+    "author": {
+        "name": "Michael Grier"
+    },
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/MikeGrier/cargo-mcp-rs.git",
+        "directory": "crates/cargo-mcp/extension"
+    },
+    "bugs": {
+        "url": "https://github.com/MikeGrier/cargo-mcp-rs/issues"
+    },
+    "homepage": "https://github.com/MikeGrier/cargo-mcp-rs/tree/main/crates/cargo-mcp",
+    "engines": {
+        "vscode": "^1.101.0"
+    },
+    "categories": [
+        "AI",
+        "Chat",
+        "Other"
+    ],
+    "keywords": [
+        "mcp",
+        "model-context-protocol",
+        "copilot",
+        "cargo",
+        "rust",
+        "build",
+        "ai-tools"
+    ],
+    "activationEvents": [
+        "onStartupFinished"
+    ],
+    "main": "./out/extension.js",
+    "contributes": {
+        "mcpServerDefinitionProviders": [
+            {
+                "id": "cargo-mcp",
+                "label": "cargo-mcp"
+            }
+        ],
+        "commands": [
+            {
+                "command": "cargo-mcp.copyServerPath",
+                "title": "cargo-mcp: Copy bundled server binary path",
+                "category": "cargo-mcp"
+            },
+            {
+                "command": "cargo-mcp.showServerVersion",
+                "title": "cargo-mcp: Show bundled server version",
+                "category": "cargo-mcp"
+            },
+            {
+                "command": "cargo-mcp.openSetupChat",
+                "title": "cargo-mcp: Open Copilot setup chat",
+                "category": "cargo-mcp"
+            }
+        ],
+        "configuration": {
+            "title": "Cargo MCP",
+            "properties": {
+                "cargo-mcp.gettingStarted": {
+                    "type": "null",
+                    "markdownDescription": "[Open Copilot setup chat](command:cargo-mcp.openSetupChat) — adds the `cargo-mcp` instruction block to your repository so Copilot uses MCP tools instead of the terminal in every future session."
+                },
+                "cargo-mcp.binaryPath": {
+                    "type": "string",
+                    "default": "",
+                    "markdownDescription": "Override the path to the `cargo-mcp` binary. Leave blank to use the binary bundled with the extension. Intended for development against a locally-built `cargo-mcp`."
+                },
+                "cargo-mcp.elicitationMode": {
+                    "type": "string",
+                    "enum": ["always-skip", "prompt", "always-accept"],
+                    "enumDescriptions": [
+                        "Skip all suggestions without prompting (default).",
+                        "Present a checkbox form for suggestions that need human review.",
+                        "Automatically accept all suggestions without prompting."
+                    ],
+                    "default": "always-skip",
+                    "markdownDescription": "Controls how `cargo-mcp` handles Clippy/check suggestions that need human approval. `always-skip` is the default and safest choice; `prompt` enables the elicitation dialog; `always-accept` applies all suggestions automatically."
+                },
+                "cargo-mcp.dev.progressDelayMs": {
+                    "type": "number",
+                    "default": 0,
+                    "minimum": 0,
+                    "maximum": 5000,
+                    "markdownDescription": "**Developer only.** Additional delay in milliseconds inserted after each cargo progress notification. Useful for slowing down progress output to observe the elicitation dialog. Has no effect when `0`."
+                },
+                "cargo-mcp.extraArgs": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    },
+                    "default": [],
+                    "markdownDescription": "Extra command-line arguments passed to the `cargo-mcp` server on startup. Prefer the dedicated `cargo-mcp.elicitationMode` setting over passing `--elicitation-mode` here."
+                }
+            }
+        }
+    },
+    "scripts": {
+        "compile": "tsc -p ./",
+        "package": "vsce package"
+    },
+    "devDependencies": {
+        "@types/node": "^22.0.0",
+        "@types/vscode": "^1.101.0",
+        "typescript": "^5.4.0",
+        "@vscode/vsce": "^3.0.0"
+    }
+}

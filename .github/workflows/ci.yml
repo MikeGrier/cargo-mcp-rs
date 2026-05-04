@@ -1,0 +1,42 @@
+# Copyright (c) Michael Grier. All rights reserved.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Opt every JavaScript-action step into the Node.js 24 runtime ahead of
+# GitHub's June 2, 2026 forced cutover. Surfaces any action-vs-runtime
+# incompatibilities under our control rather than discovering them on the
+# day GitHub flips the default.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  encoding:
+    name: encoding sanity check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Run check-encoding.ps1
+        shell: pwsh
+        run: ./tools/check-encoding.ps1
+
+  build-test:
+    name: build + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # `--locked` makes CI fail if Cargo would need to update Cargo.lock.
+      # CI must build the exact dependency graph that was committed; any
+      # version drift should happen in a developer's local edit, not silently
+      # in CI. (We deliberately do not use `--frozen`, which additionally
+      # forbids network access and would break the initial registry fetch on
+      # a cold cache.)
+      - name: cargo build
+        run: cargo build --workspace --all-targets --locked
+      - name: cargo test
+        run: cargo test --workspace --locked
