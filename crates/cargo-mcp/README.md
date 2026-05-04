@@ -26,7 +26,7 @@ and install it:
 code --install-extension cargo-mcp-win32-x64-<version>.vsix
 ```
 
-Or install directly from the VS Code Extensions Marketplace (search **cargo-mcp**).
+Or install directly from the VS Code Extensions Marketplace (search **cargo-mcp**) — Windows only; no Linux/macOS builds are published yet.
 
 Reload VS Code. The extension registers the MCP server automatically — no
 additional configuration required.

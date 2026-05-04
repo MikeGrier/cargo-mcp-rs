@@ -11,12 +11,16 @@ involved.
 
 ---
 
-## Installation — VS Code Marketplace (recommended)
+## Installation — VS Code Marketplace (Windows only)
+
+> **Windows only:** Pre-built VSIXes are currently provided for `win32-x64`
+> and `win32-arm64` only. Linux and macOS users should follow the
+> [manual installation](#installation--manual-build-from-source) steps below.
 
 Install the **cargo-mcp** extension from the VS Code Marketplace:
 
 1. Open VS Code.
-2. Press `Ctrl+Shift+X` (or `Cmd+Shift+X` on macOS) to open the Extensions panel.
+2. Press `Ctrl+Shift+X` to open the Extensions panel.
 3. Search for **cargo-mcp**.
 4. Click **Install**.
 
