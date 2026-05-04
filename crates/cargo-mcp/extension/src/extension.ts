@@ -54,8 +54,29 @@ function resolveBinaryPath(context: vscode.ExtensionContext): string | undefined
  */
 function buildArgs(): string[] {
     const config = vscode.workspace.getConfiguration("cargo-mcp");
+
+    // Dedicated settings are emitted first, followed by any extra raw args.
+    const args: string[] = [];
+
+    const mode = config.get<string>("elicitationMode", "always-skip") ?? "always-skip";
+    // Only emit if non-default so the server log stays clean.
+    if (mode !== "always-skip") {
+        args.push(`--elicitation-mode=${mode}`);
+    }
+
+    const delay = config.get<number>("dev.progressDelayMs", 0) ?? 0;
+    if (typeof delay === "number" && delay > 0) {
+        args.push(`--progress-delay-ms=${Math.round(delay)}`);
+    }
+
     const extraArgs = config.get<string[]>("extraArgs", []) ?? [];
-    return extraArgs.filter((a) => typeof a === "string" && a.length > 0);
+    for (const a of extraArgs) {
+        if (typeof a === "string" && a.length > 0) {
+            args.push(a);
+        }
+    }
+
+    return args;
 }
 
 /**
@@ -189,6 +210,18 @@ export function activate(context: vscode.ExtensionContext): void {
             await vscode.window.showInformationMessage(
                 `cargo-mcp server version ${version} \u2014 ${binary}`,
             );
+        }),
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand("cargo-mcp.openSetupChat", async () => {
+            // Open Copilot Chat with the /cargo-mcp:setup slash command pre-filled.
+            // isPartialQuery: true leaves the text in the input box so the user
+            // can review it before pressing Enter.
+            await vscode.commands.executeCommand("workbench.action.chat.open", {
+                query: "/cargo-mcp:setup",
+                isPartialQuery: true,
+            });
         }),
     );
 }

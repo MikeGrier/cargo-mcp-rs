@@ -130,7 +130,8 @@ fn build_multi_select_schema(suggestions: &[Suggestion]) -> Value {
                 "type": "array",
                 "title": "Review these suggestions",
                 "description": "These suggestions may change behaviour or contain \
-                    placeholders. Check the ones you want applied.",
+                    placeholders. Check the ones you want applied. \
+                    To apply nothing, check \u{2205} Skip all at the bottom of the list.",
                 "items": {
                     "anyOf": options
                 }
@@ -150,7 +151,8 @@ fn build_elicit_request(request_id: u64, suggestions: &[Suggestion]) -> Value {
             "message": format!(
                 "Cargo found {} suggestion(s) that need human review. \
                  Safe, machine-verified fixes were already reported. \
-                 Check the ones you\u{2019}d like applied:",
+                 Check the ones you\u{2019}d like applied, \
+                 or select \u{2205} Skip all at the bottom to apply nothing:",
                 suggestions.len()
             ),
             "requestedSchema": build_multi_select_schema(suggestions),
@@ -285,7 +287,8 @@ fn build_grouped_schema(suggestions: &[Suggestion], mode: GroupMode) -> Value {
                 "type": "array",
                 "title": "Review these suggestions",
                 "description": "These suggestions may change behaviour or contain \
-                    placeholders. Check the ones you want applied.",
+                    placeholders. Check the ones you want applied. \
+                    To apply nothing, check \u{2205} Skip all at the bottom of the list.",
                 "items": {
                     "anyOf": options
                 }
@@ -313,7 +316,8 @@ fn build_grouped_elicit_request(
             "message": format!(
                 "Cargo found {} suggestion(s) that need human review{mode_desc}. \
                  Safe, machine-verified fixes were already reported. \
-                 Check the ones you\u{2019}d like applied:",
+                 Check the ones you\u{2019}d like applied, \
+                 or select \u{2205} Skip all at the bottom to apply nothing:",
                 suggestions.len()
             ),
             "requestedSchema": build_grouped_schema(suggestions, mode),
@@ -548,6 +552,19 @@ fn send_and_read_strings(
             // the main loop will never see it, but process::exit is equivalent.
             if matches!(method, "exit" | "notifications/exit") {
                 std::process::exit(0);
+            }
+
+            // notifications/cancelled targeting our own elicitation request
+            // means the user clicked "Cancel" in the VS Code dialog. Treat it
+            // as a decline and return None so the caller skips applying fixes.
+            if method == "notifications/cancelled" {
+                let cancelled_id = msg
+                    .get("params")
+                    .and_then(|p| p.get("requestId"))
+                    .and_then(|v| v.as_str());
+                if cancelled_id == Some(expected_id) {
+                    return None;
+                }
             }
 
             // shutdown is a request (has id). Send the required null-result
@@ -977,6 +994,28 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("busy waiting for elicitation"));
+    }
+
+    #[test]
+    fn elicit_cancelled_notification_for_own_id_returns_none() {
+        let _guard = ID_LOCK.lock().unwrap();
+        let suggestions = make_suggestions(2);
+        // The client sends notifications/cancelled targeting our elicitation
+        // request id — this is what VS Code does when the user clicks "Cancel"
+        // in the elicitation dialog.
+        let cancel_notification = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": { "requestId": "s-1" }
+        });
+        let line1 = serde_json::to_string(&cancel_notification).unwrap();
+        let reader = LineReader::from_lines(&[&line1]);
+        let mut writer = Vec::new();
+
+        NEXT_REQUEST_ID.store(1, Ordering::Relaxed);
+        let ids = elicit_selection(&reader, &mut writer, &suggestions);
+        // Server must treat this as a decline.
+        assert!(ids.is_none());
     }
 
     #[test]

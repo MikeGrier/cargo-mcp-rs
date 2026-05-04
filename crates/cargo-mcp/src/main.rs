@@ -45,11 +45,13 @@ impl ElicitationMode {
     }
 }
 
-fn parse_config() -> (ElicitationMode, Vec<String>) {
+fn parse_config() -> (ElicitationMode, u64, Vec<String>) {
     let mut mode = ElicitationMode::AlwaysSkip;
+    let mut progress_delay_ms: u64 = 0;
     let mut warnings: Vec<String> = Vec::new();
     for arg in std::env::args_os().skip(1) {
-        if let Some(rest) = arg.to_string_lossy().strip_prefix("--elicitation-mode=") {
+        let s = arg.to_string_lossy();
+        if let Some(rest) = s.strip_prefix("--elicitation-mode=") {
             match ElicitationMode::from_str(rest) {
                 Some(m) => mode = m,
                 None => {
@@ -59,9 +61,19 @@ fn parse_config() -> (ElicitationMode, Vec<String>) {
                     ));
                 }
             }
+        } else if let Some(rest) = s.strip_prefix("--progress-delay-ms=") {
+            match rest.parse::<u64>() {
+                Ok(n) => progress_delay_ms = n,
+                Err(_) => {
+                    warnings.push(format!(
+                        "ignoring invalid --progress-delay-ms value: {rest:?} \
+                         (expected a non-negative integer)"
+                    ));
+                }
+            }
         }
     }
-    (mode, warnings)
+    (mode, progress_delay_ms, warnings)
 }
 
 // ── JSON-RPC 2.0 wire types ───────────────────────────────────────────────────
@@ -109,7 +121,7 @@ mod code {
 // ── event loop ────────────────────────────────────────────────────────────────
 
 fn main() {
-    let (elicitation_mode, startup_warnings) = parse_config();
+    let (elicitation_mode, progress_delay_ms, startup_warnings) = parse_config();
 
     let stdin = io::stdin();
     let stdout = io::stdout();
@@ -136,6 +148,12 @@ fn main() {
         format!("advertising {} tools: {}", names.len(), quoted.join(", ")),
     );
     log_info(&mut out, format!("elicitation mode: {elicitation_mode:?}"));
+    if progress_delay_ms > 0 {
+        log_info(
+            &mut out,
+            format!("progress delay: {progress_delay_ms}ms (developer mode)"),
+        );
+    }
 
     // Replay any warnings collected during CLI parsing through the MCP log
     // channel now that the stdout writer is available.
@@ -198,6 +216,7 @@ fn main() {
                 msg.params,
                 can_elicit,
                 elicitation_mode,
+                progress_delay_ms,
                 &line_reader,
                 &mut out,
                 &id,
@@ -319,6 +338,7 @@ fn handle_tool_call(
     params: Option<Value>,
     can_elicit: bool,
     elicitation_mode: ElicitationMode,
+    progress_delay_ms: u64,
     reader: &LineReader,
     writer: &mut impl Write,
     request_id: &Value,
@@ -353,6 +373,9 @@ fn handle_tool_call(
             if !msg.is_empty() {
                 send_progress_notification(writer, token, notification_count, &msg);
                 notification_count += 1;
+                if progress_delay_ms > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(progress_delay_ms));
+                }
             }
         };
         let cancel_token = reader.register_cancel(request_id.clone());
