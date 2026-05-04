@@ -541,21 +541,61 @@ fn send_and_read_strings(
 
         let msg_id = msg.get("id").and_then(|v| v.as_str());
         if msg_id != Some(expected_id) {
-            // If the client is shutting down or exiting, treat it as a decline
-            // so the server's main loop can handle the request/notification.
             let method = msg.get("method").and_then(|v| v.as_str()).unwrap_or("");
-            if matches!(method, "shutdown" | "exit" | "notifications/exit") {
-                return None;
+
+            // exit / notifications/exit are notifications (no id). Honour them
+            // immediately: the message has been consumed from the LineReader so
+            // the main loop will never see it, but process::exit is equivalent.
+            if matches!(method, "exit" | "notifications/exit") {
+                std::process::exit(0);
             }
-            // A message for a different request arrived while waiting for the
-            // elicitation response. We cannot re-queue it into the shared
-            // LineReader, so we forward it as an info-level log notification
-            // to preserve visibility rather than silently dropping it.
+
+            // shutdown is a request (has id). Send the required null-result
+            // response before exiting so the client sees a clean shutdown.
+            if method == "shutdown" {
+                if let Some(id) = msg.get("id").cloned() {
+                    let resp = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": null
+                    });
+                    if let Ok(mut s) = serde_json::to_string(&resp) {
+                        s.push('\n');
+                        let _ = writer.write_all(s.as_bytes());
+                        let _ = writer.flush();
+                    }
+                }
+                std::process::exit(0);
+            }
+
+            // Any other request arrived while we were waiting. We cannot
+            // re-queue it into the shared LineReader, so respond with a
+            // server-error so the client is not left waiting indefinitely.
+            if let Some(id) = msg.get("id").cloned() {
+                let resp = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {
+                        "code": -32000,
+                        "message": format!(
+                            "cargo-mcp: server is busy waiting for elicitation response \
+                             to request {expected_id}; try again after the dialog is dismissed"
+                        )
+                    }
+                });
+                if let Ok(mut s) = serde_json::to_string(&resp) {
+                    s.push('\n');
+                    let _ = writer.write_all(s.as_bytes());
+                    let _ = writer.flush();
+                }
+            }
+            // Notifications (no id) other than exit/shutdown: log and continue.
             send_log_notification(
                 writer,
                 "info",
                 &format!(
-                    "cargo-mcp: received unrelated message while waiting for elicitation response: {}",
+                    "cargo-mcp: received unrelated message while waiting for \
+                     elicitation response: {}",
                     if method.is_empty() { "(response)" } else { method }
                 ),
             );
@@ -860,7 +900,7 @@ mod tests {
     fn elicit_skips_unrelated_messages() {
         let _guard = ID_LOCK.lock().unwrap();
         let suggestions = make_suggestions(2);
-        // A notification arrives before our response.
+        // A notification (no id) arrives before our response — logged, not responded to.
         let notification = serde_json::json!({
             "jsonrpc": "2.0",
             "method": "notifications/cancelled",
@@ -882,6 +922,61 @@ mod tests {
         NEXT_REQUEST_ID.store(1, Ordering::Relaxed);
         let ids = elicit_selection(&reader, &mut writer, &suggestions);
         assert_eq!(ids, Some(vec![2]));
+
+        // Notification has no id — no JSON-RPC error response should have been
+        // written; only the elicitation request and a log notification.
+        let written = String::from_utf8(writer).unwrap();
+        let lines: Vec<&str> = written.lines().collect();
+        // None of the output lines should be an error response.
+        for line in &lines {
+            if let Ok(v) = serde_json::from_str::<Value>(line) {
+                assert!(v.get("error").is_none(), "unexpected error response: {line}");
+            }
+        }
+    }
+
+    #[test]
+    fn elicit_responds_to_concurrent_request_with_server_busy() {
+        let _guard = ID_LOCK.lock().unwrap();
+        let suggestions = make_suggestions(2);
+        // A concurrent *request* (has id) arrives before our elicitation response.
+        let concurrent_request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "other-42",
+            "method": "tools/list",
+            "params": {}
+        });
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "s-1",
+            "result": {
+                "action": "accept",
+                "content": { "selected": ["1"] }
+            }
+        });
+        let line1 = serde_json::to_string(&concurrent_request).unwrap();
+        let line2 = serde_json::to_string(&response).unwrap();
+        let reader = LineReader::from_lines(&[&line1, &line2]);
+        let mut writer = Vec::new();
+
+        NEXT_REQUEST_ID.store(1, Ordering::Relaxed);
+        let ids = elicit_selection(&reader, &mut writer, &suggestions);
+        assert_eq!(ids, Some(vec![1]));
+
+        // The concurrent request must have received a server-busy error response
+        // so the client is not left waiting indefinitely.
+        let written = String::from_utf8(writer).unwrap();
+        let busy_response = written
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .find(|v| v.get("error").is_some());
+        let busy = busy_response.expect("expected a server-busy error response");
+        assert_eq!(busy["id"], "other-42");
+        assert_eq!(busy["error"]["code"], -32000);
+        assert!(busy["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("busy waiting for elicitation"));
     }
 
     #[test]
