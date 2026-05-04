@@ -938,6 +938,25 @@ fn call_metadata(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
         .into());
     }
     if let Some(ref path) = output_file {
+        // Reject path traversal sequences — an AI agent could otherwise be
+        // tricked via prompt injection into overwriting arbitrary user files.
+        let pb = std::path::Path::new(path);
+        if pb.components().any(|c| c == std::path::Component::ParentDir) {
+            return Err(
+                "output_file must not contain '..' path traversal components".into(),
+            );
+        }
+        // Parent directory must already exist; we never create new directories.
+        if let Some(parent) = pb.parent()
+            && !parent.as_os_str().is_empty()
+            && !parent.exists()
+        {
+            return Err(format!(
+                "output_file parent directory does not exist: {}",
+                parent.display()
+            )
+            .into());
+        }
         std::fs::write(path, &out.stdout)?;
         Ok(format!(
             "Metadata written to {path} ({} bytes)",

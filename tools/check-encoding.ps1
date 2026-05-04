@@ -10,8 +10,10 @@
 #   pwsh tools/check-encoding.ps1                 # check every tracked file
 #   pwsh tools/check-encoding.ps1 -Path src/foo   # check one file or dir
 #
-# Exits 0 on success, 1 on any failure.  Designed for both local use after
-# a fallback edit and for CI invocation on every pull request.
+# Exits 0 on success, 1 when encoding issues are found, and 2 for
+# usage/configuration errors (unknown path, or not in a git repo without
+# -Path).  Designed for both local use after a fallback edit and for CI
+# invocation on every pull request.
 
 [CmdletBinding()]
 param(

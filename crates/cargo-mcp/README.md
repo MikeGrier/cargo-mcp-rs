@@ -13,6 +13,11 @@ operations run.
 
 ### 1. Install the VS Code extension
 
+> **Windows only:** Pre-built VSIXes are provided for `win32-x64` and
+> `win32-arm64`. Users on other platforms should build from source (see
+> [Building from source](#building-from-source)) and configure the server
+> manually.
+
 Download the `.vsix` for your platform from the
 [latest GitHub Release](https://github.com/MikeGrier/cargo-mcp-rs/releases/latest)
 and install it:
@@ -116,7 +121,7 @@ cross-platform.
 |---|---|
 | `cargo_metadata` | Workspace/package structure, dependencies, features, resolved graph (JSON) |
 | `cargo_check` | Fast compile-error checking without producing binaries (NDJSON) |
-| `cargo_build` | Full compilation; diagnostics + artefact info (NDJSON) |
+| `cargo_build` | Full compilation; diagnostics + build status (NDJSON) |
 | `cargo_test` | Run tests with optional filters; compilation JSON + harness output |
 | `cargo_clippy` | Lint analysis with suggested fixes (NDJSON) |
 | `cargo_fmt_check` | Verify formatting without modifying files; returns diff |
@@ -142,13 +147,15 @@ Most tools accept these optional parameters:
 | `release` | boolean | Use the release profile |
 | `features` | string | Comma-separated list of features to activate |
 | `all_targets` | boolean | Include all targets (lib, bins, tests, benches, examples) |
+| `locked` | boolean | Require `Cargo.lock` to remain unchanged (useful in CI) |
 
 ### `cargo_metadata`
 
 ```jsonc
 {
   "working_dir": "/path/to/project",  // optional
-  "no_deps": true                     // optional: omit resolved dependency graph (faster)
+  "no_deps": true,                    // optional: omit resolved dependency graph (faster)
+  "output_file": "/path/to/meta.json" // optional: write metadata JSON to a file
 }
 ```
 

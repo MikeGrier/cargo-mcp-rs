@@ -133,7 +133,7 @@ per line). Tools without a stable JSON mode return plain text.
 |---|---|---|---|
 | `cargo_metadata` | JSON | no | Workspace/package structure, dependencies, features, resolved graph |
 | `cargo_check` | NDJSON | no | Fast compile-error checking without producing binaries |
-| `cargo_build` | NDJSON | yes | Full compilation; diagnostics + artefact info |
+| `cargo_build` | NDJSON | yes | Full compilation; diagnostics + build status |
 | `cargo_test` | NDJSON+text | no | Run tests; compilation JSON then test-harness text results |
 | `cargo_clippy` | NDJSON | no | Lint analysis with suggested fixes |
 | `cargo_fmt_check` | text | no | Check formatting; returns diff of changes that would be applied |
@@ -159,13 +159,15 @@ These parameters are available on most tools:
 | `release` | boolean | Use the release profile |
 | `features` | string | Comma-separated list of features to activate |
 | `all_targets` | boolean | Include all targets (lib, bins, tests, benches, examples) |
+| `locked` | boolean | Require `Cargo.lock` to remain unchanged (useful in CI) |
 
 ### `cargo_metadata`
 
 ```jsonc
 {
   "working_dir": "/path/to/project",  // optional
-  "no_deps": true                     // optional: omit resolved dependency graph (faster)
+  "no_deps": true,                    // optional: omit resolved dependency graph (faster)
+  "output_file": "/path/to/meta.json" // optional: write metadata JSON to a file
 }
 ```
 

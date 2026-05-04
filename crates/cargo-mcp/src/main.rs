@@ -166,8 +166,15 @@ fn main() {
         };
 
         // Notifications have no id — no response is sent.
+        // Exception: `exit` must terminate the process so clients that keep
+        // stdin open after `shutdown` are not left waiting indefinitely.
         let id = match msg.id {
-            None => continue,
+            None => {
+                if msg.method == "exit" || msg.method == "notifications/exit" {
+                    std::process::exit(0);
+                }
+                continue;
+            }
             Some(ref v) if v.is_null() => continue,
             Some(v) => v,
         };
@@ -621,7 +628,7 @@ fn send_response(out: &mut impl io::Write, response: Response) {
             let _ = out.write_all(s.as_bytes());
             let _ = out.flush();
         }
-        Err(e) => eprintln!("cargo-mcp: serialization error: {e}"),
+        Err(e) => log_warn(out, format!("cargo-mcp: serialization error: {e}")),
     }
 }
 

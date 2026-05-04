@@ -541,6 +541,12 @@ fn send_and_read_strings(
 
         let msg_id = msg.get("id").and_then(|v| v.as_str());
         if msg_id != Some(expected_id) {
+            // If the client is shutting down or exiting, treat it as a decline
+            // so the server's main loop can handle the request/notification.
+            let method = msg.get("method").and_then(|v| v.as_str()).unwrap_or("");
+            if matches!(method, "shutdown" | "exit" | "notifications/exit") {
+                return None;
+            }
             // A message for a different request arrived while waiting for the
             // elicitation response. We cannot re-queue it into the shared
             // LineReader, so we forward it as an info-level log notification
@@ -550,9 +556,7 @@ fn send_and_read_strings(
                 "info",
                 &format!(
                     "cargo-mcp: received unrelated message while waiting for elicitation response: {}",
-                    msg.get("method")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("(response)")
+                    if method.is_empty() { "(response)" } else { method }
                 ),
             );
             continue;
