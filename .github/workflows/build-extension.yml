@@ -25,6 +25,16 @@ on:
 permissions:
   contents: read
 
+# Cancel any in-progress run for the same workflow and PR/push when a newer
+# commit arrives.  PR number is used on pull_request events (unique per PR,
+# fork-safe).  On non-PR events github.run_id is used (unique per run → no
+# cross-run cancellation).  This pairs with the `update-lockfile` job in
+# release-please.yml: when that job pushes a fresh Cargo.lock to the Release
+# PR branch, the earlier (--locked-failing) run is cancelled automatically.
+concurrency:
+  group: ${{ github.repository }}-${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
 # Opt every JavaScript-action step into the Node.js 24 runtime ahead of
 # GitHub's June 2, 2026 forced cutover.
 env:
@@ -70,19 +80,29 @@ jobs:
         if: matrix.rust_target == 'x86_64-pc-windows-msvc'
         run: cargo test -p cargo-mcp --target ${{ matrix.rust_target }} --locked
 
+      - name: Read workspace version
+        id: workspace-version
+        uses: ./.github/actions/workspace-version
+
+      - name: Verify package.json version matches workspace version
+        shell: pwsh
+        run: |
+          $pkg = Get-Content -Raw crates/cargo-mcp/extension/package.json | ConvertFrom-Json
+          $pkgVer = $pkg.version
+          $wsVer = "${{ steps.workspace-version.outputs.version }}"
+          if ($pkgVer -ne $wsVer) {
+              Write-Error "package.json version '$pkgVer' does not match workspace version '$wsVer'. Ensure release-please (or a manual edit) has updated package.json in sync with Cargo.toml."
+              exit 1
+          }
+          Write-Host "package.json version OK: $pkgVer"
+
       - name: Stage binary into extension/bin/
         shell: pwsh
         run: |
           $src = "target/${{ matrix.rust_target }}/release/cargo-mcp.exe"
           $dst = "crates/cargo-mcp/extension/bin/cargo-mcp.exe"
           Copy-Item $src $dst -Force
-          # Read the crate version from Cargo.toml (single source of truth).
-          $cargo = Get-Content crates/cargo-mcp/Cargo.toml -Raw
-          if ($cargo -match '(?m)^version\s*=\s*"([^"]+)"') {
-              $ver = $Matches[1]
-          } else {
-              throw "Could not parse version from crates/cargo-mcp/Cargo.toml"
-          }
+          $ver = "${{ steps.workspace-version.outputs.version }}"
           Set-Content -NoNewline -Encoding ascii `
               -Path crates/cargo-mcp/extension/bin/VERSION -Value $ver
           "Staged cargo-mcp $ver for ${{ matrix.vscode_target }}"
