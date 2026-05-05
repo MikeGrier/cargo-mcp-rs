@@ -1,0 +1,28 @@
+{
+    "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+    "release-type": "simple",
+    "include-component-in-tag": false,
+    "packages": {
+        ".": {
+            "package-name": "cargo-mcp",
+            "extra-files": [
+                "Cargo.toml",
+                {
+                    "type": "json",
+                    "path": "crates/cargo-mcp/extension/package.json",
+                    "jsonpath": "$.version"
+                },
+                {
+                    "type": "json",
+                    "path": "crates/cargo-mcp/extension/package-lock.json",
+                    "jsonpath": "$.version"
+                },
+                {
+                    "type": "json",
+                    "path": "crates/cargo-mcp/extension/package-lock.json",
+                    "jsonpath": "$.packages[''].version"
+                }
+            ]
+        }
+    }
+}
