@@ -613,7 +613,11 @@ fn send_and_read_strings(
                 &format!(
                     "cargo-mcp: received unrelated message while waiting for \
                      elicitation response: {}",
-                    if method.is_empty() { "(response)" } else { method }
+                    if method.is_empty() {
+                        "(response)"
+                    } else {
+                        method
+                    }
                 ),
             );
             continue;
@@ -947,7 +951,10 @@ mod tests {
         // None of the output lines should be an error response.
         for line in &lines {
             if let Ok(v) = serde_json::from_str::<Value>(line) {
-                assert!(v.get("error").is_none(), "unexpected error response: {line}");
+                assert!(
+                    v.get("error").is_none(),
+                    "unexpected error response: {line}"
+                );
             }
         }
     }
@@ -990,10 +997,12 @@ mod tests {
         let busy = busy_response.expect("expected a server-busy error response");
         assert_eq!(busy["id"], "other-42");
         assert_eq!(busy["error"]["code"], -32000);
-        assert!(busy["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("busy waiting for elicitation"));
+        assert!(
+            busy["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("busy waiting for elicitation")
+        );
     }
 
     #[test]

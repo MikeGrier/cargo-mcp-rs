@@ -6,6 +6,15 @@
 //! flags, capturing stdout and stderr. stdin is always closed to prevent
 //! interactive prompts or hangs.
 //!
+//! ## Toolchain resolution
+//!
+//! The `cargo` binary is located via [`resolve_cargo_binary`] (and `rustc`
+//! via [`resolve_rustc_binary`]) using a three-tier strategy: the `CARGO`
+//! env var, then the rustup proxy at `$CARGO_HOME/bin/`, then a bare-name
+//! `PATH` lookup. Honouring the rustup proxy directly ensures
+//! `rust-toolchain.toml` is respected regardless of `PATH` ordering. See
+//! [`ResolutionSource`] and the `cargo_diagnostic` MCP tool for diagnostics.
+//!
 //! ## Cancellation
 //!
 //! Call [`set_cancel_token`] with the `Arc<AtomicBool>` returned by
@@ -20,16 +29,193 @@
 //!   noise in MCP text responses.
 //! - `NO_COLOR=1` — belt-and-suspenders colour suppression for any tool in
 //!   the Cargo pipeline that respects the informal `NO_COLOR` convention.
+//!
+//! ## Logging
+//!
+//! Each invocation writes a one-line `cargo-mcp: invoking <path> ...` record
+//! to stderr (which VS Code surfaces in the *MCP Logs: cargo* output channel)
+//! so the resolved binary is visible without enabling any extra tracing.
 
 use std::cell::RefCell;
 use std::io::{BufRead, BufReader, Read};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc,
+    atomic::{AtomicBool, Ordering},
 };
 use std::thread;
 use std::time::Duration;
+
+// ── toolchain resolution ──────────────────────────────────────────────────────
+
+/// Where the cargo (or rustc) binary path came from when resolved.
+///
+/// Used for diagnostic logging so users can tell *which* cargo cargo-mcp
+/// actually invoked when the wrong toolchain is in play.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolutionSource {
+    /// `CARGO` (or `RUSTC`) environment variable pointed at an existing file.
+    CargoEnv,
+    /// Found at `$CARGO_HOME/bin/` (or `~/.cargo/bin/`) **with** a sibling
+    /// `rustup` binary — the canonical rustup proxy location. Invoking this
+    /// honours `rust-toolchain.toml`.
+    RustupProxy,
+    /// Found at the rustup-proxy location **without** a sibling `rustup`.
+    /// Treated as a regular cargo (toolchain file likely won't be honoured).
+    RustupProxyNoSibling,
+    /// No env override and no proxy on disk; fall back to a bare name and let
+    /// the OS resolve via `PATH` at spawn time.
+    PathLookup,
+}
+
+impl ResolutionSource {
+    /// Numeric step (1, 2, or 3) matching the resolver's tier order.
+    pub fn step(self) -> u8 {
+        match self {
+            Self::CargoEnv => 1,
+            Self::RustupProxy | Self::RustupProxyNoSibling => 2,
+            Self::PathLookup => 3,
+        }
+    }
+}
+
+/// Resolve which `cargo` binary to invoke.
+///
+/// Three-tier resolution (first match wins):
+///
+/// 1. **`CARGO` env var** — if set and points to an existing file, use it.
+///    Standard cargo escape hatch; nested cargo invocations rely on it.
+/// 2. **Rustup proxy** at `$CARGO_HOME/bin/cargo[.exe]` (default
+///    `~/.cargo/bin/cargo[.exe]`). When present **with** a sibling `rustup`
+///    binary, this is the rustup proxy and invoking it honours
+///    `rust-toolchain.toml` regardless of `PATH` ordering.
+/// 3. **`PATH` lookup** — fall back to the bare name `"cargo"` and let the OS
+///    resolve it at spawn time.
+///
+/// The corresponding diagnostic surface is the `cargo_diagnostic` MCP tool,
+/// which reports the resolved path, the resolution step, and surrounding
+/// environment so toolchain-mismatch problems can be diagnosed in one shot.
+pub fn resolve_cargo_binary() -> (PathBuf, ResolutionSource) {
+    resolve_binary("cargo", "CARGO")
+}
+
+/// Resolve which `rustc` binary to invoke (used by `cargo_diagnostic`).
+///
+/// Mirrors [`resolve_cargo_binary`]: env var → rustup proxy → PATH.
+pub fn resolve_rustc_binary() -> (PathBuf, ResolutionSource) {
+    resolve_binary("rustc", "RUSTC")
+}
+
+fn resolve_binary(name: &str, env_var: &str) -> (PathBuf, ResolutionSource) {
+    // Step 1: explicit env var override.
+    if let Some(v) = std::env::var_os(env_var)
+        && !v.is_empty()
+    {
+        let p = PathBuf::from(&v);
+        if p.is_file() {
+            return (p, ResolutionSource::CargoEnv);
+        }
+        // Set but not a file — fall through (don't error, don't honour).
+    }
+
+    // Step 2: rustup proxy at CARGO_HOME/bin or ~/.cargo/bin.
+    if let Some(cargo_home) = cargo_home_dir() {
+        let bin_name = if cfg!(windows) {
+            format!("{name}.exe")
+        } else {
+            name.to_string()
+        };
+        let path = cargo_home.join("bin").join(&bin_name);
+        if path.is_file() {
+            let rustup_name = if cfg!(windows) {
+                "rustup.exe"
+            } else {
+                "rustup"
+            };
+            let sibling = cargo_home.join("bin").join(rustup_name);
+            let source = if sibling.exists() {
+                ResolutionSource::RustupProxy
+            } else {
+                ResolutionSource::RustupProxyNoSibling
+            };
+            return (path, source);
+        }
+    }
+
+    // Step 3: bare name — PATH lookup happens at spawn time.
+    (PathBuf::from(name), ResolutionSource::PathLookup)
+}
+
+/// Compute the effective `CARGO_HOME` directory.
+///
+/// Honours the `CARGO_HOME` env var if set and non-empty, otherwise
+/// `~/.cargo` (`%USERPROFILE%\.cargo` on Windows).
+pub fn cargo_home_dir() -> Option<PathBuf> {
+    if let Some(v) = std::env::var_os("CARGO_HOME")
+        && !v.is_empty()
+    {
+        return Some(PathBuf::from(v));
+    }
+    user_home_dir().map(|h| h.join(".cargo"))
+}
+
+/// Best-effort home directory: `%USERPROFILE%` on Windows, `$HOME` elsewhere.
+///
+/// Returns `None` if neither is set (unusual; resolver then falls through to
+/// PATH lookup rather than panicking).
+pub fn user_home_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    let var = "USERPROFILE";
+    #[cfg(not(windows))]
+    let var = "HOME";
+    std::env::var_os(var).and_then(|v| {
+        if v.is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(v))
+        }
+    })
+}
+
+/// Walk `start` and its ancestors looking for `rust-toolchain.toml` (or the
+/// legacy `rust-toolchain`). Returns the first match found, or `None`.
+pub fn find_toolchain_file(start: &Path) -> Option<PathBuf> {
+    let mut cur: Option<&Path> = Some(start);
+    while let Some(dir) = cur {
+        for name in ["rust-toolchain.toml", "rust-toolchain"] {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+        cur = dir.parent();
+    }
+    None
+}
+
+/// Emit a one-line diagnostic to stderr describing a cargo invocation.
+///
+/// VS Code captures the cargo-mcp server's stderr in the "MCP Logs: cargo"
+/// output channel, so this surfaces "which cargo did I just run" without
+/// requiring the caller to wire through an MCP log channel.
+fn log_invocation(path: &Path, source: ResolutionSource, working_dir: Option<&str>, args: &[&str]) {
+    eprintln!(
+        "cargo-mcp: invoking {} (source={:?}, step={}) cwd={:?} args={:?}",
+        path.display(),
+        source,
+        source.step(),
+        working_dir.unwrap_or("."),
+        args,
+    );
+    if matches!(source, ResolutionSource::RustupProxyNoSibling) {
+        eprintln!(
+            "cargo-mcp: warning: {} exists but no sibling rustup found \
+             — rust-toolchain.toml may not be honoured",
+            path.display(),
+        );
+    }
+}
 
 // ── cancellation ──────────────────────────────────────────────────────────────
 
@@ -102,7 +288,9 @@ pub fn run_cargo_streaming(
     working_dir: Option<&str>,
     on_stdout_line: &mut dyn FnMut(&str),
 ) -> Result<CargoOutput, Box<dyn std::error::Error>> {
-    let mut cmd = Command::new("cargo");
+    let (cargo_path, source) = resolve_cargo_binary();
+    log_invocation(&cargo_path, source, working_dir, args);
+    let mut cmd = Command::new(&cargo_path);
     cmd.args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -190,7 +378,9 @@ pub fn run_cargo_to_file(
     working_dir: Option<&str>,
     dest_file: std::fs::File,
 ) -> Result<CargoOutput, Box<dyn std::error::Error>> {
-    let mut cmd = Command::new("cargo");
+    let (cargo_path, source) = resolve_cargo_binary();
+    log_invocation(&cargo_path, source, working_dir, args);
+    let mut cmd = Command::new(&cargo_path);
     cmd.args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::from(dest_file)) // OS-level pipe → file, no heap buffer
@@ -236,4 +426,218 @@ pub fn run_cargo_to_file(
         stderr: stderr_buf,
         exit_code: status.code().unwrap_or(-1),
     })
+}
+
+// ── tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    //! Tests for [`resolve_cargo_binary`] et al.
+    //!
+    //! These tests mutate process-global environment variables, so they
+    //! serialize through [`ENV_LOCK`]. Each test snapshots the relevant vars
+    //! up front and restores them on drop via [`EnvGuard`].
+    use super::*;
+    use std::ffi::{OsStr, OsString};
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// RAII guard that restores a set of env vars on drop.
+    struct EnvGuard {
+        saved: Vec<(&'static str, Option<OsString>)>,
+    }
+
+    impl EnvGuard {
+        fn snapshot(vars: &[&'static str]) -> Self {
+            let saved = vars.iter().map(|&v| (v, std::env::var_os(v))).collect();
+            Self { saved }
+        }
+
+        fn set(&self, key: &str, value: impl AsRef<OsStr>) {
+            // SAFETY: tests serialized via ENV_LOCK; no other thread is
+            // observing or mutating env in parallel.
+            unsafe {
+                std::env::set_var(key, value);
+            }
+        }
+
+        fn unset(&self, key: &str) {
+            // SAFETY: tests serialized via ENV_LOCK.
+            unsafe {
+                std::env::remove_var(key);
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (k, v) in self.saved.drain(..) {
+                // SAFETY: tests serialized via ENV_LOCK.
+                unsafe {
+                    match v {
+                        Some(val) => std::env::set_var(k, val),
+                        None => std::env::remove_var(k),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Create a unique temp directory under `std::env::temp_dir()`.
+    fn unique_tempdir(label: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "cargo-mcp-test-{}-{}-{}",
+            label,
+            std::process::id(),
+            n,
+        ));
+        std::fs::create_dir_all(&dir).expect("create tempdir");
+        dir
+    }
+
+    fn bin_name(name: &str) -> String {
+        if cfg!(windows) {
+            format!("{name}.exe")
+        } else {
+            name.to_string()
+        }
+    }
+
+    fn write_fake_bin(dir: &Path, name: &str) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let path = dir.join(bin_name(name));
+        std::fs::write(&path, b"#!/bin/sh\n").unwrap();
+        path
+    }
+
+    #[test]
+    fn cargo_env_var_honoured_when_pointing_at_existing_file() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let guard = EnvGuard::snapshot(&["CARGO", "CARGO_HOME", "HOME", "USERPROFILE"]);
+        let dir = unique_tempdir("cargo_env");
+        let fake = write_fake_bin(&dir, "my-cargo");
+        guard.set("CARGO", &fake);
+
+        let (path, source) = resolve_cargo_binary();
+        assert_eq!(path, fake);
+        assert_eq!(source, ResolutionSource::CargoEnv);
+        assert_eq!(source.step(), 1);
+    }
+
+    #[test]
+    fn cargo_env_var_pointing_at_missing_file_is_skipped() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let guard = EnvGuard::snapshot(&["CARGO", "CARGO_HOME", "HOME", "USERPROFILE"]);
+        let dir = unique_tempdir("cargo_env_missing");
+        guard.set("CARGO", dir.join("does-not-exist"));
+        // No CARGO_HOME / HOME → should fall through to PathLookup.
+        guard.unset("CARGO_HOME");
+        guard.unset("HOME");
+        guard.unset("USERPROFILE");
+
+        let (path, source) = resolve_cargo_binary();
+        assert_eq!(source, ResolutionSource::PathLookup);
+        assert_eq!(path, PathBuf::from("cargo"));
+    }
+
+    #[test]
+    fn rustup_proxy_with_sibling_is_preferred_over_path() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let guard = EnvGuard::snapshot(&["CARGO", "CARGO_HOME", "HOME", "USERPROFILE"]);
+        let cargo_home = unique_tempdir("cargo_home");
+        let bin_dir = cargo_home.join("bin");
+        let cargo_path = write_fake_bin(&bin_dir, "cargo");
+        write_fake_bin(&bin_dir, "rustup");
+        guard.unset("CARGO");
+        guard.set("CARGO_HOME", &cargo_home);
+
+        let (path, source) = resolve_cargo_binary();
+        assert_eq!(path, cargo_path);
+        assert_eq!(source, ResolutionSource::RustupProxy);
+        assert_eq!(source.step(), 2);
+    }
+
+    #[test]
+    fn rustup_proxy_without_sibling_emits_no_sibling_variant() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let guard = EnvGuard::snapshot(&["CARGO", "CARGO_HOME", "HOME", "USERPROFILE"]);
+        let cargo_home = unique_tempdir("cargo_home_nosib");
+        let bin_dir = cargo_home.join("bin");
+        let cargo_path = write_fake_bin(&bin_dir, "cargo");
+        // Note: no sibling rustup written.
+        guard.unset("CARGO");
+        guard.set("CARGO_HOME", &cargo_home);
+
+        let (path, source) = resolve_cargo_binary();
+        assert_eq!(path, cargo_path);
+        assert_eq!(source, ResolutionSource::RustupProxyNoSibling);
+        assert_eq!(source.step(), 2);
+    }
+
+    #[test]
+    fn no_proxy_falls_back_to_path_lookup() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let guard = EnvGuard::snapshot(&["CARGO", "CARGO_HOME", "HOME", "USERPROFILE"]);
+        let empty_home = unique_tempdir("empty_home");
+        // No bin/cargo under this home.
+        guard.unset("CARGO");
+        guard.set("CARGO_HOME", &empty_home);
+
+        let (path, source) = resolve_cargo_binary();
+        assert_eq!(path, PathBuf::from("cargo"));
+        assert_eq!(source, ResolutionSource::PathLookup);
+        assert_eq!(source.step(), 3);
+    }
+
+    #[test]
+    fn unset_home_does_not_panic() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let guard = EnvGuard::snapshot(&["CARGO", "CARGO_HOME", "HOME", "USERPROFILE"]);
+        guard.unset("CARGO");
+        guard.unset("CARGO_HOME");
+        guard.unset("HOME");
+        guard.unset("USERPROFILE");
+
+        let (path, source) = resolve_cargo_binary();
+        assert_eq!(path, PathBuf::from("cargo"));
+        assert_eq!(source, ResolutionSource::PathLookup);
+    }
+
+    #[test]
+    fn rustc_resolution_mirrors_cargo() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let guard = EnvGuard::snapshot(&["RUSTC", "CARGO_HOME", "HOME", "USERPROFILE"]);
+        let cargo_home = unique_tempdir("rustc_home");
+        let bin_dir = cargo_home.join("bin");
+        let rustc_path = write_fake_bin(&bin_dir, "rustc");
+        write_fake_bin(&bin_dir, "rustup");
+        guard.unset("RUSTC");
+        guard.set("CARGO_HOME", &cargo_home);
+
+        let (path, source) = resolve_rustc_binary();
+        assert_eq!(path, rustc_path);
+        assert_eq!(source, ResolutionSource::RustupProxy);
+    }
+
+    #[test]
+    fn find_toolchain_file_walks_ancestors() {
+        let root = unique_tempdir("toolchain_walk");
+        let nested = root.join("a").join("b").join("c");
+        std::fs::create_dir_all(&nested).unwrap();
+        let toolchain = root.join("rust-toolchain.toml");
+        std::fs::write(&toolchain, b"[toolchain]\nchannel = \"stable\"\n").unwrap();
+
+        let found = find_toolchain_file(&nested).expect("should find toolchain file");
+        assert_eq!(found, toolchain);
+    }
+
+    #[test]
+    fn find_toolchain_file_returns_none_when_absent() {
+        let root = unique_tempdir("toolchain_none");
+        assert!(find_toolchain_file(&root).is_none());
+    }
 }

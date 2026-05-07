@@ -119,6 +119,7 @@ The MCP server delegates all work to the `cargo` toolchain already on your PATH.
 | Requirement | Notes |
 |---|---|
 | Rust toolchain | stable |
+| `rustup` | optional but **strongly recommended** if your repository uses a `rust-toolchain.toml`. Without rustup, the toolchain file has no effect on *any* cargo invocation — see [Toolchain resolution](#toolchain-resolution). |
 | `cargo clippy` | `rustup component add clippy` (required for `cargo_clippy`) |
 | `cargo fmt` | `rustup component add rustfmt` (required for `cargo_fmt` / `cargo_fmt_check`) |
 
@@ -151,6 +152,7 @@ per line). Tools without a stable JSON mode return plain text.
 | `cargo_remove` | text | yes | Remove a dependency from Cargo.toml |
 | `cargo_publish` | text | yes | Package and upload to crates.io (irreversible — use `dry_run: true` first) |
 | `cargo_setup` | text | no | Return the canonical cargo-mcp instruction text for Copilot setup |
+| `cargo_diagnostic` | JSON | no | Report which `cargo` / `rustc` binary will be invoked, the active `rust-toolchain.toml` (if any), and relevant env (`PATH`, `CARGO`, `RUSTC`, `RUSTUP_TOOLCHAIN`, `RUSTUP_HOME`, `CARGO_HOME`) |
 
 ### Common parameters
 
@@ -220,6 +222,52 @@ These parameters are available on most tools:
   "release": true                     // optional: clean only release artefacts
 }
 ```
+
+---
+
+## Output format
+
+Every tool result begins with a one-line invocation header that records the
+*effective* command cargo-mcp ran, including any flags the dispatch layer
+added implicitly (e.g. `--message-format=json`):
+
+```
+$ cargo check --message-format=json --all-targets
+(cwd: /path/to/project)
+```
+
+This lets you reconstruct exactly what was invoked from the tool-result panel
+even when the JSON `arguments` shown by the MCP client are sparse.
+
+For JSON-mode tools (`check`, `build`, `test`, `clippy`, `doc`, `metadata`)
+the body of the result is NDJSON — one JSON object per line. Streaming
+progress notifications are also emitted while the build runs; the final
+notification reads `cargo <verb> finished` (or `failed`), with the optional
+target triplet appended when one is supplied.
+
+---
+
+## Toolchain resolution
+
+When cargo-mcp spawns `cargo` it resolves the binary in this priority order
+(first match wins):
+
+1. **`CARGO` environment variable** — if set and points to an existing file,
+   that path is used.
+2. **Rustup proxy** at `$CARGO_HOME/bin/cargo[.exe]` (default
+   `~/.cargo/bin/cargo[.exe]`, `%USERPROFILE%\.cargo\bin\cargo.exe` on
+   Windows). When found **with** a sibling `rustup` binary this is the
+   rustup proxy; invoking it honours `rust-toolchain.toml` regardless of
+   `PATH` ordering. If the sibling rustup is missing, cargo-mcp logs a
+   warning and uses the binary anyway.
+3. **`PATH` lookup** — fallback to spawning the bare name `cargo`.
+
+The resolved path and resolution step are logged to the cargo-mcp server's
+stderr (visible in VS Code's *MCP Logs: cargo* output channel) before each
+invocation. Run the `cargo_diagnostic` tool for a one-shot structured report
+covering the resolved binaries, `cargo --version --verbose`, the discovered
+`rust-toolchain.toml` (and its contents), and the relevant environment
+variables.
 
 ---
 

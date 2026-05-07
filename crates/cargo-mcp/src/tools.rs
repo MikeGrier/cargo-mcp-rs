@@ -2,27 +2,38 @@
 
 //! Tool definitions and dispatch for the `cargo-mcp` MCP server.
 //!
-//! Each tool invokes `cargo` as a subprocess via [`crate::invoke::run_cargo`].
-//! The server is a thin dispatch layer — all build logic lives in Cargo.
+//! Each tool invokes `cargo` as a subprocess via [`crate::invoke::run_cargo`]
+//! (or the streaming / file-piped variants). The server is a thin dispatch
+//! layer — all build logic lives in Cargo.
 //!
 //! ## Tool set
 //!
-//! - `cargo_metadata`  — project structure and dependency info (JSON)
-//! - `cargo_check`     — fast error checking without producing binaries
-//! - `cargo_build`     — compile the project
-//! - `cargo_test`      — run tests with optional filters
-//! - `cargo_clippy`    — run lint checks
-//! - `cargo_fmt_check` — check formatting without modifying files
-//! - `cargo_fmt`       — format source code
-//! - `cargo_tree`      — display dependency tree
-//! - `cargo_doc`       — build documentation
-//! - `cargo_clean`     — remove build artefacts
-//! - `cargo_update`    — update Cargo.lock
-//! - `cargo_fix`       — auto-apply compiler fixes
-//! - `cargo_add`       — add a dependency
-//! - `cargo_remove`    — remove a dependency
-//! - `cargo_publish`   — publish to crates.io
-//! - `cargo_setup`     — check/create .github/copilot-instructions.md
+//! - `cargo_metadata`   — project structure and dependency info (JSON)
+//! - `cargo_check`      — fast error checking without producing binaries
+//! - `cargo_build`      — compile the project
+//! - `cargo_test`       — run tests with optional filters
+//! - `cargo_clippy`     — run lint checks
+//! - `cargo_fmt_check`  — check formatting without modifying files
+//! - `cargo_fmt`        — format source code
+//! - `cargo_tree`       — display dependency tree
+//! - `cargo_doc`        — build documentation
+//! - `cargo_clean`      — remove build artefacts
+//! - `cargo_update`     — update Cargo.lock
+//! - `cargo_fix`        — auto-apply compiler fixes
+//! - `cargo_add`        — add a dependency
+//! - `cargo_remove`     — remove a dependency
+//! - `cargo_publish`    — publish to crates.io
+//! - `cargo_setup`      — emit canonical Copilot-instructions text
+//! - `cargo_diagnostic` — report the resolved cargo/rustc binary, the active
+//!   `rust-toolchain.toml` (if any), and the relevant environment
+//!
+//! ## Output shape
+//!
+//! Tool results begin with a one-line invocation header — `$ cargo <argv>` and
+//! a `(cwd: ...)` annotation — produced by [`invocation_header`]. This makes
+//! the *effective* command (including flags the dispatch layer added
+//! implicitly, such as `--message-format=json`) visible in the MCP client's
+//! tool-result panel even when the original `arguments` JSON is sparse.
 
 use serde_json::Value;
 
@@ -31,7 +42,7 @@ use crate::{
     suggest::{self, Suggestion},
 };
 
-use std::sync::{atomic::AtomicBool, Arc};
+use std::sync::{Arc, atomic::AtomicBool};
 
 /// The section appended to (or used to create) `.github/copilot-instructions.md`
 /// during `cargo_setup`. Kept here so the tool description and the written
@@ -58,7 +69,8 @@ for cargo just because a previous step used the terminal.\n\n\
 | `cargo_add` | `cargo add` |\n\
 | `cargo_remove` | `cargo remove` |\n\
 | `cargo_publish` | `cargo publish` |\n\
-| `cargo_setup` | *(no terminal equivalent)* |\n";
+| `cargo_setup` | *(no terminal equivalent)* |\n\
+| `cargo_diagnostic` | *(no terminal equivalent)* |\n";
 
 /// The result of a tool call, which may carry actionable suggestions.
 pub enum ToolResult {
@@ -108,13 +120,23 @@ fn filter_build_ndjson(stdout: &str) -> String {
         .join("\n")
 }
 
+/// Build a one-line header describing the cargo invocation that produced an
+/// output, so the LLM (or a human inspecting the tool result) can see the
+/// effective command and working directory at a glance — including flags that
+/// the dispatch layer added implicitly (e.g. `--message-format=json`).
+fn invocation_header(argv: &[&str], wd: Option<&str>) -> String {
+    format!("$ cargo {}\n(cwd: {})\n", argv.join(" "), wd.unwrap_or("."),)
+}
+
 /// Format a [`CargoOutput`] from a `--message-format=json` invocation.
 ///
 /// Filters the NDJSON stream to remove dep-artifact and build-script noise
 /// (already delivered as streaming progress), then returns the remainder.
 /// On failure, prepends the exit code and appends stderr for context.
-fn format_json_output(out: &CargoOutput) -> String {
-    if out.exit_code == 0 {
+/// The result is prefixed with [`invocation_header`].
+fn format_json_output(out: &CargoOutput, argv: &[&str], wd: Option<&str>) -> String {
+    let header = invocation_header(argv, wd);
+    let body = if out.exit_code == 0 {
         if out.stdout.is_empty() {
             r#"{"status":"success"}"#.to_owned()
         } else {
@@ -135,13 +157,16 @@ fn format_json_output(out: &CargoOutput) -> String {
             filtered.trim_end(),
             format_args!(r#"{{"status":"error","exit_code":{}}}"#, out.exit_code,),
         )
-    }
+    };
+    format!("{header}{body}")
 }
 
 /// Format a [`CargoOutput`] from a command with no JSON mode (fmt, tree, clean).
 ///
-/// Combines stdout and stderr into a single text block.
-fn format_text_output(out: &CargoOutput) -> String {
+/// Combines stdout and stderr into a single text block prefixed with
+/// [`invocation_header`].
+fn format_text_output(out: &CargoOutput, argv: &[&str], wd: Option<&str>) -> String {
+    let header = invocation_header(argv, wd);
     let combined = if out.stderr.is_empty() {
         out.stdout.clone()
     } else if out.stdout.is_empty() {
@@ -149,7 +174,7 @@ fn format_text_output(out: &CargoOutput) -> String {
     } else {
         format!("{}\n{}", out.stdout, out.stderr)
     };
-    if out.exit_code == 0 {
+    let body = if out.exit_code == 0 {
         if combined.is_empty() {
             "(success, no output)".to_owned()
         } else {
@@ -157,7 +182,8 @@ fn format_text_output(out: &CargoOutput) -> String {
         }
     } else {
         format!("(exit code {})\n{}", out.exit_code, combined)
-    }
+    };
+    format!("{header}{body}")
 }
 
 /// Invoke `run_cargo_streaming` when a progress callback is provided, or the
@@ -863,6 +889,29 @@ pub fn list() -> Value {
                 "required": []
             },
             "annotations": { "readOnlyHint": true, "destructiveHint": false }
+        },
+        {
+            "name": "cargo_diagnostic",
+            "description":
+                "Report which `cargo` and `rustc` binaries cargo-mcp will invoke for \
+                 the given working directory, why those were chosen, whether a \
+                 rust-toolchain.toml is in effect, and the relevant environment \
+                 (PATH, CARGO, RUSTC, RUSTUP_TOOLCHAIN, RUSTUP_HOME, CARGO_HOME). \
+                 Use this when a cargo command appears to use the wrong toolchain \
+                 (e.g. rust-toolchain.toml seems to be ignored).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "working_dir": {
+                        "type": "string",
+                        "description":
+                            "Absolute path to the directory to diagnose. \
+                             Defaults to the current directory."
+                    }
+                },
+                "required": []
+            },
+            "annotations": { "readOnlyHint": true, "destructiveHint": false }
         }
     ])
 }
@@ -888,6 +937,7 @@ pub fn tool_names() -> Vec<&'static str> {
         "cargo_remove",
         "cargo_publish",
         "cargo_setup",
+        "cargo_diagnostic",
     ]
 }
 
@@ -932,6 +982,7 @@ fn call_inner(
         "cargo_remove" => call_remove(args).map(ToolResult::Text),
         "cargo_publish" => call_publish(args).map(ToolResult::Text),
         "cargo_setup" => call_setup(args).map(ToolResult::Text),
+        "cargo_diagnostic" => call_diagnostic(args).map(ToolResult::Text),
         _ => Err(format!("unknown tool: {name}").into()),
     }
 }
@@ -960,10 +1011,11 @@ fn call_metadata(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
                 "output_file must be a relative path; absolute paths are not permitted".into(),
             );
         }
-        if pb.components().any(|c| c == std::path::Component::ParentDir) {
-            return Err(
-                "output_file must not contain '..' path traversal components".into(),
-            );
+        if pb
+            .components()
+            .any(|c| c == std::path::Component::ParentDir)
+        {
+            return Err("output_file must not contain '..' path traversal components".into());
         }
         // Parent directory must already exist; we never create new directories.
         if let Some(parent) = pb.parent()
@@ -1035,7 +1087,7 @@ fn call_check(
         argv.push("--locked");
     }
     let out = run_cargo_maybe_streaming(&argv, wd, on_progress)?;
-    let output = format_json_output(&out);
+    let output = format_json_output(&out, &argv, wd);
     let suggestions = suggest::extract_suggestions(&out.stdout);
     Ok(ToolResult::WithSuggestions {
         output,
@@ -1069,7 +1121,7 @@ fn call_build(
         argv.push("--locked");
     }
     let out = run_cargo_maybe_streaming(&argv, wd, on_progress)?;
-    Ok(format_json_output(&out))
+    Ok(format_json_output(&out, &argv, wd))
 }
 
 fn call_test(
@@ -1119,7 +1171,7 @@ fn call_test(
     let out = run_cargo_maybe_streaming(&argv, wd, on_progress)?;
     // Test output is a mix: JSON from compilation, text from the test harness.
     // Return both stdout (JSON + test results) and stderr on failure.
-    Ok(format_json_output(&out))
+    Ok(format_json_output(&out, &argv, wd))
 }
 
 fn call_clippy(
@@ -1145,7 +1197,7 @@ fn call_clippy(
         argv.push("--locked");
     }
     let out = run_cargo_maybe_streaming(&argv, wd, on_progress)?;
-    let output = format_json_output(&out);
+    let output = format_json_output(&out, &argv, wd);
     let suggestions = suggest::extract_suggestions(&out.stdout);
     Ok(ToolResult::WithSuggestions {
         output,
@@ -1162,7 +1214,7 @@ fn call_fmt_check(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
         argv.push(p);
     }
     let out = invoke::run_cargo(&argv, wd)?;
-    Ok(format_text_output(&out))
+    Ok(format_text_output(&out, &argv, wd))
 }
 
 fn call_fmt(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
@@ -1174,7 +1226,7 @@ fn call_fmt(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
         argv.push(p);
     }
     let out = invoke::run_cargo(&argv, wd)?;
-    Ok(format_text_output(&out))
+    Ok(format_text_output(&out, &argv, wd))
 }
 
 fn call_tree(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
@@ -1205,7 +1257,7 @@ fn call_tree(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
         argv.push(f);
     }
     let out = invoke::run_cargo(&argv, wd)?;
-    Ok(format_text_output(&out))
+    Ok(format_text_output(&out, &argv, wd))
 }
 
 fn call_doc(
@@ -1229,7 +1281,7 @@ fn call_doc(
         argv.push("--locked");
     }
     let out = run_cargo_maybe_streaming(&argv, wd, on_progress)?;
-    Ok(format_json_output(&out))
+    Ok(format_json_output(&out, &argv, wd))
 }
 
 fn call_clean(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
@@ -1244,7 +1296,7 @@ fn call_clean(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
         argv.push("--release");
     }
     let out = invoke::run_cargo(&argv, wd)?;
-    Ok(format_text_output(&out))
+    Ok(format_text_output(&out, &argv, wd))
 }
 
 fn call_update(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
@@ -1264,7 +1316,7 @@ fn call_update(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
         argv.push(v);
     }
     let out = invoke::run_cargo(&argv, wd)?;
-    Ok(format_text_output(&out))
+    Ok(format_text_output(&out, &argv, wd))
 }
 
 fn call_fix(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
@@ -1285,7 +1337,7 @@ fn call_fix(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
         argv.push("--clippy");
     }
     let out = invoke::run_cargo(&argv, wd)?;
-    Ok(format_text_output(&out))
+    Ok(format_text_output(&out, &argv, wd))
 }
 
 fn call_add(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
@@ -1312,7 +1364,7 @@ fn call_add(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
         argv.push(f);
     }
     let out = invoke::run_cargo(&argv, wd)?;
-    Ok(format_text_output(&out))
+    Ok(format_text_output(&out, &argv, wd))
 }
 
 fn call_remove(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
@@ -1334,7 +1386,7 @@ fn call_remove(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
         argv.push(p);
     }
     let out = invoke::run_cargo(&argv, wd)?;
-    Ok(format_text_output(&out))
+    Ok(format_text_output(&out, &argv, wd))
 }
 
 fn call_publish(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
@@ -1352,7 +1404,7 @@ fn call_publish(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
         argv.push("--allow-dirty");
     }
     let out = invoke::run_cargo(&argv, wd)?;
-    Ok(format_text_output(&out))
+    Ok(format_text_output(&out, &argv, wd))
 }
 
 fn call_setup(_args: &Value) -> Result<String, Box<dyn std::error::Error>> {
@@ -1363,4 +1415,90 @@ fn call_setup(_args: &Value) -> Result<String, Box<dyn std::error::Error>> {
          \n\n```markdown\n{}```",
         CARGO_MCP_INSTRUCTIONS
     ))
+}
+
+/// Build a structured diagnostic report about cargo/rustc resolution.
+///
+/// The report is intended for users investigating "wrong toolchain" problems.
+/// It captures, in one shot, every piece of state cargo-mcp uses to decide
+/// which `cargo` to invoke. No fields are masked — none are secret.
+fn call_diagnostic(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
+    use std::process::Command;
+
+    let wd_owned = match opt_str(args, "working_dir") {
+        Some(s) => std::path::PathBuf::from(s),
+        None => std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+    };
+
+    let (cargo_path, cargo_source) = invoke::resolve_cargo_binary();
+    let (rustc_path, rustc_source) = invoke::resolve_rustc_binary();
+
+    // Run `cargo --version --verbose`. Capture failure as a string instead of
+    // failing the diagnostic — the whole point is to report the truth.
+    let cargo_version = match Command::new(&cargo_path)
+        .args(["--version", "--verbose"])
+        .current_dir(&wd_owned)
+        .output()
+    {
+        Ok(o) => serde_json::json!({
+            "exit_code": o.status.code().unwrap_or(-1),
+            "stdout": String::from_utf8_lossy(&o.stdout).to_string(),
+            "stderr": String::from_utf8_lossy(&o.stderr).to_string(),
+        }),
+        Err(e) => serde_json::json!({ "error": e.to_string() }),
+    };
+    let rustc_version = match Command::new(&rustc_path)
+        .args(["--version", "--verbose"])
+        .current_dir(&wd_owned)
+        .output()
+    {
+        Ok(o) => serde_json::json!({
+            "exit_code": o.status.code().unwrap_or(-1),
+            "stdout": String::from_utf8_lossy(&o.stdout).to_string(),
+            "stderr": String::from_utf8_lossy(&o.stderr).to_string(),
+        }),
+        Err(e) => serde_json::json!({ "error": e.to_string() }),
+    };
+
+    let toolchain_file = invoke::find_toolchain_file(&wd_owned);
+    let toolchain_contents = toolchain_file
+        .as_ref()
+        .and_then(|p| std::fs::read_to_string(p).ok());
+
+    fn env_or_unset(key: &str) -> Value {
+        match std::env::var(key) {
+            Ok(v) => Value::String(v),
+            Err(_) => Value::Null,
+        }
+    }
+
+    let report = serde_json::json!({
+        "working_dir": wd_owned.display().to_string(),
+        "cargo": {
+            "path": cargo_path.display().to_string(),
+            "source": format!("{:?}", cargo_source),
+            "step": cargo_source.step(),
+            "version": cargo_version,
+        },
+        "rustc": {
+            "path": rustc_path.display().to_string(),
+            "source": format!("{:?}", rustc_source),
+            "step": rustc_source.step(),
+            "version": rustc_version,
+        },
+        "toolchain_file": {
+            "path": toolchain_file.as_ref().map(|p| p.display().to_string()),
+            "contents": toolchain_contents,
+        },
+        "env": {
+            "PATH": env_or_unset("PATH"),
+            "CARGO": env_or_unset("CARGO"),
+            "RUSTC": env_or_unset("RUSTC"),
+            "RUSTUP_TOOLCHAIN": env_or_unset("RUSTUP_TOOLCHAIN"),
+            "RUSTUP_HOME": env_or_unset("RUSTUP_HOME"),
+            "CARGO_HOME": env_or_unset("CARGO_HOME"),
+        },
+    });
+
+    Ok(serde_json::to_string_pretty(&report)?)
 }

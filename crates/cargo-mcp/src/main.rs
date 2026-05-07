@@ -367,7 +367,15 @@ fn handle_tool_call(
 
     let result = if let Some(ref token) = progress_token {
         let mut notification_count: u32 = 0;
-        let mut tracker = BuildTracker::new();
+        // Derive a human-friendly verb ("check", "build", ...) from the tool
+        // name so the final progress message includes it. Tools that don't
+        // start with "cargo_" fall back to the raw name.
+        let verb = name.strip_prefix("cargo_").unwrap_or(name).to_owned();
+        let target = args
+            .get("target")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned);
+        let mut tracker = BuildTracker::new(verb, target);
         let mut cb = |line: &str| {
             let msg = tracker.process_line(line);
             if !msg.is_empty() {
@@ -522,16 +530,24 @@ fn handle_tool_call(
 /// - `compile_count` — crates actually being compiled (non-fresh artifacts).
 /// - `total_count`   — all artifacts seen so far (fresh + non-fresh); a
 ///   running lower bound on the total number of crates in the build graph.
+/// - `verb` / `target` — included in the terminal `build-finished` /
+///   `build-failed` message so the chat-history summary line is unambiguous
+///   (e.g. `cargo check (x86_64-pc-windows-msvc) finished` instead of just
+///   `Build finished`).
 struct BuildTracker {
     compile_count: u32,
     total_count: u32,
+    verb: String,
+    target: Option<String>,
 }
 
 impl BuildTracker {
-    fn new() -> Self {
+    fn new(verb: String, target: Option<String>) -> Self {
         Self {
             compile_count: 0,
             total_count: 0,
+            verb,
+            target,
         }
     }
 
@@ -583,11 +599,12 @@ impl BuildTracker {
             }
             Some("build-finished") => {
                 let ok = v.get("success").and_then(|s| s.as_bool()).unwrap_or(false);
-                if ok {
-                    "Build finished".to_owned()
-                } else {
-                    "Build failed".to_owned()
-                }
+                let target_suffix = match &self.target {
+                    Some(t) => format!(" ({t})"),
+                    None => String::new(),
+                };
+                let outcome = if ok { "finished" } else { "failed" };
+                format!("cargo {}{} {}", self.verb, target_suffix, outcome)
             }
             _ => String::new(),
         }
