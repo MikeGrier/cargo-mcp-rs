@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.3.1](https://github.com/MikeGrier/cargo-mcp-rs/compare/v0.2.0...v0.3.1) (2026-05-07)
+
+
+### Features
+
+* toolchain resolver, cargo_diagnostic tool, invocation header ([#6](https://github.com/MikeGrier/cargo-mcp-rs/issues/6)) ([c29139a](https://github.com/MikeGrier/cargo-mcp-rs/commit/c29139a61262c5c5703cc139efb8cb295ed1953b))
+
+
+### Bug Fixes
+
+* annotate Cargo.toml workspace version for release-please ([#8](https://github.com/MikeGrier/cargo-mcp-rs/issues/8)) ([6f6d401](https://github.com/MikeGrier/cargo-mcp-rs/commit/6f6d40155659ae16f8c76b573d20bddd8d6f12e3))
+
+
+### Miscellaneous Chores
+
+* release 0.3.1 ([6d8b5e1](https://github.com/MikeGrier/cargo-mcp-rs/commit/6d8b5e119fb86c508b16f3184ec55b0203b6fdd5))
+
 ## [0.2.0](https://github.com/MikeGrier/cargo-mcp-rs/compare/v0.1.2...v0.2.0) (2026-05-05)
 
 
