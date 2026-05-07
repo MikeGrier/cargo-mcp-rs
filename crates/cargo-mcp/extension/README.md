@@ -16,6 +16,21 @@ VS Code automatically — no manual `mcp.json` configuration required.
 
 ---
 
+## Demo
+
+Copilot driving a clean rebuild of this repository through the MCP tools —
+`cargo_clean`, then a cross-architecture `cargo_build` and `cargo_test` for
+both `x86_64-pc-windows-msvc` and `aarch64-pc-windows-msvc` — without ever
+touching a terminal:
+
+![Copilot using cargo-mcp to clean, build, and test cargo-mcp itself for both Windows x64 and arm64 targets](media/demo-clean-build-test.png)
+
+Each tool result starts with the exact `cargo` invocation (including any flags
+the dispatch layer added) and ends with the streaming summary line you see in
+the chat history (`cargo build finished (aarch64-pc-windows-msvc)` etc.).
+
+---
+
 ## Quick start
 
 1. **Install the extension** (you're here).

@@ -16,4 +16,4 @@ Thumbs.db
 .gitkeep
 **/.gitkeep
 
-# Keep: out/**, bin/**, package.json, README.md, LICENSE
+# Keep: out/**, bin/**, media/**, package.json, README.md, LICENSE
