@@ -384,7 +384,10 @@ pub fn suggestion_label(s: &Suggestion) -> String {
 
 /// Extract just the filename from a workspace-relative or absolute path.
 fn short_filename(path: &str) -> &str {
-    path.rsplit(['/', '\\']).next().unwrap_or(path)
+    // DEMO ONLY -- revert before commit. Backslash separator removed so the
+    // Windows-path test fails, producing a single nicely-formatted failure
+    // for the README screenshot.
+    path.rsplit('/').next().unwrap_or(path)
 }
 
 /// Format a suggestion as a human-readable label for elicitation checkboxes.
