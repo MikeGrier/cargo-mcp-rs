@@ -179,7 +179,9 @@ jobs:
         working-directory: crates/cargo-mcp/extension
         env:
           VSCE_PAT: ${{ secrets.VSCE_PAT }}
-          PRE_RELEASE: ${{ inputs.pre_release }}
+          PRE_RELEASE_INPUT: ${{ inputs.pre_release }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
         shell: bash
         run: |
           set -euo pipefail
@@ -187,12 +189,25 @@ jobs:
               echo "::error::VSCE_PAT secret is not set on the 'marketplace' environment"
               exit 1
           fi
-          # Optional pre-release flag (only settable via workflow_dispatch).
-          # Tag-triggered runs always publish as stable.
+          # Decide whether this is a pre-release publish.
+          #
+          # workflow_dispatch: caller-supplied `pre_release` boolean wins.
+          # tag push (v*):     auto-detect via VS Code's minor-version
+          #                    convention -- odd minor = pre-release,
+          #                    even minor = stable. So v0.3.1 -> pre-release,
+          #                    v0.4.0 -> stable.
           pre_flag=""
-          if [ "${PRE_RELEASE:-false}" = "true" ]; then
+          if [ "${PRE_RELEASE_INPUT:-false}" = "true" ]; then
               pre_flag="--pre-release"
-              echo "Publishing as Marketplace pre-release"
+              echo "Publishing as Marketplace pre-release (workflow_dispatch input)"
+          elif [ "${REF_TYPE:-}" = "tag" ] && [[ "${REF_NAME}" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+              minor="${BASH_REMATCH[2]}"
+              if (( minor % 2 == 1 )); then
+                  pre_flag="--pre-release"
+                  echo "Publishing as Marketplace pre-release (odd minor ${minor} in tag ${REF_NAME})"
+              else
+                  echo "Publishing as Marketplace stable (even minor ${minor} in tag ${REF_NAME})"
+              fi
           fi
           # Publish each per-target VSIX. `vsce publish --packagePath`
           # uploads an already-built VSIX rather than repackaging, which
