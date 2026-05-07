@@ -18,9 +18,9 @@
 use std::{
     io::{self, BufRead},
     sync::{
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver},
-        Arc, Mutex,
     },
     thread,
     time::Duration,
@@ -59,15 +59,11 @@ impl LineReader {
                         // watcher and the line looks like a cancel notification.
                         let intercepted = if line.contains("notifications/cancelled") {
                             if let Ok(msg) = serde_json::from_str::<Value>(line.trim()) {
-                                let is_cancel = msg
-                                    .get("method")
-                                    .and_then(|v| v.as_str())
+                                let is_cancel = msg.get("method").and_then(|v| v.as_str())
                                     == Some("notifications/cancelled");
                                 if is_cancel {
-                                    let req_id = msg
-                                        .get("params")
-                                        .and_then(|p| p.get("requestId"))
-                                        .cloned();
+                                    let req_id =
+                                        msg.get("params").and_then(|p| p.get("requestId")).cloned();
                                     if let Some(cancel_id) = req_id {
                                         let guard = watcher_clone.lock().unwrap();
                                         if let Some((ref watched_id, ref cancel_flag)) = *guard {

@@ -182,11 +182,11 @@ fn collect_suggestions_from_message(msg: &Value, out: &mut Vec<Suggestion>) {
         let mut applicability_opt: Option<Applicability> = None;
 
         for span in spans {
-            let replacement_text =
-                match span.get("suggested_replacement").and_then(|v| v.as_str()) {
-                    Some(t) => t,
-                    None => continue,
-                };
+            let replacement_text = match span.get("suggested_replacement").and_then(|v| v.as_str())
+            {
+                Some(t) => t,
+                None => continue,
+            };
             let applicability_str = span
                 .get("suggestion_applicability")
                 .and_then(|v| v.as_str())
@@ -200,14 +200,13 @@ fn collect_suggestions_from_message(msg: &Value, out: &mut Vec<Suggestion>) {
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_owned();
-            let line_start =
-                span.get("line_start").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-            let line_end =
-                span.get("line_end").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-            let column_start =
-                span.get("column_start").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-            let column_end =
-                span.get("column_end").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            let line_start = span.get("line_start").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            let line_end = span.get("line_end").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            let column_start = span
+                .get("column_start")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as usize;
+            let column_end = span.get("column_end").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
             if applicability_opt.is_none() {
                 applicability_opt = Some(applicability);
             }
@@ -868,7 +867,11 @@ mod tests {
         let ndjson = r#"{"reason":"compiler-message","package_id":"test","manifest_path":"test","target":{"kind":["lib"],"crate_types":["lib"],"name":"test","src_path":"src/lib.rs","edition":"2021","doc":true,"doctest":true,"test":true},"message":{"rendered":"warning\n","children":[],"code":{"code":"test_rename","explanation":null},"level":"warning","message":"rename foo to bar","spans":[{"byte_end":10,"byte_start":7,"column_end":4,"column_start":1,"expansion":null,"file_name":"src/lib.rs","is_primary":true,"label":null,"line_end":1,"line_start":1,"suggested_replacement":"bar","suggestion_applicability":"MachineApplicable","text":[]},{"byte_end":30,"byte_start":27,"column_end":4,"column_start":1,"expansion":null,"file_name":"src/lib.rs","is_primary":false,"label":null,"line_end":5,"line_start":5,"suggested_replacement":"bar","suggestion_applicability":"MachineApplicable","text":[]}]}}"#;
         let suggestions = extract_suggestions(ndjson);
         // Both spans belong to the same atomic rename — must be a single Suggestion.
-        assert_eq!(suggestions.len(), 1, "multipart root-span fix must not be split");
+        assert_eq!(
+            suggestions.len(),
+            1,
+            "multipart root-span fix must not be split"
+        );
         assert_eq!(suggestions[0].replacements.len(), 2);
         // First replacement is from span 1 (line 1).
         assert_eq!(suggestions[0].replacements[0].span.line_start, 1);
