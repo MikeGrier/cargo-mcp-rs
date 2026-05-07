@@ -72,6 +72,32 @@ for cargo just because a previous step used the terminal.\n\n\
 | `cargo_setup` | *(no terminal equivalent)* |\n\
 | `cargo_diagnostic` | *(no terminal equivalent)* |\n";
 
+/// Description for the `working_dir` parameter, shared across every tool.
+///
+/// The phrasing is deliberately blunt about the failure mode: the MCP server's
+/// own working directory is almost never the user's workspace (on Windows it
+/// is typically the rustup toolchains directory or `C:\Windows\System32`),
+/// so omitting `working_dir` makes manifest and `rust-toolchain.toml`
+/// resolution fail silently. See `cargo_diagnostic` for the recovery path.
+const WORKING_DIR_DESC: &str = "Absolute path to the directory containing the Cargo.toml \
+     (or any descendant of the workspace root that owns a rust-toolchain.toml). \
+     STRONGLY RECOMMENDED to pass explicitly. If omitted, defaults to the \
+     cargo-mcp server process's working directory, which is typically NOT your \
+     workspace and will usually cause manifest or toolchain resolution to fail.";
+
+/// `working_dir` description for `cargo_metadata`, which also accepts a
+/// workspace member directory.
+const WORKING_DIR_DESC_METADATA: &str = "Absolute path to the directory containing the Cargo.toml (or a workspace \
+     member). STRONGLY RECOMMENDED to pass explicitly. If omitted, defaults to \
+     the cargo-mcp server process's working directory, which is typically NOT \
+     your workspace and will usually cause manifest resolution to fail.";
+
+/// `working_dir` description for `cargo_diagnostic`.
+const WORKING_DIR_DESC_DIAGNOSTIC: &str = "Absolute path to the directory to diagnose. STRONGLY RECOMMENDED to pass \
+     explicitly: this tool is most useful when pointed at the workspace where \
+     a cargo command misbehaved. If omitted, defaults to the cargo-mcp server \
+     process's working directory, which is typically NOT your workspace.";
+
 /// The result of a tool call, which may carry actionable suggestions.
 pub enum ToolResult {
     /// Plain text output (no suggestions to extract).
@@ -213,15 +239,13 @@ pub fn list() -> Value {
                  package metadata as structured JSON: workspace root, all member \
                  packages, targets, dependencies, features, and the resolved \
                  dependency graph. Use this to understand project structure instead \
-                 of reading Cargo.toml files manually.",
+                 of reading Cargo.toml files manually. ALWAYS pass `working_dir` set to the absolute path of your workspace root \u{2014} the default is the cargo-mcp server's own working directory and will usually cause the call to fail.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "working_dir": {
                         "type": "string",
-                        "description":
-                            "Absolute path to the directory containing the Cargo.toml \
-                             (or a workspace member). Defaults to the current directory."
+                        "description": WORKING_DIR_DESC_METADATA
                     },
                     "no_deps": {
                         "type": "boolean",
@@ -251,15 +275,13 @@ pub fn list() -> Value {
                  compile errors without producing binaries — faster than a full build \
                  and the preferred first step after editing Rust source. Returns \
                  structured NDJSON diagnostics with exact file paths, line/column \
-                 spans, error codes, and message text that you can act on directly.",
+                 spans, error codes, and message text that you can act on directly. ALWAYS pass `working_dir` set to the absolute path of your workspace root \u{2014} the default is the cargo-mcp server's own working directory and will usually cause the call to fail.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "working_dir": {
                         "type": "string",
-                        "description":
-                            "Absolute path to the directory containing the Cargo.toml. \
-                             Defaults to the current directory."
+                        "description": WORKING_DIR_DESC
                     },
                     "package": {
                         "type": "string",
@@ -303,15 +325,13 @@ pub fn list() -> Value {
                  when working in a Rust/Cargo project. Compiles the project and \
                  returns structured NDJSON diagnostics with exact file paths, \
                  line/column spans, and message text. Prefer cargo_check for \
-                 error-only checking when binaries are not needed.",
+                 error-only checking when binaries are not needed. ALWAYS pass `working_dir` set to the absolute path of your workspace root \u{2014} the default is the cargo-mcp server's own working directory and will usually cause the call to fail.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "working_dir": {
                         "type": "string",
-                        "description":
-                            "Absolute path to the directory containing the Cargo.toml. \
-                             Defaults to the current directory."
+                        "description": WORKING_DIR_DESC
                     },
                     "package": {
                         "type": "string",
@@ -358,15 +378,13 @@ pub fn list() -> Value {
                  the test harness output (pass/fail counts and failure details). \
                  Supports filtering by test name, running only library tests, \
                  targeting a specific integration-test file, and continuing past \
-                 failures with no_fail_fast.",
+                 failures with no_fail_fast. ALWAYS pass `working_dir` set to the absolute path of your workspace root \u{2014} the default is the cargo-mcp server's own working directory and will usually cause the call to fail.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "working_dir": {
                         "type": "string",
-                        "description":
-                            "Absolute path to the directory containing the Cargo.toml. \
-                             Defaults to the current directory."
+                        "description": WORKING_DIR_DESC
                     },
                     "package": {
                         "type": "string",
@@ -434,15 +452,13 @@ pub fn list() -> Value {
                  when working in a Rust/Cargo project. Runs lint analysis and returns \
                  structured NDJSON diagnostics with exact file paths, line/column spans, \
                  severity, lint names, and suggested fixes. Use this after editing Rust \
-                 source to catch non-idiomatic patterns and common mistakes.",
+                 source to catch non-idiomatic patterns and common mistakes. ALWAYS pass `working_dir` set to the absolute path of your workspace root \u{2014} the default is the cargo-mcp server's own working directory and will usually cause the call to fail.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "working_dir": {
                         "type": "string",
-                        "description":
-                            "Absolute path to the directory containing the Cargo.toml. \
-                             Defaults to the current directory."
+                        "description": WORKING_DIR_DESC
                     },
                     "package": {
                         "type": "string",
@@ -481,15 +497,13 @@ pub fn list() -> Value {
                  terminal when working in a Rust/Cargo project. Verifies source code \
                  formatting without modifying files. Returns a diff of changes that \
                  would be applied; empty output means the code is already correctly \
-                 formatted. Use this to check formatting before using cargo_fmt to fix it.",
+                 formatted. Use this to check formatting before using cargo_fmt to fix it. ALWAYS pass `working_dir` set to the absolute path of your workspace root \u{2014} the default is the cargo-mcp server's own working directory and will usually cause the call to fail.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "working_dir": {
                         "type": "string",
-                        "description":
-                            "Absolute path to the directory containing the Cargo.toml. \
-                             Defaults to the current directory."
+                        "description": WORKING_DIR_DESC
                     },
                     "package": {
                         "type": "string",
@@ -509,15 +523,13 @@ pub fn list() -> Value {
                  when working in a Rust/Cargo project. Automatically formats all \
                  Rust source files in place according to the project's rustfmt \
                  configuration. Use after editing source code to ensure consistent \
-                 formatting.",
+                 formatting. ALWAYS pass `working_dir` set to the absolute path of your workspace root \u{2014} the default is the cargo-mcp server's own working directory and will usually cause the call to fail.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "working_dir": {
                         "type": "string",
-                        "description":
-                            "Absolute path to the directory containing the Cargo.toml. \
-                             Defaults to the current directory."
+                        "description": WORKING_DIR_DESC
                     },
                     "package": {
                         "type": "string",
@@ -538,15 +550,13 @@ pub fn list() -> Value {
                  as readable text. Use to inspect transitive dependencies, find \
                  duplicate versions, or see which packages depend on a given crate \
                  (via the invert parameter). For structured dependency data use \
-                 cargo_metadata instead.",
+                 cargo_metadata instead. ALWAYS pass `working_dir` set to the absolute path of your workspace root \u{2014} the default is the cargo-mcp server's own working directory and will usually cause the call to fail.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "working_dir": {
                         "type": "string",
-                        "description":
-                            "Absolute path to the directory containing the Cargo.toml. \
-                             Defaults to the current directory."
+                        "description": WORKING_DIR_DESC
                     },
                     "package": {
                         "type": "string",
@@ -589,15 +599,13 @@ pub fn list() -> Value {
                 "ALWAYS use this tool instead of running `cargo doc` in a terminal \
                  when working in a Rust/Cargo project. Builds HTML documentation for \
                  the project (written to target/doc/) and returns structured NDJSON \
-                 diagnostics for any warnings or errors encountered during the build.",
+                 diagnostics for any warnings or errors encountered during the build. ALWAYS pass `working_dir` set to the absolute path of your workspace root \u{2014} the default is the cargo-mcp server's own working directory and will usually cause the call to fail.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "working_dir": {
                         "type": "string",
-                        "description":
-                            "Absolute path to the directory containing the Cargo.toml. \
-                             Defaults to the current directory."
+                        "description": WORKING_DIR_DESC
                     },
                     "package": {
                         "type": "string",
@@ -635,15 +643,13 @@ pub fn list() -> Value {
                 "ALWAYS use this tool instead of running `cargo clean` in a terminal \
                  when working in a Rust/Cargo project. Removes build artefacts from \
                  the target directory, freeing disk space and forcing a full rebuild \
-                 on the next build command. Use when builds are in an inconsistent state.",
+                 on the next build command. Use when builds are in an inconsistent state. ALWAYS pass `working_dir` set to the absolute path of your workspace root \u{2014} the default is the cargo-mcp server's own working directory and will usually cause the call to fail.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "working_dir": {
                         "type": "string",
-                        "description":
-                            "Absolute path to the directory containing the Cargo.toml. \
-                             Defaults to the current directory."
+                        "description": WORKING_DIR_DESC
                     },
                     "package": {
                         "type": "string",
@@ -669,15 +675,13 @@ pub fn list() -> Value {
                  when working in a Rust/Cargo project. Updates dependency versions in \
                  Cargo.lock to the latest compatible versions allowed by Cargo.toml. \
                  Use after adding new dependencies or when you want to pull in \
-                 compatible dependency updates.",
+                 compatible dependency updates. ALWAYS pass `working_dir` set to the absolute path of your workspace root \u{2014} the default is the cargo-mcp server's own working directory and will usually cause the call to fail.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "working_dir": {
                         "type": "string",
-                        "description":
-                            "Absolute path to the directory containing the Cargo.toml. \
-                             Defaults to the current directory."
+                        "description": WORKING_DIR_DESC
                     },
                     "package": {
                         "type": "string",
@@ -703,15 +707,13 @@ pub fn list() -> Value {
                  when working in a Rust/Cargo project. Automatically applies \
                  compiler-suggested fixes (machine-applicable lints and edition \
                  migrations) to source files. Use after cargo_check or cargo_clippy \
-                 to apply safe fixes in bulk. Returns plain text output.",
+                 to apply safe fixes in bulk. Returns plain text output. ALWAYS pass `working_dir` set to the absolute path of your workspace root \u{2014} the default is the cargo-mcp server's own working directory and will usually cause the call to fail.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "working_dir": {
                         "type": "string",
-                        "description":
-                            "Absolute path to the directory containing the Cargo.toml. \
-                             Defaults to the current directory."
+                        "description": WORKING_DIR_DESC
                     },
                     "package": {
                         "type": "string",
@@ -748,15 +750,13 @@ pub fn list() -> Value {
                 "ALWAYS use this tool instead of running `cargo add` in a terminal \
                  when working in a Rust/Cargo project. Adds one or more dependencies \
                  to Cargo.toml and updates Cargo.lock. Specify an exact version with \
-                 the `version` parameter or let Cargo choose the latest compatible release.",
+                 the `version` parameter or let Cargo choose the latest compatible release. ALWAYS pass `working_dir` set to the absolute path of your workspace root \u{2014} the default is the cargo-mcp server's own working directory and will usually cause the call to fail.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "working_dir": {
                         "type": "string",
-                        "description":
-                            "Absolute path to the directory containing the Cargo.toml. \
-                             Defaults to the current directory."
+                        "description": WORKING_DIR_DESC
                     },
                     "dependency": {
                         "type": "string",
@@ -795,15 +795,13 @@ pub fn list() -> Value {
             "description":
                 "ALWAYS use this tool instead of running `cargo remove` in a terminal \
                  when working in a Rust/Cargo project. Removes a dependency from \
-                 Cargo.toml and updates Cargo.lock.",
+                 Cargo.toml and updates Cargo.lock. ALWAYS pass `working_dir` set to the absolute path of your workspace root \u{2014} the default is the cargo-mcp server's own working directory and will usually cause the call to fail.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "working_dir": {
                         "type": "string",
-                        "description":
-                            "Absolute path to the directory containing the Cargo.toml. \
-                             Defaults to the current directory."
+                        "description": WORKING_DIR_DESC
                     },
                     "dependency": {
                         "type": "string",
@@ -838,15 +836,13 @@ pub fn list() -> Value {
                  when working in a Rust/Cargo project. Packages and uploads the crate \
                  to crates.io. IMPORTANT: publishing is permanent — a version cannot \
                  be deleted from crates.io. Always run with dry_run=true first to \
-                 validate the package before publishing for real.",
+                 validate the package before publishing for real. ALWAYS pass `working_dir` set to the absolute path of your workspace root \u{2014} the default is the cargo-mcp server's own working directory and will usually cause the call to fail.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "working_dir": {
                         "type": "string",
-                        "description":
-                            "Absolute path to the directory containing the Cargo.toml. \
-                             Defaults to the current directory."
+                        "description": WORKING_DIR_DESC
                     },
                     "package": {
                         "type": "string",
@@ -898,15 +894,13 @@ pub fn list() -> Value {
                  rust-toolchain.toml is in effect, and the relevant environment \
                  (PATH, CARGO, RUSTC, RUSTUP_TOOLCHAIN, RUSTUP_HOME, CARGO_HOME). \
                  Use this when a cargo command appears to use the wrong toolchain \
-                 (e.g. rust-toolchain.toml seems to be ignored).",
+                 (e.g. rust-toolchain.toml seems to be ignored). ALWAYS pass `working_dir` set to the absolute path of your workspace root \u{2014} the default is the cargo-mcp server's own working directory and will usually cause the call to fail.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "working_dir": {
                         "type": "string",
-                        "description":
-                            "Absolute path to the directory to diagnose. \
-                             Defaults to the current directory."
+                        "description": WORKING_DIR_DESC_DIAGNOSTIC
                     }
                 },
                 "required": []
