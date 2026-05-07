@@ -22,17 +22,24 @@
     },
     "categories": [
         "AI",
-        "Chat",
-        "Other"
+        "Chat"
     ],
     "keywords": [
         "mcp",
         "model-context-protocol",
         "copilot",
+        "copilot-chat",
+        "agent",
+        "ai-tools",
         "cargo",
         "rust",
+        "rustup",
+        "clippy",
+        "rustfmt",
         "build",
-        "ai-tools"
+        "test",
+        "linter",
+        "formatter"
     ],
     "activationEvents": [
         "onStartupFinished"
