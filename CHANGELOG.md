@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.3.2](https://github.com/MikeGrier/cargo-mcp-rs/compare/v0.3.1...v0.3.2) (2026-05-07)
+
+
+### Bug Fixes
+
+* package extension with --pre-release for odd-minor tags ([cba0446](https://github.com/MikeGrier/cargo-mcp-rs/commit/cba0446d77dbd84a191c417e9b08979c7de62d76))
+* use github.event.inputs for pre_release on push events ([1ecc58a](https://github.com/MikeGrier/cargo-mcp-rs/commit/1ecc58a357a76283047af8112414855ede40f4e4))
+
+
+### Miscellaneous Chores
+
+* release 0.3.2 ([f7db078](https://github.com/MikeGrier/cargo-mcp-rs/commit/f7db078f2689b8eee45fbe9a149c483dd4a41677))
+
 ## [0.3.1](https://github.com/MikeGrier/cargo-mcp-rs/compare/v0.2.0...v0.3.1) (2026-05-07)
 
 
