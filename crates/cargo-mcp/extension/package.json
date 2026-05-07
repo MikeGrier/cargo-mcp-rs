@@ -25,18 +25,18 @@
         "Chat"
     ],
     "keywords": [
+        "rust",
+        "cargo",
+        "copilot",
+        "build",
         "mcp",
         "model-context-protocol",
-        "copilot",
         "copilot-chat",
         "agent",
         "ai-tools",
-        "cargo",
-        "rust",
         "rustup",
         "clippy",
         "rustfmt",
-        "build",
         "test",
         "linter",
         "formatter"
