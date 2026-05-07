@@ -178,7 +178,7 @@ Most tools accept these optional parameters:
 
 | Parameter | Type | Description |
 |---|---|---|
-| `working_dir` | string | Absolute path to the Cargo.toml directory. Defaults to cwd. |
+| `working_dir` | string | Absolute path to the directory containing the workspace `Cargo.toml`. **Strongly recommended to pass explicitly.** If omitted, defaults to the cargo-mcp server process's working directory — typically not your workspace, and usually fatal to manifest or `rust-toolchain.toml` resolution. See [Toolchain resolution](#toolchain-resolution) and `cargo_diagnostic`. |
 | `package` | string | Target a specific package within the workspace |
 | `release` | boolean | Use the release profile |
 | `features` | string | Comma-separated list of features to activate |

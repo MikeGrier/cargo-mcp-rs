@@ -574,10 +574,11 @@ impl BuildTracker {
                 let (name, version) = parse_package_id(pkg_id, &v);
 
                 let counter = format!("({}/{})", self.compile_count, self.total_count);
+                let verb = &self.verb;
                 if let Some(reg) = registry_name {
-                    format!("{name} v{version} {counter} [{reg}]")
+                    format!("{verb}: {name} v{version} {counter} [{reg}]")
                 } else {
-                    format!("{name} v{version} {counter}")
+                    format!("{verb}: {name} v{version} {counter}")
                 }
             }
             Some("compiler-message") => {
@@ -595,7 +596,7 @@ impl BuildTracker {
                     return String::new();
                 }
                 let truncated: String = msg.chars().take(120).collect();
-                format!("[{level}] {truncated}")
+                format!("{}: [{level}] {truncated}", self.verb)
             }
             Some("build-finished") => {
                 let ok = v.get("success").and_then(|s| s.as_bool()).unwrap_or(false);

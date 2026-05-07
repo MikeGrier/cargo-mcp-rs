@@ -268,6 +268,50 @@ pub struct CargoOutput {
     pub exit_code: i32,
 }
 
+/// Append a self-diagnosing hint to `stderr` when its content suggests the
+/// failure was caused by `working_dir` defaulting to the cargo-mcp server's
+/// own CWD rather than the user's workspace.
+///
+/// Triggered by:
+/// - `error: could not find `Cargo.toml`` (no manifest under cwd)
+/// - `error: no override and no rust-toolchain.toml found` (rustup couldn't
+///   resolve a toolchain because no manifest/toolchain file is in scope)
+/// - `error: rustup could not choose a version of cargo to run` (same root
+///   cause from rustup's angle)
+///
+/// This short-circuits the misdiagnosis loop where an agent retries with the
+/// same arguments instead of pointing at the workspace explicitly.
+fn maybe_append_working_dir_hint(stderr: &mut String, working_dir: Option<&str>) {
+    let triggers = [
+        "could not find `Cargo.toml`",
+        "no override and no rust-toolchain.toml found",
+        "rustup could not choose a version",
+    ];
+    if !triggers.iter().any(|t| stderr.contains(t)) {
+        return;
+    }
+    let effective_cwd = working_dir.map(String::from).unwrap_or_else(|| {
+        std::env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "<unknown>".into())
+    });
+    let source = if working_dir.is_some() {
+        "(passed by caller)"
+    } else {
+        "(default \u{2014} cargo-mcp server's process CWD; this is almost \
+         certainly NOT your workspace)"
+    };
+    if !stderr.ends_with('\n') {
+        stderr.push('\n');
+    }
+    stderr.push_str(&format!(
+        "\nhint: cargo-mcp's effective working directory was {effective_cwd} {source}. \
+         Pass `working_dir` explicitly, set to the absolute path of your workspace \
+         root (the directory containing the top-level Cargo.toml), then retry. \
+         Use the cargo_diagnostic tool for a full toolchain/path report.\n"
+    ));
+}
+
 // ── subprocess runners ────────────────────────────────────────────────────────
 
 /// Run `cargo <args>`, calling `on_stdout_line` for each stdout line as it
@@ -339,13 +383,17 @@ pub fn run_cargo_streaming(
         return Err(Box::new(CancelledError));
     }
 
-    let stderr_buf = stderr_thread.join().unwrap_or_default();
+    let mut stderr_buf = stderr_thread.join().unwrap_or_default();
     let status = child.wait()?;
+    let exit_code = status.code().unwrap_or(-1);
+    if exit_code != 0 {
+        maybe_append_working_dir_hint(&mut stderr_buf, working_dir);
+    }
 
     Ok(CargoOutput {
         stdout: stdout_buf,
         stderr: stderr_buf,
-        exit_code: status.code().unwrap_or(-1),
+        exit_code,
     })
 }
 
@@ -419,12 +467,16 @@ pub fn run_cargo_to_file(
         }
     };
 
-    let stderr_buf = stderr_thread.join().unwrap_or_default();
+    let mut stderr_buf = stderr_thread.join().unwrap_or_default();
+    let exit_code = status.code().unwrap_or(-1);
+    if exit_code != 0 {
+        maybe_append_working_dir_hint(&mut stderr_buf, working_dir);
+    }
 
     Ok(CargoOutput {
         stdout: String::new(), // nothing buffered; caller reads from dest_file
         stderr: stderr_buf,
-        exit_code: status.code().unwrap_or(-1),
+        exit_code,
     })
 }
 
@@ -512,6 +564,35 @@ mod tests {
         let path = dir.join(bin_name(name));
         std::fs::write(&path, b"#!/bin/sh\n").unwrap();
         path
+    }
+
+    #[test]
+    fn working_dir_hint_appended_for_missing_manifest() {
+        let mut stderr = String::from(
+            "error: could not find `Cargo.toml` in `/some/path` or any parent directory\n",
+        );
+        maybe_append_working_dir_hint(&mut stderr, None);
+        assert!(stderr.contains("hint: cargo-mcp's effective working directory"));
+        assert!(stderr.contains("default"));
+        assert!(stderr.contains("Pass `working_dir` explicitly"));
+    }
+
+    #[test]
+    fn working_dir_hint_appended_for_toolchain_missing() {
+        let mut stderr =
+            String::from("error: no override and no rust-toolchain.toml found in /some/path\n");
+        maybe_append_working_dir_hint(&mut stderr, Some("/explicit/wd"));
+        assert!(stderr.contains("hint:"));
+        assert!(stderr.contains("/explicit/wd"));
+        assert!(stderr.contains("(passed by caller)"));
+    }
+
+    #[test]
+    fn working_dir_hint_not_appended_for_unrelated_error() {
+        let original = "error: unresolved import `nonexistent`\n";
+        let mut stderr = String::from(original);
+        maybe_append_working_dir_hint(&mut stderr, None);
+        assert_eq!(stderr, original, "hint must not fire on unrelated errors");
     }
 
     #[test]
