@@ -29,6 +29,12 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      pre_release:
+        description: "Publish as a Marketplace pre-release (use for odd-minor versions only)"
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: write   # needed to create the GitHub Release
@@ -173,12 +179,20 @@ jobs:
         working-directory: crates/cargo-mcp/extension
         env:
           VSCE_PAT: ${{ secrets.VSCE_PAT }}
+          PRE_RELEASE: ${{ inputs.pre_release }}
         shell: bash
         run: |
           set -euo pipefail
           if [ -z "${VSCE_PAT:-}" ]; then
               echo "::error::VSCE_PAT secret is not set on the 'marketplace' environment"
               exit 1
+          fi
+          # Optional pre-release flag (only settable via workflow_dispatch).
+          # Tag-triggered runs always publish as stable.
+          pre_flag=""
+          if [ "${PRE_RELEASE:-false}" = "true" ]; then
+              pre_flag="--pre-release"
+              echo "Publishing as Marketplace pre-release"
           fi
           # Publish each per-target VSIX. `vsce publish --packagePath`
           # uploads an already-built VSIX rather than repackaging, which
@@ -188,7 +202,7 @@ jobs:
           published=0
           for vsix in ../../../vsix/*/*.vsix; do
               echo "Publishing $vsix"
-              npx vsce publish --packagePath "$vsix" --pat "$VSCE_PAT"
+              npx vsce publish $pre_flag --packagePath "$vsix" --pat "$VSCE_PAT"
               published=$((published + 1))
           done
           if [ "$published" -eq 0 ]; then
