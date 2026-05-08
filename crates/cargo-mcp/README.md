@@ -1,11 +1,18 @@
 # cargo-mcp — Cargo tools for GitHub Copilot
 
-`cargo-mcp` is a [Model Context Protocol (MCP)](https://modelcontextprotocol.io/)
-server that gives GitHub Copilot direct access to Cargo's build system. Instead of
-running `cargo check`, `cargo build`, `cargo test`, and friends in a terminal,
-Copilot calls them as structured tools — getting rich diagnostics with exact file
-paths and line numbers it can act on immediately, with streaming progress as
-operations run.
+When GitHub Copilot needs to compile, test, lint, format, or inspect a Rust
+project, it normally types `cargo` commands into a terminal and reads the
+output as plain text. **cargo-mcp** replaces that with a structured channel:
+Copilot calls `cargo_check`, `cargo_build`, `cargo_test`, `cargo_clippy`,
+`cargo_fmt`, `cargo_doc`, `cargo_tree`, and friends as first-class tools and
+gets back machine-readable diagnostics with exact file paths and line numbers
+it can act on immediately. Builds stream live progress, suggested fixes can be
+reviewed and applied with one click, and transient Windows file-in-use errors
+are retried automatically so they don't derail a multi-step task.
+
+It's a [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server
+under the hood — the protocol that lets editors and agents share tools — but
+once installed it's invisible: Copilot just gets noticeably better at Rust.
 
 ---
 
@@ -355,6 +362,47 @@ If you suspect the wrong toolchain is being used, call the `cargo_diagnostic`
 tool — it returns the resolved paths, `cargo --version --verbose` output, the
 location and contents of any `rust-toolchain.toml` found by walking ancestor
 directories, and the relevant env vars in a single report.
+
+---
+
+## Transient "file in use" failures (Windows)
+
+On Windows, Cargo builds frequently fail mid-flight with messages like:
+
+```
+error: failed to remove file `target\debug\foo.exe`:
+  The process cannot access the file because it is being used by another
+  process. (os error 32)
+```
+
+```
+error: failed to write `target\debug\foo.pdb`: Access is denied. (os error 5)
+```
+
+These are virtually always transient — an antivirus scanner, file indexer, or
+the previous `rustc` invocation has briefly grabbed an open handle on a file
+in `target\` and will release it within a fraction of a second. Re-running the
+exact same cargo command immediately succeeds.
+
+cargo-mcp detects these errors automatically and retries the cargo invocation.
+The retry is gated to commands that are inherently idempotent (`check`,
+`build`, `test`, `clippy`, `fmt`, `doc`, `tree`, `clean`, `update`, `fix`) and
+only fires when cargo's combined output contains a recognised file-busy
+pattern (`os error 32`, `os error 5`, *being used by another process*,
+*access is denied*, *sharing violation*). Each retry emits a streaming
+progress notification so it's visible in the chat panel.
+
+It is **on by default**. The behaviour is controlled by three settings:
+
+| VS Code setting | CLI flag | Default | Description |
+|---|---|---|---|
+| `cargo-mcp.retry.onBusy` | `--retry-on-busy=<bool>` | `true` | Master switch. Disable to make file-busy errors surface immediately. |
+| `cargo-mcp.retry.delayMs` | `--retry-delay-ms=<n>` | `500` | Delay between attempts, in milliseconds. |
+| `cargo-mcp.retry.maxAttempts` | `--retry-max-attempts=<n>` | `3` | Maximum total attempts (initial try + retries). |
+
+Non-idempotent commands (`cargo_publish`, `cargo_add`, `cargo_remove`) and
+direct-to-file streaming (the `output_file` mode of `cargo_metadata`) are
+**never** retried, regardless of the setting.
 
 ---
 

@@ -1,13 +1,26 @@
 # Cargo MCP for VS Code
 
-Give GitHub Copilot direct access to Cargo's build system. Instead of running
-`cargo check`, `cargo build`, `cargo test`, and friends in a terminal, Copilot
-calls them as structured [Model Context Protocol](https://modelcontextprotocol.io/)
-tools — getting rich diagnostics with exact file paths and line numbers it can
-act on immediately, with streaming progress as operations run.
+Make GitHub Copilot dramatically better at Rust. When Copilot needs to build,
+test, lint, format, or inspect a Rust project, instead of typing `cargo`
+commands into a terminal and parsing the text output, it calls `cargo_check`,
+`cargo_build`, `cargo_test`, `cargo_clippy`, `cargo_fmt`, `cargo_doc`,
+`cargo_tree` and friends as structured tools. The result:
 
-This extension bundles the `cargo-mcp` server binary and registers it with
-VS Code automatically — no manual `mcp.json` configuration required.
+- **Precise diagnostics** — exact file paths and line numbers Copilot can act
+  on directly, instead of best-effort parsing of compiler text.
+- **Streaming progress** — long builds report live status in the chat panel
+  so you can see what's happening.
+- **One-click fixes** — machine-applicable Clippy and `rustc` suggestions can
+  be reviewed in a checkbox dialog and applied without copy/paste.
+- **Automatic retry on Windows file-in-use errors** — transient antivirus /
+  file-indexer collisions in `target\` no longer derail multi-step tasks.
+- **Toolchain transparency** — the `cargo_diagnostic` tool reports exactly
+  which `cargo` and `rustc` will be invoked and why.
+
+Under the hood it's a [Model Context Protocol](https://modelcontextprotocol.io/)
+server, but you don't need to think about that: this extension bundles the
+server binary and registers it with VS Code automatically — no manual
+`mcp.json` configuration required.
 
 > **Platforms:** This extension ships pre-built binaries for **Windows
 > (x64 and arm64)** only. Users on Linux/macOS should
@@ -117,10 +130,13 @@ itself, not specific to this extension).
 
 ## Settings
 
-| Setting | Description |
-|---|---|
-| `cargo-mcp.binaryPath` | Override the path to the `cargo-mcp` binary. Leave blank to use the bundled one. Intended for development against a locally-built server. |
-| `cargo-mcp.elicitationMode` | How to handle machine-applicable fix suggestions: `prompt` (default), `always-accept`, or `always-skip`. |
+| Setting | Default | Description |
+|---|---|---|
+| `cargo-mcp.binaryPath` | _(bundled)_ | Override the path to the `cargo-mcp` binary. Leave blank to use the bundled one. Intended for development against a locally-built server. |
+| `cargo-mcp.elicitationMode` | `always-skip` | How to handle machine-applicable fix suggestions: `prompt`, `always-accept`, or `always-skip`. |
+| `cargo-mcp.retry.onBusy` | `true` | Retry idempotent cargo invocations when they fail with a transient Windows file-locking error (`os error 32` *sharing violation*, `os error 5` *access denied*, *being used by another process*). These usually clear themselves within a fraction of a second once an antivirus, file indexer, or stray process releases the handle. |
+| `cargo-mcp.retry.delayMs` | `500` | Delay between retry attempts, in milliseconds. |
+| `cargo-mcp.retry.maxAttempts` | `3` | Maximum total attempts (initial try + retries). |
 
 ---
 

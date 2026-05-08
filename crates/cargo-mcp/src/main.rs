@@ -45,17 +45,40 @@ impl ElicitationMode {
     }
 }
 
-fn parse_config() -> (ElicitationMode, u64, Vec<String>) {
-    let mut mode = ElicitationMode::AlwaysSkip;
-    let mut progress_delay_ms: u64 = 0;
-    let mut warnings: Vec<String> = Vec::new();
+/// Parsed startup configuration.
+struct StartupConfig {
+    elicitation_mode: ElicitationMode,
+    progress_delay_ms: u64,
+    retry_on_busy: bool,
+    retry_delay_ms: u64,
+    retry_max_attempts: u32,
+    warnings: Vec<String>,
+}
+
+fn parse_bool_flag(value: &str) -> Option<bool> {
+    match value.to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Some(true),
+        "false" | "0" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn parse_config() -> StartupConfig {
+    let mut cfg = StartupConfig {
+        elicitation_mode: ElicitationMode::AlwaysSkip,
+        progress_delay_ms: 0,
+        retry_on_busy: true,
+        retry_delay_ms: 500,
+        retry_max_attempts: 3,
+        warnings: Vec::new(),
+    };
     for arg in std::env::args_os().skip(1) {
         let s = arg.to_string_lossy();
         if let Some(rest) = s.strip_prefix("--elicitation-mode=") {
             match ElicitationMode::from_str(rest) {
-                Some(m) => mode = m,
+                Some(m) => cfg.elicitation_mode = m,
                 None => {
-                    warnings.push(format!(
+                    cfg.warnings.push(format!(
                         "ignoring invalid --elicitation-mode value: {rest:?} \
                          (expected: prompt, always-accept, always-skip)"
                     ));
@@ -63,17 +86,47 @@ fn parse_config() -> (ElicitationMode, u64, Vec<String>) {
             }
         } else if let Some(rest) = s.strip_prefix("--progress-delay-ms=") {
             match rest.parse::<u64>() {
-                Ok(n) => progress_delay_ms = n,
+                Ok(n) => cfg.progress_delay_ms = n,
                 Err(_) => {
-                    warnings.push(format!(
+                    cfg.warnings.push(format!(
                         "ignoring invalid --progress-delay-ms value: {rest:?} \
                          (expected a non-negative integer)"
                     ));
                 }
             }
+        } else if let Some(rest) = s.strip_prefix("--retry-on-busy=") {
+            match parse_bool_flag(rest) {
+                Some(b) => cfg.retry_on_busy = b,
+                None => {
+                    cfg.warnings.push(format!(
+                        "ignoring invalid --retry-on-busy value: {rest:?} \
+                         (expected: true or false)"
+                    ));
+                }
+            }
+        } else if let Some(rest) = s.strip_prefix("--retry-delay-ms=") {
+            match rest.parse::<u64>() {
+                Ok(n) => cfg.retry_delay_ms = n,
+                Err(_) => {
+                    cfg.warnings.push(format!(
+                        "ignoring invalid --retry-delay-ms value: {rest:?} \
+                         (expected a non-negative integer)"
+                    ));
+                }
+            }
+        } else if let Some(rest) = s.strip_prefix("--retry-max-attempts=") {
+            match rest.parse::<u32>() {
+                Ok(n) if n >= 1 => cfg.retry_max_attempts = n,
+                _ => {
+                    cfg.warnings.push(format!(
+                        "ignoring invalid --retry-max-attempts value: {rest:?} \
+                         (expected a positive integer)"
+                    ));
+                }
+            }
         }
     }
-    (mode, progress_delay_ms, warnings)
+    cfg
 }
 
 // ── JSON-RPC 2.0 wire types ───────────────────────────────────────────────────
@@ -121,7 +174,16 @@ mod code {
 // ── event loop ────────────────────────────────────────────────────────────────
 
 fn main() {
-    let (elicitation_mode, progress_delay_ms, startup_warnings) = parse_config();
+    let cfg = parse_config();
+    let elicitation_mode = cfg.elicitation_mode;
+    let progress_delay_ms = cfg.progress_delay_ms;
+
+    // Push retry configuration into the invoke layer's static config.
+    invoke::set_retry_config(
+        cfg.retry_on_busy,
+        cfg.retry_delay_ms,
+        cfg.retry_max_attempts,
+    );
 
     let stdin = io::stdin();
     let stdout = io::stdout();
@@ -154,10 +216,25 @@ fn main() {
             format!("progress delay: {progress_delay_ms}ms (developer mode)"),
         );
     }
+    if cfg.retry_on_busy {
+        log_info(
+            &mut out,
+            format!(
+                "retry on transient busy errors: enabled (delay={delay}ms, max attempts={max})",
+                delay = cfg.retry_delay_ms,
+                max = cfg.retry_max_attempts,
+            ),
+        );
+    } else {
+        log_info(
+            &mut out,
+            "retry on transient busy errors: disabled".to_string(),
+        );
+    }
 
     // Replay any warnings collected during CLI parsing through the MCP log
     // channel now that the stdout writer is available.
-    for w in startup_warnings {
+    for w in cfg.warnings {
         log_warn(&mut out, w);
     }
 

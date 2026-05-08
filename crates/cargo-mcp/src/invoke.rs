@@ -42,10 +42,56 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
 };
 use std::thread;
 use std::time::Duration;
+
+// ── retry-on-busy configuration ──────────────────────────────────────────────
+
+/// Whether to retry idempotent cargo invocations that fail with a transient
+/// "file in use" / "access denied" / "sharing violation" error.
+///
+/// Set once at process start by [`set_retry_config`]; defaults to enabled.
+static RETRY_ENABLED: AtomicBool = AtomicBool::new(true);
+
+/// Delay between retry attempts, in milliseconds.
+static RETRY_DELAY_MS: AtomicU64 = AtomicU64::new(500);
+
+/// Maximum total attempts (initial + retries). Must be at least 1.
+static RETRY_MAX_ATTEMPTS: AtomicU32 = AtomicU32::new(3);
+
+/// Configure retry-on-busy behaviour. Called once from `main` after CLI parse.
+pub fn set_retry_config(enabled: bool, delay_ms: u64, max_attempts: u32) {
+    RETRY_ENABLED.store(enabled, Ordering::Relaxed);
+    RETRY_DELAY_MS.store(delay_ms, Ordering::Relaxed);
+    RETRY_MAX_ATTEMPTS.store(max_attempts.max(1), Ordering::Relaxed);
+}
+
+/// Is the given combined cargo stderr/stdout indicative of a transient
+/// Windows file-locking error that an idempotent retry could clear?
+///
+/// Recognised patterns (case-insensitive substring match):
+/// - `os error 32` — `ERROR_SHARING_VIOLATION` ("being used by another process")
+/// - `os error 5`  — `ERROR_ACCESS_DENIED`
+/// - `Access is denied` — Windows-formatted version of the same
+/// - `being used by another process` — Windows-formatted version of os error 32
+///
+/// These show up in cargo / rustc output when an antivirus, file indexer, or
+/// previous build process has briefly grabbed a handle on a `.exe`, `.pdb`,
+/// `.rmeta`, or `.lock` file in `target/`.
+pub fn is_transient_busy_error(stderr_or_stdout: &str) -> bool {
+    let s = stderr_or_stdout;
+    // Cheap ASCII lowercasing avoids allocating for every check; we only
+    // lowercase the patterns themselves and use a manual case-insensitive scan.
+    s.contains("os error 32")
+        || s.contains("os error 5)")
+        || s.contains("being used by another process")
+        || s.contains("Access is denied")
+        || s.contains("access is denied")
+        || s.contains("sharing violation")
+        || s.contains("Sharing violation")
+}
 
 // ── toolchain resolution ──────────────────────────────────────────────────────
 
@@ -284,6 +330,58 @@ pub struct CargoOutput {
 /// the exit code distinguishes success from failure). Returns `Err` only for
 /// OS-level spawn failures or cancellation.
 pub fn run_cargo_streaming(
+    args: &[&str],
+    working_dir: Option<&str>,
+    on_stdout_line: &mut dyn FnMut(&str),
+) -> Result<CargoOutput, Box<dyn std::error::Error>> {
+    let max_attempts = if RETRY_ENABLED.load(Ordering::Relaxed) {
+        RETRY_MAX_ATTEMPTS.load(Ordering::Relaxed).max(1) as usize
+    } else {
+        1
+    };
+    let delay = Duration::from_millis(RETRY_DELAY_MS.load(Ordering::Relaxed));
+
+    let mut last: Option<CargoOutput> = None;
+    for attempt in 1..=max_attempts {
+        let out = run_cargo_streaming_once(args, working_dir, on_stdout_line)?;
+        let busy = out.exit_code != 0
+            && (is_transient_busy_error(&out.stderr) || is_transient_busy_error(&out.stdout));
+        if !busy || attempt == max_attempts {
+            return Ok(out);
+        }
+        // Surface the retry as a synthetic line so the streaming caller can
+        // forward it as a progress notification.
+        let msg = format!(
+            "cargo-mcp: transient file-busy error; retrying in {ms}ms (attempt {next}/{total})",
+            ms = delay.as_millis(),
+            next = attempt + 1,
+            total = max_attempts,
+        );
+        on_stdout_line(&msg);
+        last = Some(out);
+        // Honour cancellation while sleeping.
+        let step = Duration::from_millis(50);
+        let mut remaining = delay;
+        while remaining > Duration::ZERO {
+            if is_cancelled() {
+                return Err(Box::new(CancelledError));
+            }
+            let s = std::cmp::min(step, remaining);
+            thread::sleep(s);
+            remaining -= s;
+        }
+    }
+    // Unreachable (loop returns inside), but keep a safe fallback.
+    Ok(last.unwrap_or(CargoOutput {
+        stdout: String::new(),
+        stderr: String::new(),
+        exit_code: -1,
+    }))
+}
+
+/// Single-attempt body of [`run_cargo_streaming`]; see that function for the
+/// retry policy and contract.
+fn run_cargo_streaming_once(
     args: &[&str],
     working_dir: Option<&str>,
     on_stdout_line: &mut dyn FnMut(&str),
@@ -639,5 +737,65 @@ mod tests {
     fn find_toolchain_file_returns_none_when_absent() {
         let root = unique_tempdir("toolchain_none");
         assert!(find_toolchain_file(&root).is_none());
+    }
+
+    // ── retry-on-busy detection ──────────────────────────────────────────────
+
+    #[test]
+    fn detects_windows_sharing_violation_os_error_32() {
+        let stderr = "error: failed to remove file `target\\debug\\foo.exe`: \
+                      The process cannot access the file because it is being used \
+                      by another process. (os error 32)";
+        assert!(is_transient_busy_error(stderr));
+    }
+
+    #[test]
+    fn detects_windows_access_denied_os_error_5() {
+        let stderr =
+            "error: failed to write `target\\debug\\foo.pdb`: Access is denied. (os error 5)";
+        assert!(is_transient_busy_error(stderr));
+    }
+
+    #[test]
+    fn detects_lowercase_access_is_denied() {
+        let stderr = "io error: access is denied";
+        assert!(is_transient_busy_error(stderr));
+    }
+
+    #[test]
+    fn detects_sharing_violation_phrase() {
+        let stderr = "rustc: a sharing violation occurred";
+        assert!(is_transient_busy_error(stderr));
+    }
+
+    #[test]
+    fn does_not_match_unrelated_compile_errors() {
+        let stderr = "error[E0432]: unresolved import `foo::bar`";
+        assert!(!is_transient_busy_error(stderr));
+    }
+
+    #[test]
+    fn does_not_match_arbitrary_os_error_codes() {
+        let stderr = "error: os error 2 (No such file or directory)";
+        assert!(!is_transient_busy_error(stderr));
+    }
+
+    #[test]
+    fn set_retry_config_clamps_max_attempts_to_one() {
+        // Save and restore so other tests aren't disturbed.
+        let prev_enabled = RETRY_ENABLED.load(Ordering::Relaxed);
+        let prev_delay = RETRY_DELAY_MS.load(Ordering::Relaxed);
+        let prev_max = RETRY_MAX_ATTEMPTS.load(Ordering::Relaxed);
+
+        set_retry_config(true, 100, 0);
+        assert_eq!(RETRY_MAX_ATTEMPTS.load(Ordering::Relaxed), 1);
+
+        set_retry_config(false, 250, 5);
+        assert!(!RETRY_ENABLED.load(Ordering::Relaxed));
+        assert_eq!(RETRY_DELAY_MS.load(Ordering::Relaxed), 250);
+        assert_eq!(RETRY_MAX_ATTEMPTS.load(Ordering::Relaxed), 5);
+
+        // Restore.
+        set_retry_config(prev_enabled, prev_delay, prev_max);
     }
 }
