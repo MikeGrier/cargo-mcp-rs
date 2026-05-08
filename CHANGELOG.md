@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.4.1](https://github.com/MikeGrier/cargo-mcp-rs/compare/v0.4.0...v0.4.1) (2026-05-08)
+
+
+### Bug Fixes
+
+* **extension:** point Marketplace Q&A link to GitHub Discussions ([c728e69](https://github.com/MikeGrier/cargo-mcp-rs/commit/c728e69c5d6b9cc80d9cf852bfd4793512a41dd3))
+* **extension:** point Marketplace Q&A link to GitHub Discussions ([aab6844](https://github.com/MikeGrier/cargo-mcp-rs/commit/aab68449245ecc72f3c711d39c21a84c51baae2c))
+
 ## [0.4.0](https://github.com/MikeGrier/cargo-mcp-rs/compare/v0.3.2...v0.4.0) (2026-05-07)
 
 
