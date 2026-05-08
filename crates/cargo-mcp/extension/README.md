@@ -33,6 +33,20 @@ Install, reload, run `/cargo-mcp:setup` once per repo. That's it.
 
 ---
 
+## Screenshots
+
+> **Note:** The images below are placeholders shipped with the initial
+> release; real screenshots will replace them in a follow-up.
+
+| | |
+|---|---|
+| ![Streaming build progress](images/streaming-build.png) | ![Reviewable Clippy suggestions](images/clippy-suggestions.png) |
+| **Streaming build progress** in the chat panel. | **Clippy suggestions** in a reviewable checkbox dialog. |
+| ![Precise diagnostics](images/diagnostics.png) |  |
+| **Precise diagnostics** with exact file paths and line numbers. |  |
+
+---
+
 ## Quick start
 
 1. **Install this extension.**
