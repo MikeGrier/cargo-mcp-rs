@@ -432,3 +432,4 @@ cargo install --path crates/cargo-mcp --root ~
 
 Then configure VS Code manually as shown in the
 [Manual server configuration](#manual-server-configuration) section above.
+
