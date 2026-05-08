@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.4.1](https://github.com/MikeGrier/cargo-mcp-rs/compare/v0.4.0...v0.4.1) (2026-05-08)
+
+
+### Bug Fixes
+
+* **extension:** point Marketplace Q&A link to GitHub Discussions ([c728e69](https://github.com/MikeGrier/cargo-mcp-rs/commit/c728e69c5d6b9cc80d9cf852bfd4793512a41dd3))
+* **extension:** point Marketplace Q&A link to GitHub Discussions ([aab6844](https://github.com/MikeGrier/cargo-mcp-rs/commit/aab68449245ecc72f3c711d39c21a84c51baae2c))
+
+## [0.4.0](https://github.com/MikeGrier/cargo-mcp-rs/compare/v0.3.2...v0.4.0) (2026-05-07)
+
+
+### Features
+
+* **progress:** prefix per-crate progress messages with the cargo verb ([da71bc8](https://github.com/MikeGrier/cargo-mcp-rs/commit/da71bc819ecb9febea7ee2b2943cbabfea343a8c))
+
+
+### Bug Fixes
+
+* **tools:** warn that working_dir defaults to the server CWD; prefix progress messages with the cargo verb ([341dd82](https://github.com/MikeGrier/cargo-mcp-rs/commit/341dd8291daed6eaff0977b4f1436ba0e8058c6f))
+* **tools:** warn that working_dir defaults to the server process CWD ([c60337b](https://github.com/MikeGrier/cargo-mcp-rs/commit/c60337bca76b0f31e10a3f5a7d4f48dcc275aedd))
+
 ## [0.3.2](https://github.com/MikeGrier/cargo-mcp-rs/compare/v0.3.1...v0.3.2) (2026-05-07)
 
 

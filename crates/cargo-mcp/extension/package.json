@@ -2,7 +2,7 @@
     "name": "cargo-mcp",
     "displayName": "Cargo MCP",
     "description": "MCP server for Cargo workspace operations: check, build, test, clippy, fmt, tree, doc, and clean — callable directly from Copilot Chat with structured JSON output.",
-    "version": "0.3.2",
+    "version": "0.4.1",
     "publisher": "MikeGrierTools",
     "license": "MIT",
     "author": {
@@ -17,6 +17,7 @@
         "url": "https://github.com/MikeGrier/cargo-mcp-rs/issues"
     },
     "homepage": "https://github.com/MikeGrier/cargo-mcp-rs/tree/main/crates/cargo-mcp",
+    "qna": "https://github.com/MikeGrier/cargo-mcp-rs/discussions/categories/q-a",
     "engines": {
         "vscode": "^1.101.0"
     },
