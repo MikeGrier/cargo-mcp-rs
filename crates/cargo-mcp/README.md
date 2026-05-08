@@ -386,10 +386,13 @@ exact same cargo command immediately succeeds.
 
 cargo-mcp detects these errors automatically and retries the cargo invocation.
 The retry is gated to commands that are inherently idempotent (`check`,
-`build`, `test`, `clippy`, `fmt`, `doc`, `tree`, `clean`, `update`, `fix`) and
-only fires when cargo's combined output contains a recognised file-busy
-pattern (`os error 32`, `os error 5`, *being used by another process*,
-*access is denied*, *sharing violation*). Each retry emits a streaming
+`build`, `test`, `clippy`, `fmt`, `doc`, `tree`, `clean`, `update`, `fix`,
+`metadata`) and only fires when cargo's combined output contains a recognised
+file-busy pattern: the phrases *being used by another process*, *access is
+denied*, or *sharing violation*, or — only when running on Windows — the
+parenthesised error codes `(os error 32)` and `(os error 5)`. (The bare
+codes are gated to Windows because errno 32 / 5 mean *broken pipe* / *I/O
+error* on POSIX, which are not retry-worthy.) Each retry emits a streaming
 progress notification so it's visible in the chat panel.
 
 It is **on by default**. The behaviour is controlled by three settings:

@@ -68,24 +68,51 @@ pub fn set_retry_config(enabled: bool, delay_ms: u64, max_attempts: u32) {
     RETRY_MAX_ATTEMPTS.store(max_attempts.max(1), Ordering::Relaxed);
 }
 
+/// Cargo subcommands whose retry on a transient file-busy error is safe
+/// because the operation is idempotent — re-running cannot produce duplicate
+/// state changes (no crates published twice, no `Cargo.toml` mutated twice,
+/// etc.). Anything not on this list is **never** retried by
+/// [`run_cargo_streaming`], regardless of the user's retry settings.
+const IDEMPOTENT_SUBCOMMANDS: &[&str] = &[
+    "check", "build", "test", "clippy", "fmt", "doc", "tree", "clean", "update", "fix", "metadata",
+];
+
+/// Returns `true` iff `args[0]` (the cargo subcommand) is in
+/// [`IDEMPOTENT_SUBCOMMANDS`].
+fn is_retry_safe(args: &[&str]) -> bool {
+    args.first()
+        .is_some_and(|sub| IDEMPOTENT_SUBCOMMANDS.contains(sub))
+}
+
 /// Is the given combined cargo stderr/stdout indicative of a transient
 /// Windows file-locking error that an idempotent retry could clear?
 ///
-/// Recognised patterns (case-insensitive substring match):
-/// - `os error 32` — `ERROR_SHARING_VIOLATION` ("being used by another process")
-/// - `os error 5`  — `ERROR_ACCESS_DENIED`
-/// - `Access is denied` — Windows-formatted version of the same
-/// - `being used by another process` — Windows-formatted version of os error 32
+/// Pattern matching is **case-sensitive** because every known producer of
+/// these messages (cargo, rustc, Windows `FormatMessage`) emits them with
+/// stable casing. Matches are anchored with surrounding parentheses where
+/// applicable to avoid false positives such as `os error 320`.
+///
+/// Recognised patterns:
+/// - `(os error 32)` — `ERROR_SHARING_VIOLATION` ("being used by another
+///   process"). On non-Windows hosts the same numeric code maps to `EPIPE`,
+///   which is **not** a retry-worthy condition, so this pattern is gated to
+///   `cfg!(windows)`.
+/// - `(os error 5)` — `ERROR_ACCESS_DENIED`. Same Windows-only gate; on
+///   POSIX, errno 5 is `EIO` which we don't want to retry.
+/// - `being used by another process` — Windows-formatted form of error 32.
+/// - `Access is denied` / `access is denied` — both common casings of the
+///   Windows-formatted form of error 5.
+/// - `sharing violation` / `Sharing violation` — both common casings of the
+///   Windows-formatted form of error 32.
 ///
 /// These show up in cargo / rustc output when an antivirus, file indexer, or
 /// previous build process has briefly grabbed a handle on a `.exe`, `.pdb`,
 /// `.rmeta`, or `.lock` file in `target/`.
 pub fn is_transient_busy_error(stderr_or_stdout: &str) -> bool {
     let s = stderr_or_stdout;
-    // Cheap ASCII lowercasing avoids allocating for every check; we only
-    // lowercase the patterns themselves and use a manual case-insensitive scan.
-    s.contains("os error 32")
-        || s.contains("os error 5)")
+    let os_error_match =
+        cfg!(windows) && (s.contains("(os error 32)") || s.contains("(os error 5)"));
+    os_error_match
         || s.contains("being used by another process")
         || s.contains("Access is denied")
         || s.contains("access is denied")
@@ -334,7 +361,11 @@ pub fn run_cargo_streaming(
     working_dir: Option<&str>,
     on_stdout_line: &mut dyn FnMut(&str),
 ) -> Result<CargoOutput, Box<dyn std::error::Error>> {
-    let max_attempts = if RETRY_ENABLED.load(Ordering::Relaxed) {
+    // Retry only for cargo subcommands that are inherently idempotent. This
+    // is the gate that keeps `cargo_publish`, `cargo_add`, `cargo_remove`
+    // (and anything else not in `IDEMPOTENT_SUBCOMMANDS`) from being silently
+    // re-executed on a transient busy error.
+    let max_attempts = if RETRY_ENABLED.load(Ordering::Relaxed) && is_retry_safe(args) {
         RETRY_MAX_ATTEMPTS.load(Ordering::Relaxed).max(1) as usize
     } else {
         1
@@ -742,7 +773,10 @@ mod tests {
     // ── retry-on-busy detection ──────────────────────────────────────────────
 
     #[test]
-    fn detects_windows_sharing_violation_os_error_32() {
+    fn detects_windows_sharing_violation_via_phrase() {
+        // The phrase "being used by another process" is recognised on every
+        // host (it's a Windows-formatted message that may surface in stderr
+        // captured by cross-compilation tooling, etc.).
         let stderr = "error: failed to remove file `target\\debug\\foo.exe`: \
                       The process cannot access the file because it is being used \
                       by another process. (os error 32)";
@@ -750,7 +784,8 @@ mod tests {
     }
 
     #[test]
-    fn detects_windows_access_denied_os_error_5() {
+    fn detects_windows_access_denied_via_phrase() {
+        // Even on non-Windows, the phrase "Access is denied" alone is enough.
         let stderr =
             "error: failed to write `target\\debug\\foo.pdb`: Access is denied. (os error 5)";
         assert!(is_transient_busy_error(stderr));
@@ -778,6 +813,63 @@ mod tests {
     fn does_not_match_arbitrary_os_error_codes() {
         let stderr = "error: os error 2 (No such file or directory)";
         assert!(!is_transient_busy_error(stderr));
+    }
+
+    #[test]
+    fn os_error_32_without_parens_is_not_a_match_to_avoid_false_positives() {
+        // Without the surrounding parens this could be `os error 320` etc.;
+        // the previous (looser) implementation would mis-match. Verify the
+        // tightened pattern rejects substring lookalikes.
+        let stderr = "error: random text mentioning os error 320";
+        assert!(!is_transient_busy_error(stderr));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn detects_parenthesised_os_error_32_on_windows() {
+        let stderr = "io error (os error 32)";
+        assert!(is_transient_busy_error(stderr));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn detects_parenthesised_os_error_5_on_windows() {
+        let stderr = "io error (os error 5)";
+        assert!(is_transient_busy_error(stderr));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn ignores_parenthesised_os_error_32_on_non_windows_because_it_means_epipe() {
+        // On POSIX, errno 32 is EPIPE — not retry-worthy. The phrase
+        // version of the same message is what we want to match instead.
+        let stderr = "io error (os error 32)";
+        assert!(!is_transient_busy_error(stderr));
+    }
+
+    #[test]
+    fn is_retry_safe_allows_idempotent_subcommands() {
+        for sub in [
+            "check", "build", "test", "clippy", "fmt", "doc", "tree", "clean", "update", "fix",
+            "metadata",
+        ] {
+            assert!(is_retry_safe(&[sub]), "{sub} should be retry-safe");
+        }
+    }
+
+    #[test]
+    fn is_retry_safe_rejects_non_idempotent_subcommands() {
+        for sub in ["publish", "add", "remove", "yank", "owner", "login"] {
+            assert!(
+                !is_retry_safe(&[sub]),
+                "{sub} should NOT be retry-safe (state-changing)"
+            );
+        }
+    }
+
+    #[test]
+    fn is_retry_safe_rejects_empty_args() {
+        assert!(!is_retry_safe(&[]));
     }
 
     #[test]

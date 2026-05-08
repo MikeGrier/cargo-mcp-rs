@@ -100,7 +100,7 @@ fn parse_config() -> StartupConfig {
                 None => {
                     cfg.warnings.push(format!(
                         "ignoring invalid --retry-on-busy value: {rest:?} \
-                         (expected: true or false)"
+                         (expected one of: true/false, 1/0, yes/no, on/off)"
                     ));
                 }
             }
