@@ -386,14 +386,19 @@ exact same cargo command immediately succeeds.
 
 cargo-mcp detects these errors automatically and retries the cargo invocation.
 The retry is gated to commands that are inherently idempotent (`check`,
-`build`, `test`, `clippy`, `fmt`, `doc`, `tree`, `clean`, `update`, `fix`,
-`metadata`) and only fires when cargo's combined output contains a recognised
-file-busy pattern: the phrases *being used by another process*, *access is
-denied*, or *sharing violation*, or — only when running on Windows — the
-parenthesised error codes `(os error 32)` and `(os error 5)`. (The bare
-codes are gated to Windows because errno 32 / 5 mean *broken pipe* / *I/O
-error* on POSIX, which are not retry-worthy.) Each retry emits a streaming
-progress notification so it's visible in the chat panel.
+`build`, `test`, `clippy`, `fmt`, `doc`, `tree`, `clean`, `metadata`) and
+only fires when cargo's combined output contains a recognised file-busy
+pattern: the phrases *being used by another process*, *access is denied*, or
+*sharing violation*, or — only when running on Windows — the parenthesised
+error codes `(os error 32)` and `(os error 5)`. (The bare codes are gated to
+Windows because errno 32 / 5 mean *broken pipe* / *I/O error* on POSIX,
+which are not retry-worthy.) Each retry emits a streaming progress
+notification so it's visible in the chat panel.
+
+`cargo fix` and `cargo update` are deliberately **not** retried even though
+they're nominally read-mostly: a partial first attempt could leave source
+files or `Cargo.lock` half-edited, and re-running on top of that state isn't
+safe.
 
 It is **on by default**. The behaviour is controlled by three settings:
 
@@ -403,9 +408,9 @@ It is **on by default**. The behaviour is controlled by three settings:
 | `cargo-mcp.retry.delayMs` | `--retry-delay-ms=<n>` | `500` | Delay between attempts, in milliseconds. |
 | `cargo-mcp.retry.maxAttempts` | `--retry-max-attempts=<n>` | `3` | Maximum total attempts (initial try + retries). |
 
-Non-idempotent commands (`cargo_publish`, `cargo_add`, `cargo_remove`) and
-direct-to-file streaming (the `output_file` mode of `cargo_metadata`) are
-**never** retried, regardless of the setting.
+Non-idempotent commands (`cargo_publish`, `cargo_add`, `cargo_remove`,
+`cargo_fix`, `cargo_update`) and direct-to-file streaming (the `output_file`
+mode of `cargo_metadata`) are **never** retried, regardless of the setting.
 
 ---
 

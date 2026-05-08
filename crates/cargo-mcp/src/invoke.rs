@@ -73,8 +73,17 @@ pub fn set_retry_config(enabled: bool, delay_ms: u64, max_attempts: u32) {
 /// state changes (no crates published twice, no `Cargo.toml` mutated twice,
 /// etc.). Anything not on this list is **never** retried by
 /// [`run_cargo_streaming`], regardless of the user's retry settings.
+///
+/// Notably **excluded** even though they are read-only-ish:
+/// - `fix` — modifies source files. A partial first attempt could leave the
+///   tree in a half-edited state; we don't want to redo edits on top of that.
+/// - `update` — mutates `Cargo.lock`. Same partial-state concern.
+///
+/// `clean` is included because deleting an already-(partially-)deleted
+/// directory tree is a true no-op: the end state matches the goal regardless
+/// of how many times it runs.
 const IDEMPOTENT_SUBCOMMANDS: &[&str] = &[
-    "check", "build", "test", "clippy", "fmt", "doc", "tree", "clean", "update", "fix", "metadata",
+    "check", "build", "test", "clippy", "fmt", "doc", "tree", "clean", "metadata",
 ];
 
 /// Returns `true` iff `args[0]` (the cargo subcommand) is in
@@ -624,6 +633,10 @@ mod tests {
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    /// Serializes any test that mutates the global `RETRY_*` atomics, so
+    /// parallel test execution can't race on shared retry config.
+    static RETRY_LOCK: Mutex<()> = Mutex::new(());
+
     /// RAII guard that restores a set of env vars on drop.
     struct EnvGuard {
         saved: Vec<(&'static str, Option<OsString>)>,
@@ -931,8 +944,7 @@ mod tests {
     #[test]
     fn is_retry_safe_allows_idempotent_subcommands() {
         for sub in [
-            "check", "build", "test", "clippy", "fmt", "doc", "tree", "clean", "update", "fix",
-            "metadata",
+            "check", "build", "test", "clippy", "fmt", "doc", "tree", "clean", "metadata",
         ] {
             assert!(is_retry_safe(&[sub]), "{sub} should be retry-safe");
         }
@@ -940,7 +952,13 @@ mod tests {
 
     #[test]
     fn is_retry_safe_rejects_non_idempotent_subcommands() {
-        for sub in ["publish", "add", "remove", "yank", "owner", "login"] {
+        // `fix` and `update` modify the working tree / lockfile, so a
+        // partial first attempt leaves state behind that we can't safely
+        // retry on top of. They must NOT be in the allowlist even though
+        // they're read-mostly.
+        for sub in [
+            "publish", "add", "remove", "yank", "owner", "login", "fix", "update",
+        ] {
             assert!(
                 !is_retry_safe(&[sub]),
                 "{sub} should NOT be retry-safe (state-changing)"
@@ -955,6 +973,9 @@ mod tests {
 
     #[test]
     fn set_retry_config_clamps_max_attempts_to_one() {
+        // Serialize against any other test that touches RETRY_* atomics.
+        let _g = RETRY_LOCK.lock().unwrap();
+
         // Save and restore so other tests aren't disturbed.
         let prev_enabled = RETRY_ENABLED.load(Ordering::Relaxed);
         let prev_delay = RETRY_DELAY_MS.load(Ordering::Relaxed);

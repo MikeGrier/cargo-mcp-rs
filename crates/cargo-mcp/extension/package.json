@@ -105,7 +105,7 @@
                 "cargo-mcp.retry.onBusy": {
                     "type": "boolean",
                     "default": true,
-                    "markdownDescription": "Retry idempotent cargo invocations (`check`, `build`, `test`, `clippy`, `fmt`, `doc`, `tree`, `clean`, `update`, `fix`) when they fail with a transient Windows file-locking error (`os error 32` *sharing violation*, `os error 5` *access denied*, *being used by another process*). These usually clear themselves within a fraction of a second once an antivirus, file indexer, or stray process releases the handle. Disable if you want failures to surface immediately."
+                    "markdownDescription": "Retry idempotent cargo invocations (`check`, `build`, `test`, `clippy`, `fmt`, `doc`, `tree`, `clean`, `metadata`) when they fail with a transient Windows file-locking error (`(os error 32)` *sharing violation*, `(os error 5)` *access denied*, *being used by another process*). These usually clear themselves within a fraction of a second once an antivirus, file indexer, or stray process releases the handle. Disable if you want failures to surface immediately."
                 },
                 "cargo-mcp.retry.delayMs": {
                     "type": "number",

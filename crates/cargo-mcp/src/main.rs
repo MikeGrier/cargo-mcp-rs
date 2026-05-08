@@ -632,6 +632,14 @@ impl BuildTracker {
     /// Returns a human-readable progress message, or an empty string if no
     /// notification should be sent for this line.
     fn process_line(&mut self, line: &str) -> String {
+        // Synthetic out-of-band progress lines that the invoke layer injects
+        // directly (e.g. retry-on-busy notices) are prefixed with
+        // `cargo-mcp:` and should be forwarded verbatim — they aren't
+        // cargo's JSON output and would otherwise be silently dropped by the
+        // `serde_json::from_str` parse below.
+        if let Some(rest) = line.strip_prefix("cargo-mcp:") {
+            return format!("cargo-mcp:{rest}");
+        }
         let v = match serde_json::from_str::<Value>(line) {
             Ok(v) => v,
             Err(_) => return String::new(),

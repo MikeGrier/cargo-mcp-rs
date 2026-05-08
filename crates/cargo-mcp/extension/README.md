@@ -112,7 +112,7 @@ Install, reload, run `/cargo-mcp:setup` once per repo. That's it.
 | Setting | Default | Description |
 |---|---|---|
 | `cargo-mcp.elicitationMode` | `always-skip` | How to handle machine-applicable fix suggestions: `prompt`, `always-accept`, or `always-skip`. |
-| `cargo-mcp.retry.onBusy` | `true` | Retry idempotent cargo invocations when they fail with a transient Windows file-locking error (`os error 32` *sharing violation*, `os error 5` *access denied*, *being used by another process*). These usually clear themselves within a fraction of a second once an antivirus, file indexer, or stray process releases the handle. |
+| `cargo-mcp.retry.onBusy` | `true` | Retry idempotent cargo invocations (`check`, `build`, `test`, `clippy`, `fmt`, `doc`, `tree`, `clean`, `metadata`) when they fail with a transient Windows file-locking error (`(os error 32)` *sharing violation*, `(os error 5)` *access denied*, *being used by another process*). These usually clear themselves within a fraction of a second once an antivirus, file indexer, or stray process releases the handle. |
 | `cargo-mcp.retry.delayMs` | `500` | Delay between retry attempts, in milliseconds. |
 | `cargo-mcp.retry.maxAttempts` | `3` | Maximum total attempts (initial try + retries). |
 | `cargo-mcp.binaryPath` | _(bundled)_ | Override the path to the `cargo-mcp` binary. Intended for development against a locally-built server. |
