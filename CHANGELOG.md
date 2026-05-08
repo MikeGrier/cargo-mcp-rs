@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.5.0](https://github.com/MikeGrier/cargo-mcp-rs/compare/v0.4.1...v0.5.0) (2026-05-08)
+
+
+### Features
+
+* **extension:** add icon, gallery banner, and screenshot placeholders for Marketplace listing ([4ca4a43](https://github.com/MikeGrier/cargo-mcp-rs/commit/4ca4a43829c56fdbc4c1d2bc97e9d9bd5afe5747))
+* **retry:** retry idempotent cargo invocations on transient Windows file-busy errors ([5a6f890](https://github.com/MikeGrier/cargo-mcp-rs/commit/5a6f89047cd463340de08a9560e022e335d1ff88))
+* **retry:** retry idempotent cargo invocations on transient Windows file-busy errors ([6cfffe8](https://github.com/MikeGrier/cargo-mcp-rs/commit/6cfffe89d8fe7a906f114742e2d03e4345b990ec))
+
+
+### Bug Fixes
+
+* **retry:** gate retries to idempotent subcommands and tighten busy-error patterns ([629fd69](https://github.com/MikeGrier/cargo-mcp-rs/commit/629fd697b3012acc96f36b873154b42bbdbef371))
+* **retry:** tighten allowlist, surface retry notice in JSON mode, serialize tests ([e5f9334](https://github.com/MikeGrier/cargo-mcp-rs/commit/e5f93344403badd353443c1f5517c805018ecbbd))
+
 ## [0.4.1](https://github.com/MikeGrier/cargo-mcp-rs/compare/v0.4.0...v0.4.1) (2026-05-08)
 
 
