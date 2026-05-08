@@ -69,6 +69,22 @@ function buildArgs(): string[] {
         args.push(`--progress-delay-ms=${Math.round(delay)}`);
     }
 
+    // Retry on transient Windows file-busy errors. Defaults match the server's
+    // built-in defaults (enabled, 500ms delay, 3 attempts) so we only emit
+    // flags when the user has changed something.
+    const retryEnabled = config.get<boolean>("retry.onBusy", true);
+    if (retryEnabled === false) {
+        args.push("--retry-on-busy=false");
+    }
+    const retryDelayMs = config.get<number>("retry.delayMs", 500) ?? 500;
+    if (typeof retryDelayMs === "number" && retryDelayMs !== 500 && retryDelayMs >= 0) {
+        args.push(`--retry-delay-ms=${Math.round(retryDelayMs)}`);
+    }
+    const retryMaxAttempts = config.get<number>("retry.maxAttempts", 3) ?? 3;
+    if (typeof retryMaxAttempts === "number" && retryMaxAttempts !== 3 && retryMaxAttempts >= 1) {
+        args.push(`--retry-max-attempts=${Math.round(retryMaxAttempts)}`);
+    }
+
     const extraArgs = config.get<string[]>("extraArgs", []) ?? [];
     for (const a of extraArgs) {
         if (typeof a === "string" && a.length > 0) {

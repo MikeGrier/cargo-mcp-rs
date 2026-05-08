@@ -21,6 +21,11 @@
     "engines": {
         "vscode": "^1.101.0"
     },
+    "icon": "images/icon.png",
+    "galleryBanner": {
+        "color": "#2D2D30",
+        "theme": "dark"
+    },
     "categories": [
         "AI",
         "Chat",
@@ -96,6 +101,25 @@
                     "minimum": 0,
                     "maximum": 5000,
                     "markdownDescription": "**Developer only.** Additional delay in milliseconds inserted after each cargo progress notification. Useful for slowing down progress output to observe the elicitation dialog. Has no effect when `0`."
+                },
+                "cargo-mcp.retry.onBusy": {
+                    "type": "boolean",
+                    "default": true,
+                    "markdownDescription": "Retry idempotent cargo invocations (`check`, `build`, `test`, `clippy`, `fmt`, `doc`, `tree`, `clean`, `metadata`) when they fail with a transient Windows file-locking error (`(os error 32)` *sharing violation*, `(os error 5)` *access denied*, *being used by another process*). These usually clear themselves within a fraction of a second once an antivirus, file indexer, or stray process releases the handle. Disable if you want failures to surface immediately."
+                },
+                "cargo-mcp.retry.delayMs": {
+                    "type": "number",
+                    "default": 500,
+                    "minimum": 0,
+                    "maximum": 60000,
+                    "markdownDescription": "Delay in milliseconds between retry attempts when `#cargo-mcp.retry.onBusy#` is enabled. Default is `500` (half a second)."
+                },
+                "cargo-mcp.retry.maxAttempts": {
+                    "type": "number",
+                    "default": 3,
+                    "minimum": 1,
+                    "maximum": 10,
+                    "markdownDescription": "Maximum total attempts (initial try + retries) when `#cargo-mcp.retry.onBusy#` is enabled. Default is `3`."
                 },
                 "cargo-mcp.extraArgs": {
                     "type": "array",

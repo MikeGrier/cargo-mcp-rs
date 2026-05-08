@@ -42,10 +42,92 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
 };
 use std::thread;
 use std::time::Duration;
+
+// ── retry-on-busy configuration ──────────────────────────────────────────────
+
+/// Whether to retry idempotent cargo invocations that fail with a transient
+/// "file in use" / "access denied" / "sharing violation" error.
+///
+/// Set once at process start by [`set_retry_config`]; defaults to enabled.
+static RETRY_ENABLED: AtomicBool = AtomicBool::new(true);
+
+/// Delay between retry attempts, in milliseconds.
+static RETRY_DELAY_MS: AtomicU64 = AtomicU64::new(500);
+
+/// Maximum total attempts (initial + retries). Must be at least 1.
+static RETRY_MAX_ATTEMPTS: AtomicU32 = AtomicU32::new(3);
+
+/// Configure retry-on-busy behaviour. Called once from `main` after CLI parse.
+pub fn set_retry_config(enabled: bool, delay_ms: u64, max_attempts: u32) {
+    RETRY_ENABLED.store(enabled, Ordering::Relaxed);
+    RETRY_DELAY_MS.store(delay_ms, Ordering::Relaxed);
+    RETRY_MAX_ATTEMPTS.store(max_attempts.max(1), Ordering::Relaxed);
+}
+
+/// Cargo subcommands whose retry on a transient file-busy error is safe
+/// because the operation is idempotent — re-running cannot produce duplicate
+/// state changes (no crates published twice, no `Cargo.toml` mutated twice,
+/// etc.). Anything not on this list is **never** retried by
+/// [`run_cargo_streaming`], regardless of the user's retry settings.
+///
+/// Notably **excluded** even though they are read-only-ish:
+/// - `fix` — modifies source files. A partial first attempt could leave the
+///   tree in a half-edited state; we don't want to redo edits on top of that.
+/// - `update` — mutates `Cargo.lock`. Same partial-state concern.
+///
+/// `clean` is included because deleting an already-(partially-)deleted
+/// directory tree is a true no-op: the end state matches the goal regardless
+/// of how many times it runs.
+const IDEMPOTENT_SUBCOMMANDS: &[&str] = &[
+    "check", "build", "test", "clippy", "fmt", "doc", "tree", "clean", "metadata",
+];
+
+/// Returns `true` iff `args[0]` (the cargo subcommand) is in
+/// [`IDEMPOTENT_SUBCOMMANDS`].
+fn is_retry_safe(args: &[&str]) -> bool {
+    args.first()
+        .is_some_and(|sub| IDEMPOTENT_SUBCOMMANDS.contains(sub))
+}
+
+/// Is the given combined cargo stderr/stdout indicative of a transient
+/// Windows file-locking error that an idempotent retry could clear?
+///
+/// Pattern matching is **case-sensitive** because every known producer of
+/// these messages (cargo, rustc, Windows `FormatMessage`) emits them with
+/// stable casing. Matches are anchored with surrounding parentheses where
+/// applicable to avoid false positives such as `os error 320`.
+///
+/// Recognised patterns:
+/// - `(os error 32)` — `ERROR_SHARING_VIOLATION` ("being used by another
+///   process"). On non-Windows hosts the same numeric code maps to `EPIPE`,
+///   which is **not** a retry-worthy condition, so this pattern is gated to
+///   `cfg!(windows)`.
+/// - `(os error 5)` — `ERROR_ACCESS_DENIED`. Same Windows-only gate; on
+///   POSIX, errno 5 is `EIO` which we don't want to retry.
+/// - `being used by another process` — Windows-formatted form of error 32.
+/// - `Access is denied` / `access is denied` — both common casings of the
+///   Windows-formatted form of error 5.
+/// - `sharing violation` / `Sharing violation` — both common casings of the
+///   Windows-formatted form of error 32.
+///
+/// These show up in cargo / rustc output when an antivirus, file indexer, or
+/// previous build process has briefly grabbed a handle on a `.exe`, `.pdb`,
+/// `.rmeta`, or `.lock` file in `target/`.
+pub fn is_transient_busy_error(stderr_or_stdout: &str) -> bool {
+    let s = stderr_or_stdout;
+    let os_error_match =
+        cfg!(windows) && (s.contains("(os error 32)") || s.contains("(os error 5)"));
+    os_error_match
+        || s.contains("being used by another process")
+        || s.contains("Access is denied")
+        || s.contains("access is denied")
+        || s.contains("sharing violation")
+        || s.contains("Sharing violation")
+}
 
 // ── toolchain resolution ──────────────────────────────────────────────────────
 
@@ -332,6 +414,62 @@ pub fn run_cargo_streaming(
     working_dir: Option<&str>,
     on_stdout_line: &mut dyn FnMut(&str),
 ) -> Result<CargoOutput, Box<dyn std::error::Error>> {
+    // Retry only for cargo subcommands that are inherently idempotent. This
+    // is the gate that keeps `cargo_publish`, `cargo_add`, `cargo_remove`
+    // (and anything else not in `IDEMPOTENT_SUBCOMMANDS`) from being silently
+    // re-executed on a transient busy error.
+    let max_attempts = if RETRY_ENABLED.load(Ordering::Relaxed) && is_retry_safe(args) {
+        RETRY_MAX_ATTEMPTS.load(Ordering::Relaxed).max(1) as usize
+    } else {
+        1
+    };
+    let delay = Duration::from_millis(RETRY_DELAY_MS.load(Ordering::Relaxed));
+
+    let mut last: Option<CargoOutput> = None;
+    for attempt in 1..=max_attempts {
+        let out = run_cargo_streaming_once(args, working_dir, on_stdout_line)?;
+        let busy = out.exit_code != 0
+            && (is_transient_busy_error(&out.stderr) || is_transient_busy_error(&out.stdout));
+        if !busy || attempt == max_attempts {
+            return Ok(out);
+        }
+        // Surface the retry as a synthetic line so the streaming caller can
+        // forward it as a progress notification.
+        let msg = format!(
+            "cargo-mcp: transient file-busy error; retrying in {ms}ms (attempt {next}/{total})",
+            ms = delay.as_millis(),
+            next = attempt + 1,
+            total = max_attempts,
+        );
+        on_stdout_line(&msg);
+        last = Some(out);
+        // Honour cancellation while sleeping.
+        let step = Duration::from_millis(50);
+        let mut remaining = delay;
+        while remaining > Duration::ZERO {
+            if is_cancelled() {
+                return Err(Box::new(CancelledError));
+            }
+            let s = std::cmp::min(step, remaining);
+            thread::sleep(s);
+            remaining -= s;
+        }
+    }
+    // Unreachable (loop returns inside), but keep a safe fallback.
+    Ok(last.unwrap_or(CargoOutput {
+        stdout: String::new(),
+        stderr: String::new(),
+        exit_code: -1,
+    }))
+}
+
+/// Single-attempt body of [`run_cargo_streaming`]; see that function for the
+/// retry policy and contract.
+fn run_cargo_streaming_once(
+    args: &[&str],
+    working_dir: Option<&str>,
+    on_stdout_line: &mut dyn FnMut(&str),
+) -> Result<CargoOutput, Box<dyn std::error::Error>> {
     let (cargo_path, source) = resolve_cargo_binary();
     log_invocation(&cargo_path, source, working_dir, args);
     let mut cmd = Command::new(&cargo_path);
@@ -494,6 +632,10 @@ mod tests {
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Serializes any test that mutates the global `RETRY_*` atomics, so
+    /// parallel test execution can't race on shared retry config.
+    static RETRY_LOCK: Mutex<()> = Mutex::new(());
 
     /// RAII guard that restores a set of env vars on drop.
     struct EnvGuard {
@@ -720,5 +862,134 @@ mod tests {
     fn find_toolchain_file_returns_none_when_absent() {
         let root = unique_tempdir("toolchain_none");
         assert!(find_toolchain_file(&root).is_none());
+    }
+
+    // ── retry-on-busy detection ──────────────────────────────────────────────
+
+    #[test]
+    fn detects_windows_sharing_violation_via_phrase() {
+        // The phrase "being used by another process" is recognised on every
+        // host (it's a Windows-formatted message that may surface in stderr
+        // captured by cross-compilation tooling, etc.).
+        let stderr = "error: failed to remove file `target\\debug\\foo.exe`: \
+                      The process cannot access the file because it is being used \
+                      by another process. (os error 32)";
+        assert!(is_transient_busy_error(stderr));
+    }
+
+    #[test]
+    fn detects_windows_access_denied_via_phrase() {
+        // Even on non-Windows, the phrase "Access is denied" alone is enough.
+        let stderr =
+            "error: failed to write `target\\debug\\foo.pdb`: Access is denied. (os error 5)";
+        assert!(is_transient_busy_error(stderr));
+    }
+
+    #[test]
+    fn detects_lowercase_access_is_denied() {
+        let stderr = "io error: access is denied";
+        assert!(is_transient_busy_error(stderr));
+    }
+
+    #[test]
+    fn detects_sharing_violation_phrase() {
+        let stderr = "rustc: a sharing violation occurred";
+        assert!(is_transient_busy_error(stderr));
+    }
+
+    #[test]
+    fn does_not_match_unrelated_compile_errors() {
+        let stderr = "error[E0432]: unresolved import `foo::bar`";
+        assert!(!is_transient_busy_error(stderr));
+    }
+
+    #[test]
+    fn does_not_match_arbitrary_os_error_codes() {
+        let stderr = "error: os error 2 (No such file or directory)";
+        assert!(!is_transient_busy_error(stderr));
+    }
+
+    #[test]
+    fn os_error_32_without_parens_is_not_a_match_to_avoid_false_positives() {
+        // Without the surrounding parens this could be `os error 320` etc.;
+        // the previous (looser) implementation would mis-match. Verify the
+        // tightened pattern rejects substring lookalikes.
+        let stderr = "error: random text mentioning os error 320";
+        assert!(!is_transient_busy_error(stderr));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn detects_parenthesised_os_error_32_on_windows() {
+        let stderr = "io error (os error 32)";
+        assert!(is_transient_busy_error(stderr));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn detects_parenthesised_os_error_5_on_windows() {
+        let stderr = "io error (os error 5)";
+        assert!(is_transient_busy_error(stderr));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn ignores_parenthesised_os_error_32_on_non_windows_because_it_means_epipe() {
+        // On POSIX, errno 32 is EPIPE — not retry-worthy. The phrase
+        // version of the same message is what we want to match instead.
+        let stderr = "io error (os error 32)";
+        assert!(!is_transient_busy_error(stderr));
+    }
+
+    #[test]
+    fn is_retry_safe_allows_idempotent_subcommands() {
+        for sub in [
+            "check", "build", "test", "clippy", "fmt", "doc", "tree", "clean", "metadata",
+        ] {
+            assert!(is_retry_safe(&[sub]), "{sub} should be retry-safe");
+        }
+    }
+
+    #[test]
+    fn is_retry_safe_rejects_non_idempotent_subcommands() {
+        // `fix` and `update` modify the working tree / lockfile, so a
+        // partial first attempt leaves state behind that we can't safely
+        // retry on top of. They must NOT be in the allowlist even though
+        // they're read-mostly.
+        for sub in [
+            "publish", "add", "remove", "yank", "owner", "login", "fix", "update",
+        ] {
+            assert!(
+                !is_retry_safe(&[sub]),
+                "{sub} should NOT be retry-safe (state-changing)"
+            );
+        }
+    }
+
+    #[test]
+    fn is_retry_safe_rejects_empty_args() {
+        assert!(!is_retry_safe(&[]));
+    }
+
+    #[test]
+    fn set_retry_config_clamps_max_attempts_to_one() {
+        // Serialize against any other test that touches RETRY_* atomics.
+        let _g = RETRY_LOCK.lock().unwrap();
+
+        // Save and restore so other tests aren't disturbed.
+        let prev_enabled = RETRY_ENABLED.load(Ordering::Relaxed);
+        let prev_delay = RETRY_DELAY_MS.load(Ordering::Relaxed);
+        let prev_max = RETRY_MAX_ATTEMPTS.load(Ordering::Relaxed);
+
+        set_retry_config(true, 100, 0);
+        assert_eq!(RETRY_MAX_ATTEMPTS.load(Ordering::Relaxed), 1);
+
+        set_retry_config(false, 250, 5);
+        assert!(!RETRY_ENABLED.load(Ordering::Relaxed));
+        assert_eq!(RETRY_DELAY_MS.load(Ordering::Relaxed), 250);
+        assert_eq!(RETRY_MAX_ATTEMPTS.load(Ordering::Relaxed), 5);
+
+        // Restore.
+        set_retry_config(prev_enabled, prev_delay, prev_max);
     }
 }
