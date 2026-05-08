@@ -17,6 +17,7 @@
         "url": "https://github.com/MikeGrier/cargo-mcp-rs/issues"
     },
     "homepage": "https://github.com/MikeGrier/cargo-mcp-rs/tree/main/crates/cargo-mcp",
+    "qna": "https://github.com/MikeGrier/cargo-mcp-rs/discussions/categories/q-a",
     "engines": {
         "vscode": "^1.101.0"
     },
