@@ -435,11 +435,13 @@ mod windows_impl {
     const FORMAT_MESSAGE_ALLOCATE_BUFFER: u32 = 0x0000_0100;
     const FORMAT_MESSAGE_FROM_SYSTEM: u32 = 0x0000_1000;
     const FORMAT_MESSAGE_IGNORE_INSERTS: u32 = 0x0000_0200;
-    // U.S. English; falls back to neutral if not installed. We pick a
-    // fixed language rather than the user default so the message is
-    // predictable across machines (and matches the patterns the rest of
-    // cargo-mcp parses elsewhere).
-    const LANG_NEUTRAL_SUBLANG_DEFAULT: u32 = 0;
+    // MAKELANGID(LANG_ENGLISH=0x09, SUBLANG_ENGLISH_US=0x01) -> 0x0409.
+    // We try en-US first because the rest of cargo-mcp parses
+    // English error text elsewhere; if en-US isn't installed on this
+    // host `format_win32_error` falls back to the system default
+    // language (`LANG_NEUTRAL_SUBLANG_DEFAULT`, 0).
+    const LANG_ENGLISH_US: u32 = 0x0409;
+    const LANG_SYSTEM_DEFAULT: u32 = 0;
 
     #[link(name = "kernel32")]
     unsafe extern "system" {
@@ -457,14 +459,25 @@ mod windows_impl {
     }
 
     /// Translate a Win32 error code (as returned by Restart Manager) into
-    /// the system's localized message via `FormatMessageW`. Returns
-    /// `None` if `FormatMessageW` itself fails (e.g. unknown code).
+    /// a localized message via `FormatMessageW`. Returns `None` if
+    /// `FormatMessageW` itself fails (e.g. unknown code).
     ///
-    /// We use `FORMAT_MESSAGE_ALLOCATE_BUFFER` so the OS picks the buffer
+    /// Tries U.S. English first (`MAKELANGID(LANG_ENGLISH,
+    /// SUBLANG_ENGLISH_US)`) so the text is predictable across hosts and
+    /// matches the English error patterns that the rest of cargo-mcp
+    /// parses; falls back to the system default language if en-US is not
+    /// installed on this machine.
+    ///
+    /// Uses `FORMAT_MESSAGE_ALLOCATE_BUFFER` so the OS picks the buffer
     /// size; this avoids the trim/retry dance with a fixed-size stack
     /// buffer for messages that exceed it. The buffer is freed via
     /// `LocalFree` per the API contract.
     fn format_win32_error(code: u32) -> Option<String> {
+        format_win32_error_in(code, LANG_ENGLISH_US)
+            .or_else(|| format_win32_error_in(code, LANG_SYSTEM_DEFAULT))
+    }
+
+    fn format_win32_error_in(code: u32, lang_id: u32) -> Option<String> {
         let mut buf_ptr: *mut u16 = ptr::null_mut();
         let n = unsafe {
             FormatMessageW(
@@ -473,7 +486,7 @@ mod windows_impl {
                     | FORMAT_MESSAGE_IGNORE_INSERTS,
                 ptr::null(),
                 code,
-                LANG_NEUTRAL_SUBLANG_DEFAULT,
+                lang_id,
                 // With ALLOCATE_BUFFER, the API expects a *pointer to* a
                 // pointer (it writes the allocated address back). Cast
                 // accordingly.
