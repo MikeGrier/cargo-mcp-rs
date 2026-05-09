@@ -29,6 +29,13 @@
 //!   noise in MCP text responses.
 //! - `NO_COLOR=1` — belt-and-suspenders colour suppression for any tool in
 //!   the Cargo pipeline that respects the informal `NO_COLOR` convention.
+//! - `RUSTC=<resolved rustc>` — pinned to the rustc resolved by
+//!   [`resolve_rustc_binary`] (when not [`ResolutionSource::PathLookup`]) so
+//!   that `cargo` does not fall back to a stray `rustc` that happens to come
+//!   first on `PATH`. Without this, environments that prepend a non-rustup
+//!   `rustc` ahead of the rustup proxy bin dir would silently bypass
+//!   `rust-toolchain.toml` even though `cargo` itself is the rustup proxy.
+//!   Honoured only if the caller has not already set `RUSTC`.
 //!
 //! ## Logging
 //!
@@ -187,6 +194,36 @@ pub fn resolve_cargo_binary() -> (PathBuf, ResolutionSource) {
 /// Mirrors [`resolve_cargo_binary`]: env var → rustup proxy → PATH.
 pub fn resolve_rustc_binary() -> (PathBuf, ResolutionSource) {
     resolve_binary("rustc", "RUSTC")
+}
+
+/// Inject `RUSTC=<resolved rustc>` into `cmd`'s environment so the spawned
+/// `cargo` does not fall back to a stray `rustc` from `PATH`.
+///
+/// Without this, an environment that prepends a non-rustup directory
+/// containing a plain `rustc.exe` ahead of `~/.cargo/bin` would cause cargo
+/// (even when *cargo* itself was correctly resolved to the rustup proxy) to
+/// invoke that stray `rustc`, silently bypassing `rust-toolchain.toml`. See
+/// the module-level "Environment" docs.
+///
+/// Behaviour:
+/// - If the user has already set `RUSTC` in the inherited environment, it is
+///   left alone (their explicit choice wins).
+/// - If [`resolve_rustc_binary`] returned [`ResolutionSource::PathLookup`],
+///   no override is set: there is no concrete path to pin, and forcing
+///   `RUSTC=rustc` would just re-run the same `PATH` lookup cargo would do
+///   anyway.
+/// - Otherwise (`RustupProxy` or `RustupProxyNoSibling`), set `RUSTC` to
+///   the resolved path. For the rustup proxy this defers toolchain
+///   selection to the proxy, which honours `rust-toolchain.toml`.
+fn apply_rustc_env(cmd: &mut Command) {
+    if std::env::var_os("RUSTC").is_some_and(|v| !v.is_empty()) {
+        return;
+    }
+    let (rustc_path, source) = resolve_rustc_binary();
+    if matches!(source, ResolutionSource::PathLookup) {
+        return;
+    }
+    cmd.env("RUSTC", &rustc_path);
 }
 
 fn resolve_binary(name: &str, env_var: &str) -> (PathBuf, ResolutionSource) {
@@ -479,6 +516,7 @@ fn run_cargo_streaming_once(
         .stderr(Stdio::piped())
         .env("CARGO_TERM_COLOR", "never")
         .env("NO_COLOR", "1");
+    apply_rustc_env(&mut cmd);
 
     if let Some(dir) = working_dir {
         cmd.current_dir(dir);
@@ -573,6 +611,7 @@ pub fn run_cargo_to_file(
         .stderr(Stdio::piped())
         .env("CARGO_TERM_COLOR", "never")
         .env("NO_COLOR", "1");
+    apply_rustc_env(&mut cmd);
 
     if let Some(dir) = working_dir {
         cmd.current_dir(dir);
@@ -844,6 +883,72 @@ mod tests {
         let (path, source) = resolve_rustc_binary();
         assert_eq!(path, rustc_path);
         assert_eq!(source, ResolutionSource::RustupProxy);
+    }
+
+    /// Read the `RUSTC` env override that `apply_rustc_env` set on `cmd`.
+    /// Returns `None` if the helper chose not to set one.
+    fn rustc_override(cmd: &Command) -> Option<PathBuf> {
+        cmd.get_envs().find_map(|(k, v)| {
+            if k == OsStr::new("RUSTC") {
+                v.map(PathBuf::from)
+            } else {
+                None
+            }
+        })
+    }
+
+    #[test]
+    fn apply_rustc_env_pins_rustup_proxy_path() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let guard = EnvGuard::snapshot(&["RUSTC", "CARGO_HOME", "HOME", "USERPROFILE"]);
+        let cargo_home = unique_tempdir("apply_rustc_proxy");
+        let bin_dir = cargo_home.join("bin");
+        let rustc_path = write_fake_bin(&bin_dir, "rustc");
+        write_fake_bin(&bin_dir, "rustup");
+        guard.unset("RUSTC");
+        guard.set("CARGO_HOME", &cargo_home);
+
+        let mut cmd = Command::new("does-not-matter");
+        apply_rustc_env(&mut cmd);
+        assert_eq!(rustc_override(&cmd), Some(rustc_path));
+    }
+
+    #[test]
+    fn apply_rustc_env_skips_when_rustc_already_set_by_user() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let guard = EnvGuard::snapshot(&["RUSTC", "CARGO_HOME", "HOME", "USERPROFILE"]);
+        // User-provided RUSTC takes precedence — we must not override it
+        // (even if it points at a non-existent file; that's the user's call).
+        guard.set("RUSTC", "/explicit/user/rustc");
+        let cargo_home = unique_tempdir("apply_rustc_userset");
+        let bin_dir = cargo_home.join("bin");
+        write_fake_bin(&bin_dir, "rustc");
+        write_fake_bin(&bin_dir, "rustup");
+        guard.set("CARGO_HOME", &cargo_home);
+
+        let mut cmd = Command::new("does-not-matter");
+        apply_rustc_env(&mut cmd);
+        assert!(
+            rustc_override(&cmd).is_none(),
+            "must not override user-set RUSTC"
+        );
+    }
+
+    #[test]
+    fn apply_rustc_env_skips_for_path_lookup() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let guard = EnvGuard::snapshot(&["RUSTC", "CARGO_HOME", "HOME", "USERPROFILE"]);
+        let empty_home = unique_tempdir("apply_rustc_path");
+        guard.unset("RUSTC");
+        guard.set("CARGO_HOME", &empty_home);
+        // No bin/rustc under this home → resolver returns PathLookup.
+
+        let mut cmd = Command::new("does-not-matter");
+        apply_rustc_env(&mut cmd);
+        assert!(
+            rustc_override(&cmd).is_none(),
+            "PathLookup must not pin a concrete RUSTC path"
+        );
     }
 
     #[test]
