@@ -358,6 +358,27 @@ The resolved path and resolution step are written to the cargo-mcp server's
 stderr (visible in VS Code's *MCP Logs: cargo* output channel) before each
 invocation.
 
+### `rustc` is pinned alongside `cargo`
+
+Resolving only `cargo` is not enough on systems where a non-rustup directory
+containing a stray `rustc` is prepended to `PATH` ahead of the rustup proxy
+bin dir. In that situation cargo (even when correctly invoked as the rustup
+proxy) would still spawn the stray `rustc` via its own `PATH` lookup,
+silently bypassing `rust-toolchain.toml`.
+
+To prevent this, cargo-mcp also resolves `rustc` (with the same env →
+proxy → PATH order) and injects `RUSTC=<resolved rustc>` into the spawned
+cargo's environment, unless:
+
+- The caller has already set `RUSTC` in cargo-mcp's environment — that
+  explicit choice wins, or
+- Resolution fell through to the PATH-lookup tier — there is no concrete
+  path to pin, so the spawned cargo's normal PATH-based `rustc` lookup
+  applies.
+
+When `RUSTC` is pinned to the rustup proxy `rustc`, the proxy itself defers
+toolchain selection to `rust-toolchain.toml`.
+
 If you suspect the wrong toolchain is being used, call the `cargo_diagnostic`
 tool — it returns the resolved paths, `cargo --version --verbose` output, the
 location and contents of any `rust-toolchain.toml` found by walking ancestor
