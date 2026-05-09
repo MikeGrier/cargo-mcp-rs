@@ -212,10 +212,9 @@ pub fn resolve_rustc_binary() -> (PathBuf, ResolutionSource) {
 ///   no override is set: there is no concrete path to pin, and forcing
 ///   `RUSTC=rustc` would just re-run the same `PATH` lookup cargo would do
 ///   anyway.
-/// - Otherwise (`CargoEnv`, `RustupProxy`, or `RustupProxyNoSibling`), set
-///   `RUSTC` to the resolved absolute path. For the rustup proxy this
-///   defers toolchain selection to the proxy, which honours
-///   `rust-toolchain.toml`.
+/// - Otherwise (`RustupProxy` or `RustupProxyNoSibling`), set `RUSTC` to
+///   the resolved path. For the rustup proxy this defers toolchain
+///   selection to the proxy, which honours `rust-toolchain.toml`.
 fn apply_rustc_env(cmd: &mut Command) {
     if std::env::var_os("RUSTC").is_some_and(|v| !v.is_empty()) {
         return;

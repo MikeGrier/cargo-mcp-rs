@@ -366,15 +366,12 @@ bin dir. In that situation cargo (even when correctly invoked as the rustup
 proxy) would still spawn the stray `rustc` via its own `PATH` lookup,
 silently bypassing `rust-toolchain.toml`.
 
-To prevent this, cargo-mcp also resolves `rustc` (with the same env →
-proxy → PATH order) and injects `RUSTC=<resolved rustc>` into the spawned
-cargo's environment, unless:
-
-- The caller has already set `RUSTC` in cargo-mcp's environment — that
-  explicit choice wins, or
-- Resolution fell through to the PATH-lookup tier — there is no concrete
-  path to pin, so the spawned cargo's normal PATH-based `rustc` lookup
-  applies.
+To prevent this, cargo-mcp resolves `rustc` (unless `RUSTC` is already set
+in cargo-mcp's environment) with the same env → proxy → PATH order, and
+injects `RUSTC=<resolved rustc>` into the spawned cargo's environment. The
+injection is also skipped if resolution fell through to the PATH-lookup tier
+— there is no concrete path to pin, so the spawned cargo's normal PATH-based
+`rustc` lookup applies.
 
 When `RUSTC` is pinned to the rustup proxy `rustc`, the proxy itself defers
 toolchain selection to `rust-toolchain.toml`.
