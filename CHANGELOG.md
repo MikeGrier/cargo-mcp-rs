@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.5.2](https://github.com/MikeGrier/cargo-mcp-rs/compare/v0.5.1...v0.5.2) (2026-05-09)
+
+
+### Bug Fixes
+
+* address Copilot review comments on busy_files ([aa4b62a](https://github.com/MikeGrier/cargo-mcp-rs/commit/aa4b62a04031f2a8e00874a24d497481d21d6427))
+* diagnose Windows file-busy errors via Restart Manager ([85b819b](https://github.com/MikeGrier/cargo-mcp-rs/commit/85b819ba37b6e9de7ad2683963d26c98af668a71))
+* gate (os error 32/5) busy indicators on Windows to match invoke ([efbc8ef](https://github.com/MikeGrier/cargo-mcp-rs/commit/efbc8ef2a0662e6f83c3ba1490e9247d7459e330))
+* harden strip_unc_prefix against lossy paths and verbatim UNC ([c35ef7c](https://github.com/MikeGrier/cargo-mcp-rs/commit/c35ef7c30d5adc520225e5d09adfab386e29f467))
+* prefer en-US for FormatMessageW with system-default fallback ([e9fe08c](https://github.com/MikeGrier/cargo-mcp-rs/commit/e9fe08ca588bab23e58e02f978622ba27895a382))
+* reframe RmGetList loop as resize-to-fit, not bounded retry ([925f099](https://github.com/MikeGrier/cargo-mcp-rs/commit/925f0993cc99a275b13630484e477b114e6f7d06))
+* retry RmGetList fetch on ERROR_MORE_DATA race ([4f648d8](https://github.com/MikeGrier/cargo-mcp-rs/commit/4f648d82a9ecdcb86e11e3e3f2ac7910ac332a97))
+
 ## [0.5.1](https://github.com/MikeGrier/cargo-mcp-rs/compare/v0.5.0...v0.5.1) (2026-05-09)
 
 
