@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.1](https://github.com/MikeGrier/cargo-mcp-rs/compare/v0.5.0...v0.5.1) (2026-05-09)
+
+
+### Bug Fixes
+
+* correct apply_rustc_env doc comment and README wording per review feedback ([63be067](https://github.com/MikeGrier/cargo-mcp-rs/commit/63be0670d980aec2d52644ae8f63dbb07c4d2e96))
+
 ## [0.5.0](https://github.com/MikeGrier/cargo-mcp-rs/compare/v0.4.1...v0.5.0) (2026-05-08)
 
 
