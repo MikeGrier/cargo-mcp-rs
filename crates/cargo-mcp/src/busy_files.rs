@@ -111,19 +111,35 @@ pub struct FileHolders {
 /// Phrases that indicate a file-busy / sharing-violation condition in cargo
 /// or rustc output. Kept in sync with [`crate::invoke::is_transient_busy_error`]
 /// so the two detectors agree on what counts as "busy".
+///
+/// The two `(os error N)` markers are Win32-specific error numbers and are
+/// gated to Windows in [`line_is_busy_indicator`] (mirroring the same
+/// `cfg!(windows)` gate in `is_transient_busy_error`); the textual phrases
+/// match on every platform because cargo prints them verbatim regardless of
+/// host (e.g. when relaying the OS message from a remote build target).
 const BUSY_INDICATORS: &[&str] = &[
     "being used by another process",
     "Access is denied",
     "access is denied",
     "sharing violation",
     "Sharing violation",
-    "(os error 32)",
-    "(os error 5)",
 ];
 
-/// Returns `true` if `line` contains any [`BUSY_INDICATORS`] phrase.
+/// Win32-specific OS-error tags. Only treated as busy indicators on Windows
+/// hosts; on other platforms `(os error 32)` could legitimately mean
+/// `EPIPE`, etc.
+const BUSY_INDICATORS_WINDOWS_ONLY: &[&str] = &["(os error 32)", "(os error 5)"];
+
+/// Returns `true` if `line` contains any [`BUSY_INDICATORS`] phrase, or (on
+/// Windows only) any [`BUSY_INDICATORS_WINDOWS_ONLY`] phrase.
 fn line_is_busy_indicator(line: &str) -> bool {
-    BUSY_INDICATORS.iter().any(|p| line.contains(p))
+    if BUSY_INDICATORS.iter().any(|p| line.contains(p)) {
+        return true;
+    }
+    cfg!(windows)
+        && BUSY_INDICATORS_WINDOWS_ONLY
+            .iter()
+            .any(|p| line.contains(p))
 }
 
 /// Extract every file path that cargo reported as busy in `stderr_or_stdout`.
