@@ -516,6 +516,11 @@ mod windows_impl {
         rm_err(api, code)
     }
 
+    #[cfg(test)]
+    pub(super) fn strip_unc_prefix_for_tests(p: PathBuf) -> PathBuf {
+        strip_unc_prefix(p)
+    }
+
     // ── public entry point ───────────────────────────────────────────────
 
     /// One Restart Manager session per file so each holder list maps back
@@ -634,16 +639,62 @@ mod windows_impl {
             .collect())
     }
 
-    /// Strip the `\\?\` UNC prefix that `canonicalize` returns on Windows
-    /// so log output is human-readable. Restart Manager accepts both
-    /// forms, so this is purely cosmetic.
+    /// Strip the `\\?\` verbatim prefix that `canonicalize` returns on
+    /// Windows so log output is human-readable, and (more importantly)
+    /// so verbatim UNC paths get rewritten back to a real UNC form
+    /// (`\\?\UNC\server\share\...` -> `\\server\share\...`) instead of
+    /// the invalid `UNC\server\share\...` that a naive prefix strip
+    /// would produce. Restart Manager accepts the verbatim form, so
+    /// strictly cosmetic for local-disk paths; required for
+    /// correctness for verbatim UNC paths if they ever reach us.
+    ///
+    /// Operates on path [`Component`]s rather than a lossy
+    /// `to_string_lossy` round-trip so paths containing non-Unicode
+    /// `OsStr` bytes are preserved exactly.
     fn strip_unc_prefix(p: PathBuf) -> PathBuf {
-        let s = p.to_string_lossy().into_owned();
-        if let Some(rest) = s.strip_prefix(r"\\?\") {
-            PathBuf::from(rest)
-        } else {
-            p
+        use std::ffi::OsString;
+        use std::path::{Component, Prefix};
+
+        let mut comps = p.components();
+        let Some(Component::Prefix(pc)) = comps.next() else {
+            return p;
+        };
+
+        // Build the new prefix as an OsString so non-Unicode bytes in
+        // the server/share names survive intact.
+        let head: OsString = match pc.kind() {
+            Prefix::VerbatimDisk(letter) => {
+                // VerbatimDisk's letter is a guaranteed ASCII byte.
+                let mut s = OsString::new();
+                s.push(format!("{}:\\", letter as char));
+                s
+            }
+            Prefix::VerbatimUNC(server, share) => {
+                let mut s = OsString::from(r"\\");
+                s.push(server);
+                s.push(r"\");
+                s.push(share);
+                s.push(r"\");
+                s
+            }
+            // Anything else (plain Disk, UNC, DeviceNS, or
+            // Verbatim(<volume GUID>)) is already either non-verbatim
+            // or unsafe to rewrite. Leave the path alone.
+            _ => return p,
+        };
+
+        let mut rebuilt = PathBuf::from(head);
+        for c in comps {
+            // The component immediately after a Prefix on an absolute
+            // path is RootDir; the head we just built already contains
+            // the trailing separator, so skip it to avoid `\\?\` style
+            // duplication.
+            if matches!(c, Component::RootDir) {
+                continue;
+            }
+            rebuilt.push(c.as_os_str());
         }
+        rebuilt
     }
 
     /// Read a NUL-terminated UTF-16 string from a fixed-size buffer.
@@ -927,5 +978,39 @@ error: failed to remove file `foo`:
             s.contains("3735928559") && s.contains("no system message"),
             "missing fallback markers: {s:?}"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn strip_unc_prefix_rewrites_verbatim_disk() {
+        let p = PathBuf::from(r"\\?\C:\Users\me\file.txt");
+        let out = super::windows_impl::strip_unc_prefix_for_tests(p);
+        assert_eq!(out, PathBuf::from(r"C:\Users\me\file.txt"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn strip_unc_prefix_rewrites_verbatim_unc() {
+        // \\?\UNC\server\share\dir\file -> \\server\share\dir\file
+        let p = PathBuf::from(r"\\?\UNC\server\share\dir\file.dll");
+        let out = super::windows_impl::strip_unc_prefix_for_tests(p);
+        assert_eq!(out, PathBuf::from(r"\\server\share\dir\file.dll"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn strip_unc_prefix_leaves_plain_disk_alone() {
+        let p = PathBuf::from(r"D:\projects\thing.exe");
+        let out = super::windows_impl::strip_unc_prefix_for_tests(p.clone());
+        assert_eq!(out, p);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn strip_unc_prefix_leaves_volume_guid_alone() {
+        // Verbatim(<volume GUID>) is not safe to rewrite; pass through.
+        let p = PathBuf::from(r"\\?\Volume{12345678-0000-0000-0000-000000000000}\file");
+        let out = super::windows_impl::strip_unc_prefix_for_tests(p.clone());
+        assert_eq!(out, p);
     }
 }
