@@ -640,19 +640,36 @@ mod windows_impl {
             return Ok(Vec::new());
         }
 
-        // Fetch the actual list. RmGetList can return ERROR_MORE_DATA
-        // again here if the set of affected processes grew between the
-        // probe and the fetch (a real and not-uncommon race on busy
-        // systems). Retry a bounded number of times, reallocating with
-        // the new `needed` count each time, before giving up. Cap the
-        // attempts so a pathological churning system can't make us spin
-        // forever.
-        const MAX_FETCH_ATTEMPTS: u32 = 4;
-        let mut buf: Vec<RmProcessInfo> = Vec::new();
-        let mut final_count: u32 = 0;
-        let mut last_rc: u32 = ERROR_MORE_DATA;
-        for _ in 0..MAX_FETCH_ATTEMPTS {
-            buf = Vec::with_capacity(needed as usize);
+        // Fetch the list. RmGetList is *not* a streaming API: each call
+        // returns the entire current snapshot of affected processes, and
+        // signals "the snapshot grew between calls" by returning
+        // ERROR_MORE_DATA together with an updated `needed` count. We
+        // therefore loop, growing the buffer to whatever RM currently
+        // wants, until we either get ERROR_SUCCESS or detect that
+        // looping further can't make progress.
+        //
+        // Termination conditions (in priority order):
+        //   1. ERROR_SUCCESS  -> success path, take the buffer.
+        //   2. Some non-MORE_DATA error  -> hard fail with rm_err.
+        //   3. ERROR_MORE_DATA but `needed` did NOT strictly grow ->
+        //      RM is misbehaving (it told us "bigger" without telling
+        //      us *how much* bigger); bail rather than spin.
+        //   4. `needed` exceeds a sanity ceiling -> a runaway system
+        //      where literally every process opens this file; bail
+        //      with a clear diagnostic.
+        //
+        // Note: there is no fixed cap on loop iterations. As long as RM
+        // is honestly reporting genuine growth, we keep up with it.
+        const MAX_HOLDERS: u32 = 65_536; // ~16x the entire pid space on Win11.
+        let (buf, final_count) = loop {
+            if needed > MAX_HOLDERS {
+                return Err(format!(
+                    "RmGetList reported {needed} affected processes \
+                     (exceeds sanity limit {MAX_HOLDERS})"
+                ));
+            }
+            let prev_needed = needed;
+            let mut buf: Vec<RmProcessInfo> = Vec::with_capacity(needed as usize);
             count = needed;
             let rc = unsafe {
                 RmGetList(
@@ -663,20 +680,25 @@ mod windows_impl {
                     &mut reasons,
                 )
             };
-            last_rc = rc;
-            if rc == ERROR_SUCCESS {
-                final_count = count;
-                break;
+            match rc {
+                ERROR_SUCCESS => break (buf, count),
+                ERROR_MORE_DATA => {
+                    // RM updated `needed` to the now-required size.
+                    // If it didn't actually grow, RM is telling us
+                    // "bigger" without making progress; refuse to spin.
+                    if needed <= prev_needed {
+                        return Err(format!(
+                            "RmGetList kept asking for more space \
+                             without growing the request \
+                             (stuck at {needed} entries)"
+                        ));
+                    }
+                    // Otherwise loop and reallocate to the new size.
+                }
+                other => return Err(rm_err("RmGetList fetch", other)),
             }
-            if rc != ERROR_MORE_DATA {
-                return Err(rm_err("RmGetList fetch", rc));
-            }
-            // ERROR_MORE_DATA: `needed` was updated by RM; loop and
-            // reallocate to the new size.
-        }
-        if last_rc != ERROR_SUCCESS {
-            return Err(rm_err("RmGetList fetch (after retries)", last_rc));
-        }
+        };
+        let mut buf = buf;
         // SAFETY: RM populated `final_count` valid entries in `buf`.
         unsafe { buf.set_len(final_count as usize) };
 
