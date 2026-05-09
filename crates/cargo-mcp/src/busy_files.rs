@@ -19,8 +19,10 @@
 //! 2. **Holder query** ([`query_holders`]) — Windows-only call into the
 //!    Restart Manager APIs (`rstrtmgr.dll`) that reports every process
 //!    holding a handle on each given file (PID, executable name,
-//!    application kind). Returns an empty vector on non-Windows hosts so
-//!    callers don't need their own `cfg` gates.
+//!    application kind). On non-Windows hosts it returns one
+//!    [`FileHolders`] entry per input path with `error = Some(...)`
+//!    explaining that RM is Windows-only, so callers can render a
+//!    uniform diagnostic without their own `cfg` gates.
 //!
 //! Combined, these power the file-busy diagnostic that cargo-mcp appends
 //! to failed cargo output and surfaces as progress notifications between
@@ -660,7 +662,15 @@ mod windows_impl {
         //
         // Note: there is no fixed cap on loop iterations. As long as RM
         // is honestly reporting genuine growth, we keep up with it.
-        const MAX_HOLDERS: u32 = 65_536; // ~16x the entire pid space on Win11.
+        // Sanity ceiling on the per-file affected-process count. RM
+        // returns one entry per holder on the system; even on a busy host
+        // a single file is realistically held by single-digit numbers of
+        // processes, and an answer in the tens of thousands almost
+        // certainly indicates a runaway snapshot or RM bug. The exact
+        // number is arbitrary -- it just needs to be far above any
+        // plausible real answer and far below anything that would let us
+        // burn unbounded memory.
+        const MAX_HOLDERS: u32 = 65_536;
         let (buf, final_count) = loop {
             if needed > MAX_HOLDERS {
                 return Err(format!(
@@ -1032,12 +1042,18 @@ error: failed to remove file `foo`:
         // sensitive to the host's display language.
         let s = super::windows_impl::rm_err_for_tests("RmTest", 2);
         assert!(s.starts_with("RmTest failed:"), "unexpected prefix: {s:?}");
-        assert!(s.contains("(code 2)"), "missing numeric code: {s:?}");
-        // Either a real translation, or our own fallback if FormatMessage
-        // didn't recognise the code on this host.
+        // Two valid shapes:
+        //   success:  "RmTest failed: <localized message> (code 2)"
+        //   fallback: "RmTest failed: code 2 (no system message)"
+        // Either way assert there's a non-empty descriptive body --
+        // not just the prefix and the trailing code.
+        let success = s.strip_prefix("RmTest failed: ")
+            .and_then(|rest| rest.strip_suffix(" (code 2)"))
+            .map(|msg| !msg.trim().is_empty());
+        let fallback = s == "RmTest failed: code 2 (no system message)";
         assert!(
-            !s.ends_with("failed: (code 2)"),
-            "message body should be non-empty: {s:?}"
+            success == Some(true) || fallback,
+            "expected localized body or explicit fallback marker: {s:?}"
         );
     }
 
