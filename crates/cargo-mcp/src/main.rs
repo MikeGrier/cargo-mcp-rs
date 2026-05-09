@@ -9,6 +9,7 @@
 //! stderr. This keeps the MCP server as a thin dispatch layer — all build
 //! logic lives in Cargo itself.
 
+mod busy_files;
 mod elicit;
 mod invoke;
 mod line_reader;

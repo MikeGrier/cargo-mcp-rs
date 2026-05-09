@@ -431,6 +431,41 @@ fn maybe_append_working_dir_hint(stderr: &mut String, working_dir: Option<&str>)
     ));
 }
 
+/// Extract busy file paths from cargo output and ask the OS which processes
+/// hold them. Returns an empty vector when no busy paths could be parsed
+/// out of the combined stderr/stdout (in which case there is nothing
+/// useful to report to the agent).
+///
+/// Combines stderr and stdout because cargo writes its diagnostic blocks
+/// to stderr but some downstream tools (notably the MSVC linker invoked
+/// via `link.exe`) emit "file in use" errors on stdout instead.
+fn collect_busy_holders(stderr: &str, stdout: &str) -> Vec<crate::busy_files::FileHolders> {
+    let mut paths = crate::busy_files::extract_busy_paths(stderr);
+    paths.extend(crate::busy_files::extract_busy_paths(stdout));
+    if paths.is_empty() {
+        return Vec::new();
+    }
+    // Dedupe across the two streams while keeping order.
+    let mut seen = std::collections::HashSet::new();
+    paths.retain(|p| seen.insert(p.clone()));
+    let refs: Vec<&Path> = paths.iter().map(|p| p.as_path()).collect();
+    crate::busy_files::query_holders(&refs)
+}
+
+/// Append the formatted holder report to `stderr`, ensuring a leading
+/// blank line so it doesn't run into cargo's own message text.
+fn append_holder_report(stderr: &mut String, report: &[crate::busy_files::FileHolders]) {
+    let formatted = crate::busy_files::format_full_report(report);
+    if formatted.is_empty() {
+        return;
+    }
+    if !stderr.ends_with('\n') {
+        stderr.push('\n');
+    }
+    stderr.push('\n');
+    stderr.push_str(&formatted);
+}
+
 // ── subprocess runners ────────────────────────────────────────────────────────
 
 /// Run `cargo <args>`, calling `on_stdout_line` for each stdout line as it
@@ -464,10 +499,26 @@ pub fn run_cargo_streaming(
 
     let mut last: Option<CargoOutput> = None;
     for attempt in 1..=max_attempts {
-        let out = run_cargo_streaming_once(args, working_dir, on_stdout_line)?;
+        let mut out = run_cargo_streaming_once(args, working_dir, on_stdout_line)?;
         let busy = out.exit_code != 0
             && (is_transient_busy_error(&out.stderr) || is_transient_busy_error(&out.stdout));
-        if !busy || attempt == max_attempts {
+        if !busy {
+            return Ok(out);
+        }
+        // Best-effort: identify the processes holding the busy files and
+        // surface them. Done on every busy attempt because the offender
+        // can change between retries (e.g. AV releases its handle but the
+        // freshly-launched binary itself takes one).
+        let holder_report = collect_busy_holders(&out.stderr, &out.stdout);
+        if !holder_report.is_empty() {
+            if let Some(line) = crate::busy_files::format_short_summary(&holder_report) {
+                on_stdout_line(&line);
+            }
+            // Also append the full per-process breakdown to the captured
+            // stderr so the agent sees it even if it never reads progress.
+            append_holder_report(&mut out.stderr, &holder_report);
+        }
+        if attempt == max_attempts {
             return Ok(out);
         }
         // Surface the retry as a synthetic line so the streaming caller can
@@ -648,6 +699,13 @@ pub fn run_cargo_to_file(
     let exit_code = status.code().unwrap_or(-1);
     if exit_code != 0 {
         maybe_append_working_dir_hint(&mut stderr_buf, working_dir);
+        // No retry loop here (stdout is plumbed straight to a file), so
+        // do the busy-file diagnostic in line. stdout is unavailable to
+        // parse — pass an empty string and rely on stderr only.
+        let report = collect_busy_holders(&stderr_buf, "");
+        if !report.is_empty() {
+            append_holder_report(&mut stderr_buf, &report);
+        }
     }
 
     Ok(CargoOutput {
