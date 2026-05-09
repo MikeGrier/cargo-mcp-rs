@@ -640,23 +640,45 @@ mod windows_impl {
             return Ok(Vec::new());
         }
 
-        // Second call: fetch the actual list.
-        let mut buf: Vec<RmProcessInfo> = Vec::with_capacity(needed as usize);
-        count = needed;
-        let rc = unsafe {
-            RmGetList(
-                handle,
-                &mut needed,
-                &mut count,
-                buf.as_mut_ptr(),
-                &mut reasons,
-            )
-        };
-        if rc != ERROR_SUCCESS {
-            return Err(rm_err("RmGetList fetch", rc));
+        // Fetch the actual list. RmGetList can return ERROR_MORE_DATA
+        // again here if the set of affected processes grew between the
+        // probe and the fetch (a real and not-uncommon race on busy
+        // systems). Retry a bounded number of times, reallocating with
+        // the new `needed` count each time, before giving up. Cap the
+        // attempts so a pathological churning system can't make us spin
+        // forever.
+        const MAX_FETCH_ATTEMPTS: u32 = 4;
+        let mut buf: Vec<RmProcessInfo> = Vec::new();
+        let mut final_count: u32 = 0;
+        let mut last_rc: u32 = ERROR_MORE_DATA;
+        for _ in 0..MAX_FETCH_ATTEMPTS {
+            buf = Vec::with_capacity(needed as usize);
+            count = needed;
+            let rc = unsafe {
+                RmGetList(
+                    handle,
+                    &mut needed,
+                    &mut count,
+                    buf.as_mut_ptr(),
+                    &mut reasons,
+                )
+            };
+            last_rc = rc;
+            if rc == ERROR_SUCCESS {
+                final_count = count;
+                break;
+            }
+            if rc != ERROR_MORE_DATA {
+                return Err(rm_err("RmGetList fetch", rc));
+            }
+            // ERROR_MORE_DATA: `needed` was updated by RM; loop and
+            // reallocate to the new size.
         }
-        // SAFETY: RM populated `count` valid entries.
-        unsafe { buf.set_len(count as usize) };
+        if last_rc != ERROR_SUCCESS {
+            return Err(rm_err("RmGetList fetch (after retries)", last_rc));
+        }
+        // SAFETY: RM populated `final_count` valid entries in `buf`.
+        unsafe { buf.set_len(final_count as usize) };
 
         Ok(buf
             .into_iter()
