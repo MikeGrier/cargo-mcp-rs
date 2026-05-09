@@ -430,6 +430,30 @@ Non-idempotent commands (`cargo_publish`, `cargo_add`, `cargo_remove`,
 `cargo_fix`, `cargo_update`) and direct-to-file streaming (the `output_file`
 mode of `cargo_metadata`) are **never** retried, regardless of the setting.
 
+### File-busy holder diagnostics (Windows)
+
+When a busy error is detected on Windows, cargo-mcp parses the offending
+file paths out of cargo's output and asks the OS's [Restart Manager
+APIs](https://learn.microsoft.com/windows/win32/api/restartmanager/) which
+processes currently hold open handles on each file. Each holder is
+reported by PID, executable name, and process kind (console, GUI app,
+service, Explorer, critical system process).
+
+The diagnostic is emitted in two places:
+
+- **Per-retry progress line** — a one-line summary (e.g. `cargo-mcp: file
+  held by: rust-analyzer-proc-macro-srv.exe (PID 12345)`) is streamed as
+  a progress notification before each retry attempt.
+- **Final stderr** — a multi-line block listing every busy file and its
+  holders is appended to the captured stderr if the operation ultimately
+  fails (or runs without retry).
+
+The query is best-effort: if Restart Manager is unavailable, access is
+denied, or the file has already been released, the per-file entry records
+the reason and the rest of the report still renders. On non-Windows hosts
+the path-extraction step still runs but no holder lookup is performed
+(Restart Manager is a Windows-only API).
+
 ---
 
 ## Building from source
