@@ -171,8 +171,10 @@ pub fn extract_busy_paths(stderr_or_stdout: &str) -> Vec<PathBuf> {
     // object whose backslashes (and embedded backticks) are JSON-escaped,
     // so the raw stdout bytes contain `\\` between path segments and our
     // backtick scanner would harvest a malformed path that Restart Manager
-    // can't open. Pre-expand any JSON line into its `rendered` (or
-    // `message`) text first, falling back to the line itself.
+    // can't open. Pre-expand JSON diagnostic lines into their rendered
+    // text; non-JSON lines pass through unchanged. See
+    // `normalize_json_lines` for the exact contract on JSON lines that
+    // carry no diagnostic text (they are dropped, not passed through).
     let normalized = normalize_json_lines(stderr_or_stdout);
     let lines: Vec<&str> = normalized.lines().collect();
 
@@ -255,9 +257,13 @@ fn harvest_backtick_paths(line: &str, out: &mut Vec<PathBuf>) {
 /// would get a Restart Manager report against the *outer* artefact (which
 /// rustc never created) instead of the actual locked file.
 ///
-/// The match is deliberately narrow: only the exact phrase `at path "`
-/// followed by a closing `"` on the same line, with no escape handling
-/// (the JSON un-escape step in [`normalize_json_lines`] runs first).
+/// The captured substring is `Debug`-formatted by rustc (`{:?}`), so on
+/// Windows every backslash arrives doubled (`\\`) even after the JSON
+/// layer has already been un-escaped by [`normalize_json_lines`]. We
+/// collapse those doubled backslashes back to single ones before
+/// returning the path; otherwise `std::fs::canonicalize` would have to
+/// guess at the redundant separators and Restart Manager would receive
+/// a syntactically odd path. Forward slashes are not affected.
 fn harvest_at_path_paths(line: &str, out: &mut Vec<PathBuf>) {
     const NEEDLE: &str = "at path \"";
     let mut rest = line;
@@ -268,7 +274,11 @@ fn harvest_at_path_paths(line: &str, out: &mut Vec<PathBuf>) {
             if !inner.is_empty()
                 && (inner.contains('/') || inner.contains('\\') || inner.contains('.'))
             {
-                out.push(PathBuf::from(inner));
+                // Un-escape Debug-style doubled backslashes. Safe for
+                // UNC paths because rustc Debug-prints `\\\\server\\share`,
+                // which collapses to the correct `\\server\\share`.
+                let unescaped = inner.replace(r"\\", r"\");
+                out.push(PathBuf::from(unescaped));
             }
             rest = &after[end + 1..];
         } else {
@@ -924,9 +934,17 @@ error: failed to remove file `target/debug/dup.exe`:
     #[test]
     fn extracts_paths_from_cargo_json_message_format() {
         // Real-world line from `cargo build --message-format=json` when
-        // rustc fails to clean up its temp archive on Windows. Backslashes
-        // are JSON-escaped (`\\`) and the locked file is reported only in
-        // an `at path "..."` form, not in backticks.
+        // rustc fails to clean up its temp archive on Windows. In the
+        // NDJSON source:
+        //   * the backtick-quoted artefact uses `\\` (one JSON-escaped
+        //     backslash) because cargo writes the path verbatim into
+        //     `rendered`, and
+        //   * the locked file is reported as `at path \"...\"` with `\\\\`
+        //     because rustc Debug-formats it (`{:?}`) before cargo wraps
+        //     the whole thing in JSON, so each backslash is escaped twice.
+        // After JSON decoding the two paths therefore look different
+        // (single vs. double backslashes); both must end up extracted as
+        // the same canonical Windows path.
         let stdout = r#"{"reason":"compiler-message","package_id":"path+file:///x#0.1.0","message":{"rendered":"error: failed to build archive at `Z:\\deps\\libfoo.rlib`: failed to remove temporary directory: The process cannot access the file because it is being used by another process. (os error 32) at path \"Z:\\\\deps\\\\.tmpD5sCLz.temp-archive\"\n\n","$message_type":"diagnostic","children":[],"level":"error","message":"failed","spans":[],"code":null}}
 {"reason":"build-finished","success":false}"#;
         let paths = extract_busy_paths(stdout);
@@ -937,7 +955,8 @@ error: failed to remove file `target/debug/dup.exe`:
                 PathBuf::from(r"Z:\deps\.tmpD5sCLz.temp-archive"),
             ],
             "expected both the rlib (backtick) and the temp-archive \
-             (at path \"...\") form to be extracted, got {paths:?}"
+             (at path \"...\") form to be extracted with single \
+             backslashes, got {paths:?}"
         );
     }
 
@@ -948,8 +967,11 @@ error: failed to remove temporary directory: The process cannot access the \
 file because it is being used by another process. (os error 32) at path \
 \"C:\\\\work\\\\.tmpAbc.temp-archive\"
 ";
-        // The double-backslashes here are Rust source-string escapes; the
-        // actual stderr text contains single backslashes.
+        // The four-backslash sequences in the Rust source render as two
+        // literal backslashes in the test input, matching how rustc
+        // Debug-formats Windows paths (`{:?}`) inside its error chain.
+        // `harvest_at_path_paths` is expected to un-escape those back to
+        // single separators.
         let paths = extract_busy_paths(stderr);
         assert_eq!(
             paths,
