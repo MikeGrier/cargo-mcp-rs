@@ -46,6 +46,11 @@ use std::path::{Path, PathBuf};
 /// Kept as a stable Rust enum (rather than a raw integer) so non-Windows
 /// callers and tests can match on it without `cfg` gates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// Most variants are only constructed by the Windows-only `windows_impl`
+// module (via `classify`); on non-Windows builds the dead-code lint would
+// otherwise fire even though the variants are part of the cross-platform
+// public API by design.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub enum AppKind {
     /// Could not be classified.
     Unknown,
