@@ -162,7 +162,14 @@ fn line_is_busy_indicator(line: &str) -> bool {
 /// errors like "unresolved import \`foo\`".
 pub fn extract_busy_paths(stderr_or_stdout: &str) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
-    let lines: Vec<&str> = stderr_or_stdout.lines().collect();
+    // Cargo's `--message-format=json` wraps each diagnostic in an NDJSON
+    // object whose backslashes (and embedded backticks) are JSON-escaped,
+    // so the raw stdout bytes contain `\\` between path segments and our
+    // backtick scanner would harvest a malformed path that Restart Manager
+    // can't open. Pre-expand any JSON line into its `rendered` (or
+    // `message`) text first, falling back to the line itself.
+    let normalized = normalize_json_lines(stderr_or_stdout);
+    let lines: Vec<&str> = normalized.lines().collect();
 
     // Identify block boundaries: any line whose first non-whitespace token
     // is `error:` or `warning:` starts a new diagnostic block. Everything
@@ -192,6 +199,7 @@ pub fn extract_busy_paths(stderr_or_stdout: &str) -> Vec<PathBuf> {
         }
         for line in block {
             harvest_backtick_paths(line, &mut out);
+            harvest_at_path_paths(line, &mut out);
         }
     }
 
@@ -232,6 +240,71 @@ fn harvest_backtick_paths(line: &str, out: &mut Vec<PathBuf>) {
         }
         i = j + 1;
     }
+}
+
+/// Push every path that appears after the literal `at path "..."` (a form
+/// rustc uses for the *underlying* file when reporting a wrapping error,
+/// e.g. `failed to remove temporary directory: ... at path
+/// "...\\.tmpD5sCLz.temp-archive"`). Cargo doesn't put this path in
+/// backticks, so [`harvest_backtick_paths`] would miss it and the user
+/// would get a Restart Manager report against the *outer* artefact (which
+/// rustc never created) instead of the actual locked file.
+///
+/// The match is deliberately narrow: only the exact phrase `at path "`
+/// followed by a closing `"` on the same line, with no escape handling
+/// (the JSON un-escape step in [`normalize_json_lines`] runs first).
+fn harvest_at_path_paths(line: &str, out: &mut Vec<PathBuf>) {
+    const NEEDLE: &str = "at path \"";
+    let mut rest = line;
+    while let Some(pos) = rest.find(NEEDLE) {
+        let after = &rest[pos + NEEDLE.len()..];
+        if let Some(end) = after.find('"') {
+            let inner = &after[..end];
+            if !inner.is_empty()
+                && (inner.contains('/') || inner.contains('\\') || inner.contains('.'))
+            {
+                out.push(PathBuf::from(inner));
+            }
+            rest = &after[end + 1..];
+        } else {
+            break;
+        }
+    }
+}
+
+/// Replace every NDJSON line emitted by `cargo --message-format=json` with
+/// its rendered diagnostic text, so the rest of the extractor can run
+/// against unescaped (`\` not `\\`) paths and human-readable phrases.
+///
+/// Non-JSON lines pass through unchanged. Lines that are JSON but lack a
+/// `message.rendered` / `rendered` / `message` field are dropped because
+/// they carry no diagnostic text relevant here (e.g. `compiler-artifact`,
+/// `build-finished`).
+fn normalize_json_lines(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for line in s.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('{')
+            && let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed)
+        {
+            let rendered = v
+                .pointer("/message/rendered")
+                .and_then(|x| x.as_str())
+                .or_else(|| v.pointer("/rendered").and_then(|x| x.as_str()))
+                .or_else(|| v.pointer("/message/message").and_then(|x| x.as_str()))
+                .or_else(|| v.pointer("/message").and_then(|x| x.as_str()));
+            if let Some(text) = rendered {
+                out.push_str(text);
+                if !text.ends_with('\n') {
+                    out.push('\n');
+                }
+            }
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
 }
 
 // ── Restart Manager query ────────────────────────────────────────────────────
@@ -841,6 +914,42 @@ error: failed to remove file `target/debug/dup.exe`:
 ";
         let paths = extract_busy_paths(stderr);
         assert_eq!(paths, vec![PathBuf::from("target/debug/dup.exe")]);
+    }
+
+    #[test]
+    fn extracts_paths_from_cargo_json_message_format() {
+        // Real-world line from `cargo build --message-format=json` when
+        // rustc fails to clean up its temp archive on Windows. Backslashes
+        // are JSON-escaped (`\\`) and the locked file is reported only in
+        // an `at path "..."` form, not in backticks.
+        let stdout = r#"{"reason":"compiler-message","package_id":"path+file:///x#0.1.0","message":{"rendered":"error: failed to build archive at `Z:\\deps\\libfoo.rlib`: failed to remove temporary directory: The process cannot access the file because it is being used by another process. (os error 32) at path \"Z:\\\\deps\\\\.tmpD5sCLz.temp-archive\"\n\n","$message_type":"diagnostic","children":[],"level":"error","message":"failed","spans":[],"code":null}}
+{"reason":"build-finished","success":false}"#;
+        let paths = extract_busy_paths(stdout);
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from(r"Z:\deps\libfoo.rlib"),
+                PathBuf::from(r"Z:\deps\.tmpD5sCLz.temp-archive"),
+            ],
+            "expected both the rlib (backtick) and the temp-archive \
+             (at path \"...\") form to be extracted, got {paths:?}"
+        );
+    }
+
+    #[test]
+    fn extracts_at_path_quoted_paths_from_plain_text() {
+        let stderr = "\
+error: failed to remove temporary directory: The process cannot access the \
+file because it is being used by another process. (os error 32) at path \
+\"C:\\\\work\\\\.tmpAbc.temp-archive\"
+";
+        // The double-backslashes here are Rust source-string escapes; the
+        // actual stderr text contains single backslashes.
+        let paths = extract_busy_paths(stderr);
+        assert_eq!(
+            paths,
+            vec![PathBuf::from(r"C:\work\.tmpAbc.temp-archive")]
+        );
     }
 
     #[test]
