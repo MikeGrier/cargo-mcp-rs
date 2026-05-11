@@ -3,14 +3,20 @@
 // Layer 2 end-to-end-in-process test for the Restart Manager
 // "who holds this file" pipeline.
 //
-// Spawns rm-target-sniffer to hold a directory handle on a real
-// victim crate's `target\debug\deps` (the CWD-pattern offender we
-// see in production), then drives `invoke::run_cargo_streaming` for
-// `cargo clean`. Because `clean` is on `IDEMPOTENT_SUBCOMMANDS` and
-// the failure carries `(os error 32)` ("being used by another
-// process"), the retry path runs and `collect_busy_holders` /
-// `append_holder_report` should resolve and append the sniffer's
-// PID, exe name, and full image path to the captured stderr.
+// Spawns rm-target-sniffer to hold open `*.exe` files inside a real
+// victim crate's `target\debug\deps` (the file-handle pattern that
+// reliably triggers RmGetList in production), then drives
+// `invoke::run_cargo_streaming` for `cargo clean`. Because `clean`
+// is on `IDEMPOTENT_SUBCOMMANDS` and the failure carries
+// `(os error 32)` ("being used by another process"), the retry path
+// runs and `collect_busy_holders` / `append_holder_report` should
+// resolve and append the sniffer's PID, exe name, and full image
+// path to the captured stderr.
+//
+// The directory-handle / CWD-holder variant is covered by the
+// `#[ignore]`'d limitation-doc test below: `RmGetList` returns
+// `ERROR_ACCESS_DENIED (5)` for directory resources, so that path
+// surfaces only the access-denied probe note (no process name).
 //
 // `cargo-mcp` is a binary-only crate, so the test mounts the three
 // relevant modules at the test crate's root via `#[path]`. This

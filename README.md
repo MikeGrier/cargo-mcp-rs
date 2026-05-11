@@ -243,10 +243,14 @@ invoked from the tool-result panel even when the JSON `arguments` shown
 by the MCP client are sparse.
 
 For JSON-mode tools (`check`, `build`, `test`, `clippy`, `doc`, `metadata`)
-the body of the result is NDJSON — one JSON object per line. Streaming
-progress notifications are also emitted while the build runs; the final
-notification reads `cargo <verb> finished` (or `failed`), with the optional
-target triplet appended when one is supplied.
+the body of the result is NDJSON — one JSON object per line. On failure
+cargo-mcp also appends a `{"reason":"x-cargo-mcp-stderr","text":...}`
+record carrying the cargo child's stderr (where the Restart Manager
+"who holds this file" report and other side-channel diagnostics land), so
+the full response remains parseable end-to-end with a single line-by-line
+JSON parser. Streaming progress notifications are also emitted while the
+build runs; the final notification reads `cargo <verb> finished` (or
+`failed`), with the optional target triplet appended when one is supplied.
 
 ---
 

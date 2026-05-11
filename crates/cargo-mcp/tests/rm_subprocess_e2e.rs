@@ -122,9 +122,11 @@ impl Drop for ChildGuard {
     }
 }
 
-/// Spawn a background thread that reads NDJSON lines from `child`'s
-/// stdout and pushes each parsed `serde_json::Value` onto a channel.
-/// Returns the receiver and a handle to the join (caller owns drop).
+/// Spawn a detached background thread that reads NDJSON lines from
+/// `child`'s stdout and pushes each parsed `serde_json::Value` onto a
+/// channel. Returns the receiver; the reader thread exits naturally
+/// when the receiver is dropped (`tx.send` returns an error) or when
+/// the child closes its stdout, so no join handle is needed.
 fn spawn_stdout_reader(child: &mut Child) -> mpsc::Receiver<serde_json::Value> {
     let (tx, rx) = mpsc::channel();
     let stdout = child.stdout.take().expect("server stdout");

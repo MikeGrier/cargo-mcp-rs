@@ -191,6 +191,11 @@ fn invocation_header(argv: &[&str], wd: Option<&str>) -> String {
 /// (and grep) only have one string to look for.
 pub(crate) const INVOCATION_REASON: &str = "x-cargo-mcp-invocation";
 
+/// Discriminator for the NDJSON record that carries the cargo child's
+/// stderr (where the Restart Manager holder report and other side-channel
+/// diagnostics land). Emitted only on failure when stderr is non-empty.
+pub(crate) const STDERR_REASON: &str = "x-cargo-mcp-stderr";
+
 /// Format a [`CargoOutput`] from a `--message-format=json` invocation.
 ///
 /// Filters the NDJSON stream to remove dep-artifact and build-script noise
@@ -199,10 +204,11 @@ pub(crate) const INVOCATION_REASON: &str = "x-cargo-mcp-invocation";
 /// The result is prefixed with [`invocation_header`].
 ///
 /// On failure, any non-empty stderr text is appended after the JSON
-/// payload as a `\n[stderr]\n<text>\n` block. This is the channel the
-/// retry-on-busy code path uses to surface the Restart Manager
-/// "who holds this file" report; without this trailer the report is
-/// generated but never reaches the agent or the user.
+/// payload as an extra NDJSON record with `reason = STDERR_REASON` so the
+/// whole tool result remains a clean stream of one-JSON-object-per-line.
+/// This is the channel the retry-on-busy code path uses to surface the
+/// Restart Manager "who holds this file" report; without this record the
+/// report is generated but never reaches the agent or the user.
 fn format_json_output(out: &CargoOutput, argv: &[&str], wd: Option<&str>) -> String {
     let header = invocation_header(argv, wd);
     let body = if out.exit_code == 0 {
@@ -228,12 +234,12 @@ fn format_json_output(out: &CargoOutput, argv: &[&str], wd: Option<&str>) -> Str
         if stderr_trimmed.is_empty() {
             format!("{}\n{}", filtered.trim_end(), trailer)
         } else {
-            format!(
-                "{}\n{}\n[stderr]\n{}\n",
-                filtered.trim_end(),
-                trailer,
-                stderr_trimmed,
-            )
+            let stderr_record = serde_json::to_string(&serde_json::json!({
+                "reason": STDERR_REASON,
+                "text": stderr_trimmed,
+            }))
+            .unwrap_or_else(|_| "{}".into());
+            format!("{}\n{}\n{}", filtered.trim_end(), trailer, stderr_record,)
         }
     };
     format!("{header}{body}")
@@ -1561,6 +1567,19 @@ mod tests {
         }
     }
 
+    /// Every non-blank line of a JSON-mode failure output must parse as a
+    /// JSON object. Guards against regressions where a non-NDJSON appendix
+    /// (e.g. a bare `[stderr]` sentinel) is reintroduced.
+    fn assert_pure_ndjson(formatted: &str) {
+        for (i, line) in formatted.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            serde_json::from_str::<Value>(line)
+                .unwrap_or_else(|e| panic!("line {} is not JSON: {line:?} ({e})", i + 1));
+        }
+    }
+
     #[test]
     fn format_json_output_surfaces_stderr_holder_report_on_failure() {
         // Real-shape NDJSON line so filter_build_ndjson keeps it.
@@ -1568,13 +1587,14 @@ mod tests {
         let stderr = "Holders for `target\\debug\\foo.exe`:\n    PID 1234 - rm-hold-file.exe (C:\\path\\to\\rm-hold-file.exe) [console]\n";
         let out = fake_output(101, stdout, stderr);
         let formatted = format_json_output(&out, &["build"], None);
+        assert_pure_ndjson(&formatted);
         assert!(
             formatted.contains("rm-hold-file.exe"),
             "stderr holder report missing from formatted output:\n{formatted}"
         );
         assert!(
-            formatted.contains("[stderr]"),
-            "expected [stderr] sentinel; got:\n{formatted}"
+            formatted.contains(STDERR_REASON),
+            "expected stderr NDJSON record (reason={STDERR_REASON}); got:\n{formatted}"
         );
         assert!(
             formatted.contains(r#""status":"error""#),
@@ -1583,25 +1603,27 @@ mod tests {
     }
 
     #[test]
-    fn format_json_output_omits_stderr_block_when_empty() {
+    fn format_json_output_omits_stderr_record_when_empty() {
         let stdout = r#"{"reason":"compiler-message","package_id":"foo 0.1.0","target":{"name":"foo"},"message":{"rendered":"error"}}"#;
         let out = fake_output(101, stdout, "");
         let formatted = format_json_output(&out, &["build"], None);
+        assert_pure_ndjson(&formatted);
         assert!(
-            !formatted.contains("[stderr]"),
-            "should not emit [stderr] block when stderr is empty:\n{formatted}"
+            !formatted.contains(STDERR_REASON),
+            "should not emit stderr NDJSON record when stderr is empty:\n{formatted}"
         );
     }
 
     #[test]
-    fn format_json_output_success_omits_stderr_block() {
+    fn format_json_output_success_omits_stderr_record() {
         let stdout =
             r#"{"reason":"compiler-artifact","package_id":"foo 0.1.0","target":{"name":"foo"}}"#;
         let out = fake_output(0, stdout, "noisy progress on stderr\n");
         let formatted = format_json_output(&out, &["build"], None);
+        assert_pure_ndjson(&formatted);
         assert!(
-            !formatted.contains("[stderr]"),
-            "success path must not append stderr:\n{formatted}"
+            !formatted.contains(STDERR_REASON),
+            "success path must not append stderr record:\n{formatted}"
         );
     }
 

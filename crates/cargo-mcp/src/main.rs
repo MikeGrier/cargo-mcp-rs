@@ -247,11 +247,20 @@ fn main() {
         );
     }
     if cfg.rm_lookup_enabled {
-        log_info(
-            &mut out,
-            "Restart Manager process lookup: ENABLED (uses unsafe Win32 FFI in src/rm/)"
-                .to_string(),
-        );
+        if cfg!(windows) {
+            log_info(
+                &mut out,
+                "Restart Manager process lookup: ENABLED (uses unsafe Win32 FFI in src/rm/)"
+                    .to_string(),
+            );
+        } else {
+            log_info(
+                &mut out,
+                "Restart Manager process lookup: requested but unavailable on this host \
+                 (Windows-only; the Win32 FFI in src/rm/ is not compiled in here)"
+                    .to_string(),
+            );
+        }
     }
 
     // Replay any warnings collected during CLI parsing through the MCP log

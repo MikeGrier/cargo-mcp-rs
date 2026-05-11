@@ -144,11 +144,16 @@ single boolean flag).
 
 For JSON-mode tools (`check`, `build`, `test`, `clippy`, `doc`, `metadata`)
 the body of the result is NDJSON — one JSON object per line — filtered to
-keep only `compiler-message` and `build-finished` records. While the build
-runs, streaming progress notifications are also emitted; the final
-notification reads `cargo <verb> finished` (or `failed`), with the optional
-target triplet appended when one is supplied. This is what appears as the
-collapsed summary line in the VS Code chat history.
+keep only `compiler-message` and `build-finished` records. On failure
+cargo-mcp also appends a `{"reason":"x-cargo-mcp-stderr","text":...}`
+record carrying the cargo child's stderr (where the Restart Manager
+"who holds this file" report and other side-channel diagnostics land), so
+the full response stays parseable end-to-end with a single line-by-line
+JSON parser. While the build runs, streaming progress notifications are
+also emitted; the final notification reads `cargo <verb> finished` (or
+`failed`), with the optional target triplet appended when one is supplied.
+This is what appears as the collapsed summary line in the VS Code chat
+history.
 
 For tools without a JSON mode (`fmt`, `tree`, `clean`, `update`, `fix`,
 `add`, `remove`, `publish`) the body is the combined stdout/stderr of cargo,
