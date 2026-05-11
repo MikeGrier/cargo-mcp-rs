@@ -104,11 +104,17 @@ New windows-only test in `crates/cargo-mcp/tests/rm_end_to_end.rs`:
 
 Marked `#[ignore]` (run on demand) — proves what the agent actually sees.
 
-- [ ] _(Deferred)_ Layer 2 already drives `run_cargo_streaming` and
-  asserts the user-visible stderr/stdout shape. Layer 3's incremental
-  value is verifying the JSON-RPC framing, which the formatter unit
-  tests added in `tools.rs` already cover. Re-prioritise if the agent
-  ever reports something the in-process test cannot reproduce.
+- [x] `tests/rm_subprocess_e2e.rs::cargo_clean_holder_report_reaches_agent_through_mcp_transport`
+  spawns the built `cargo-mcp.exe` as a child, drives the
+  newline-delimited JSON-RPC handshake (`initialize` →
+  `notifications/initialized` → `tools/call cargo_clean` → `shutdown`),
+  and asserts that `result.content[0].text` from the `cargo_clean`
+  response contains both `rm-target-sniffer.exe (` and
+  `PID <sniffer_pid>`. This catches transport-level regressions where
+  the holder report would be produced by `invoke` but lost between
+  `format_text_output` / `format_json_output` and the JSON-RPC frame.
+- [x] Run on demand:
+  `cargo test -p cargo-mcp --test rm_subprocess_e2e -- --ignored --nocapture`.
 
 
 ### Wrap-up
