@@ -1,0 +1,26 @@
+# Copyright (c) Michael Grier. All rights reserved.
+#
+# Test-only helper binaries used by `cargo-mcp`'s integration tests to
+# exercise the Restart Manager wrapper (`crate::rm`) and the
+# retry-on-busy code path. Not published.
+
+[package]
+name = "rm-test-helpers"
+version.workspace = true
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "rm-hold-file"
+path = "src/hold_file.rs"
+
+[[bin]]
+name = "rm-target-sniffer"
+path = "src/target_sniffer.rs"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+] }

@@ -282,11 +282,15 @@ pub fn query_holders(paths: &[&Path]) -> Vec<FileHolders> {
 /// ```text
 /// cargo-mcp: 2 file(s) reported in use by other processes:
 ///   target\debug\foo.exe
-///     PID 12345 - foo.exe (console)
-///     PID  6789 - rust-analyzer-proc-macro-srv.exe (console)
+///     PID 12345 - foo.exe (C:\src\foo\target\debug\foo.exe) [console]
+///     PID  6789 - rust-analyzer-proc-macro-srv.exe [console]
 ///   target\debug\bar.dll
 ///     (no current holders - likely a transient AV / indexer scan)
 /// ```
+///
+/// The full image path is shown in parentheses when Restart Manager could
+/// resolve it; the application kind is shown in `[brackets]` to keep it
+/// visually distinct from the path.
 pub fn format_full_report(report: &[FileHolders]) -> String {
     if report.is_empty() {
         return String::new();
@@ -307,8 +311,12 @@ pub fn format_full_report(report: &[FileHolders]) -> String {
             continue;
         }
         for h in &entry.holders {
+            let path_part = match &h.app_path {
+                Some(p) => format!(" ({})", p.display()),
+                None => String::new(),
+            };
             s.push_str(&format!(
-                "    PID {pid} - {name} ({kind})\n",
+                "    PID {pid} - {name}{path_part} [{kind}]\n",
                 pid = h.pid,
                 name = h.app_name,
                 kind = h.app_kind.label(),
@@ -326,7 +334,15 @@ pub fn format_short_summary(report: &[FileHolders]) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
     for entry in report {
         for h in &entry.holders {
-            parts.push(format!("{} (PID {})", h.app_name, h.pid));
+            let path_part = match &h.app_path {
+                Some(p) => format!(" ({})", p.display()),
+                None => String::new(),
+            };
+            parts.push(format!(
+                "{name}{path_part} (PID {pid})",
+                name = h.app_name,
+                pid = h.pid
+            ));
         }
     }
     if parts.is_empty() {
@@ -514,11 +530,13 @@ error: failed to remove file `foo`:
                 ProcessHolder {
                     pid: 1,
                     app_name: "foo.exe".into(),
+                    app_path: None,
                     app_kind: AppKind::Console,
                 },
                 ProcessHolder {
                     pid: 2,
                     app_name: "bar.exe".into(),
+                    app_path: Some(PathBuf::from(r"C:\bin\bar.exe")),
                     app_kind: AppKind::MainWindow,
                 },
             ],
@@ -526,7 +544,10 @@ error: failed to remove file `foo`:
         }];
         let s = format_short_summary(&report).unwrap();
         assert!(s.contains("foo.exe (PID 1)"));
-        assert!(s.contains("bar.exe (PID 2)"));
+        assert!(
+            s.contains(r"bar.exe (C:\bin\bar.exe) (PID 2)"),
+            "missing path-decorated entry in {s:?}"
+        );
     }
 
     #[test]
@@ -536,6 +557,7 @@ error: failed to remove file `foo`:
             holders.push(ProcessHolder {
                 pid: i,
                 app_name: format!("app{i}.exe"),
+                app_path: None,
                 app_kind: AppKind::Console,
             });
         }
@@ -555,6 +577,7 @@ error: failed to remove file `foo`:
             holders: vec![ProcessHolder {
                 pid: 12345,
                 app_name: "foo.exe".into(),
+                app_path: Some(PathBuf::from(r"C:\src\foo\target\debug\foo.exe")),
                 app_kind: AppKind::Console,
             }],
             error: None,
@@ -563,8 +586,8 @@ error: failed to remove file `foo`:
         assert!(s.contains("1 file(s) reported in use"));
         assert!(s.contains("target/debug/foo.exe"));
         assert!(s.contains("PID 12345"));
-        assert!(s.contains("foo.exe"));
-        assert!(s.contains("console"));
+        assert!(s.contains(r"foo.exe (C:\src\foo\target\debug\foo.exe)"));
+        assert!(s.contains("[console]"));
     }
 
     #[test]

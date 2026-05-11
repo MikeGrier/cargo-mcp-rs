@@ -113,6 +113,12 @@ pub struct ProcessHolder {
     /// executable basename (e.g. `foo.exe`) for normal processes, or the
     /// service short name for services.
     pub app_name: String,
+    /// Full path to the holder's executable image, when it could be
+    /// resolved via `OpenProcess` + `QueryFullProcessImageNameW`. `None`
+    /// when the process exited between the RM snapshot and the lookup,
+    /// when our token lacks `PROCESS_QUERY_LIMITED_INFORMATION` rights
+    /// for it (e.g. protected/system processes), or on non-Windows hosts.
+    pub app_path: Option<PathBuf>,
     /// Coarse application kind (used to tailor the suggested remediation —
     /// e.g. "stop the debugger" vs "stop the service").
     pub app_kind: AppKind,
@@ -172,7 +178,9 @@ mod windows_impl {
     use std::path::{Path, PathBuf};
     use std::ptr;
 
-    use windows_sys::Win32::Foundation::{ERROR_MORE_DATA, ERROR_SUCCESS, HLOCAL, LocalFree};
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, ERROR_MORE_DATA, ERROR_SUCCESS, HLOCAL, LocalFree,
+    };
     use windows_sys::Win32::System::Diagnostics::Debug::{
         FORMAT_MESSAGE_ALLOCATE_BUFFER, FORMAT_MESSAGE_FROM_SYSTEM, FORMAT_MESSAGE_IGNORE_INSERTS,
         FormatMessageW,
@@ -181,6 +189,9 @@ mod windows_impl {
         CCH_RM_SESSION_KEY, RM_APP_TYPE, RM_PROCESS_INFO, RmConsole, RmCritical, RmEndSession,
         RmExplorer, RmGetList, RmMainWindow, RmOtherWindow, RmRegisterResources, RmService,
         RmStartSession,
+    };
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
     };
 
     fn classify(app_type: RM_APP_TYPE) -> AppKind {
@@ -480,12 +491,49 @@ mod windows_impl {
 
         Ok(buf
             .into_iter()
-            .map(|info| ProcessHolder {
-                pid: info.Process.dwProcessId,
-                app_name: read_wide_string(&info.strAppName),
-                app_kind: classify(info.ApplicationType),
+            .map(|info| {
+                let pid = info.Process.dwProcessId;
+                ProcessHolder {
+                    pid,
+                    app_name: read_wide_string(&info.strAppName),
+                    app_path: process_image_path(pid),
+                    app_kind: classify(info.ApplicationType),
+                }
             })
             .collect())
+    }
+
+    /// Resolve the full image path of `pid` via `OpenProcess` +
+    /// `QueryFullProcessImageNameW`. Returns `None` on any failure (the
+    /// process exited, our token lacks rights, etc.) so the caller can
+    /// degrade gracefully to displaying just the RM-reported name.
+    fn process_image_path(pid: u32) -> Option<PathBuf> {
+        // SAFETY: `pid` is a plain integer; `OpenProcess` returns a null
+        // handle on failure and a real `HANDLE` we own on success.
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if handle.is_null() {
+            return None;
+        }
+        // Wide-char buffer sized for the documented Windows long-path
+        // ceiling (32_768 UTF-16 code units, including the trailing NUL).
+        let mut buf = vec![0u16; 32_768];
+        let mut size: u32 = buf.len() as u32;
+        // SAFETY: `handle` is a live process handle we just obtained;
+        // `buf` has `size` UTF-16 slots that outlive the call; `size` is
+        // an in/out parameter the API rewrites with the count of code
+        // units actually written (excluding the trailing NUL).
+        let ok = unsafe { QueryFullProcessImageNameW(handle, 0, buf.as_mut_ptr(), &mut size) };
+        // SAFETY: `handle` was returned by `OpenProcess` above and has
+        // not been closed yet; close exactly once.
+        unsafe { CloseHandle(handle) };
+        if ok == 0 || size == 0 || (size as usize) > buf.len() {
+            return None;
+        }
+        let s = String::from_utf16_lossy(&buf[..size as usize]);
+        if s.is_empty() {
+            return None;
+        }
+        Some(strip_unc_prefix(PathBuf::from(s)))
     }
 
     /// Strip the `\\?\` verbatim prefix that `canonicalize` returns on

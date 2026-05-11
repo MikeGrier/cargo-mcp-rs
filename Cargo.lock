@@ -42,6 +42,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rm-test-helpers"
+version = "0.5.3"
+dependencies = [
+ "windows-sys",
+]
+
+[[package]]
 name = "serde"
 version = "1.0.228"
 source = "registry+https://github.com/rust-lang/crates.io-index"
