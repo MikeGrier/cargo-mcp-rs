@@ -29,11 +29,22 @@
 //!
 //! ## Output shape
 //!
-//! Tool results begin with a one-line invocation header — `$ cargo <argv>` and
-//! a `(cwd: ...)` annotation — produced by [`invocation_header`]. This makes
-//! the *effective* command (including flags the dispatch layer added
-//! implicitly, such as `--message-format=json`) visible in the MCP client's
-//! tool-result panel even when the original `arguments` JSON is sparse.
+//! Tool results begin with a one-line **JSON invocation header** produced by
+//! [`invocation_header`], shaped to look like another cargo NDJSON record so
+//! consumers can parse the entire response with a single line-by-line JSON
+//! parser:
+//!
+//! ```json
+//! {"reason":"x-cargo-mcp-invocation","argv":["build","--message-format=json"],"cwd":"C:\\path\\to\\workspace"}
+//! ```
+//!
+//! The `reason` value uses an `x-` prefix so it can never collide with a
+//! cargo-defined record type (`compiler-message`, `build-finished`,
+//! `compiler-artifact`, etc.). The header makes the *effective* command
+//! (including flags the dispatch layer added implicitly, such as
+//! `--message-format=json`) visible in the MCP client's tool-result panel
+//! even when the original `arguments` JSON is sparse, without breaking
+//! NDJSON parsing in clients that scan for cargo's own `reason` discriminator.
 
 use serde_json::Value;
 
@@ -146,13 +157,39 @@ fn filter_build_ndjson(stdout: &str) -> String {
         .join("\n")
 }
 
-/// Build a one-line header describing the cargo invocation that produced an
-/// output, so the LLM (or a human inspecting the tool result) can see the
-/// effective command and working directory at a glance — including flags that
-/// the dispatch layer added implicitly (e.g. `--message-format=json`).
+/// Build a one-line **JSON invocation header** describing the cargo command
+/// that produced an output, so the LLM (or a human inspecting the tool
+/// result) can see the effective command and working directory at a glance —
+/// including flags that the dispatch layer added implicitly (e.g.
+/// `--message-format=json`).
+///
+/// The header is shaped as a cargo-style NDJSON record with a custom,
+/// `x-`-prefixed `reason` so the tool result remains a valid stream of
+/// JSON-per-line objects:
+///
+/// ```json
+/// {"reason":"x-cargo-mcp-invocation","argv":["build","--message-format=json"],"cwd":"C:\\path"}
+/// ```
+///
+/// The trailing newline is included so the next NDJSON line starts cleanly.
+/// `cwd` is `"."` when no working directory was supplied (the same default
+/// the underlying child inherits).
 fn invocation_header(argv: &[&str], wd: Option<&str>) -> String {
-    format!("$ cargo {}\n(cwd: {})\n", argv.join(" "), wd.unwrap_or("."),)
+    let payload = serde_json::json!({
+        "reason": INVOCATION_REASON,
+        "argv": argv,
+        "cwd": wd.unwrap_or("."),
+    });
+    // serde_json::to_string is infallible for owned `Value`s.
+    let mut s = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".into());
+    s.push('\n');
+    s
 }
+
+/// Discriminator value placed in the `reason` field of cargo-mcp's
+/// invocation-header NDJSON record. Kept as a single constant so consumers
+/// (and grep) only have one string to look for.
+pub(crate) const INVOCATION_REASON: &str = "x-cargo-mcp-invocation";
 
 /// Format a [`CargoOutput`] from a `--message-format=json` invocation.
 ///
@@ -1566,5 +1603,40 @@ mod tests {
             !formatted.contains("[stderr]"),
             "success path must not append stderr:\n{formatted}"
         );
+    }
+
+    /// The header must be a single, parseable JSON line ending in `\n`,
+    /// with the documented `reason` discriminator and the argv/cwd echoed
+    /// back so consumers can scan the output as pure NDJSON.
+    #[test]
+    fn invocation_header_is_valid_ndjson_record() {
+        let h = invocation_header(
+            &["build", "--message-format=json", "--all-targets"],
+            Some(r"C:\path\to\workspace"),
+        );
+        assert!(h.ends_with('\n'), "header must end in newline: {h:?}");
+        assert_eq!(
+            h.matches('\n').count(),
+            1,
+            "header must be exactly one line (got {h:?})"
+        );
+        let v: Value = serde_json::from_str(h.trim_end()).expect("header is valid JSON");
+        assert_eq!(v["reason"], INVOCATION_REASON);
+        assert_eq!(v["reason"], "x-cargo-mcp-invocation");
+        assert_eq!(
+            v["argv"],
+            serde_json::json!(["build", "--message-format=json", "--all-targets"])
+        );
+        assert_eq!(v["cwd"], r"C:\path\to\workspace");
+    }
+
+    /// When no working directory was supplied, `cwd` defaults to `"."` so
+    /// the field is always present and the consumer never has to special-case
+    /// a missing key.
+    #[test]
+    fn invocation_header_defaults_cwd_to_dot() {
+        let h = invocation_header(&["fmt", "--check"], None);
+        let v: Value = serde_json::from_str(h.trim_end()).unwrap();
+        assert_eq!(v["cwd"], ".");
     }
 }
