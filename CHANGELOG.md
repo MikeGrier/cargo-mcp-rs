@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.5.3](https://github.com/MikeGrier/cargo-mcp-rs/compare/v0.5.2...v0.5.3) (2026-05-11)
+
+
+### Bug Fixes
+
+* **busy-files:** extract paths from cargo JSON and `at path` form ([7ec29ef](https://github.com/MikeGrier/cargo-mcp-rs/commit/7ec29ef89df11024c447a97b6bfd35cd6d8497eb))
+* **busy-files:** extract paths from cargo JSON and `at path` form ([579d4b4](https://github.com/MikeGrier/cargo-mcp-rs/commit/579d4b48a354c3fe724a4c4e6eeb3b53b610750f))
+* **busy-files:** silence dead_code on AppKind for non-Windows builds ([93b60ba](https://github.com/MikeGrier/cargo-mcp-rs/commit/93b60ba1646d96b6622f5a3656217629ee8a56ec))
+* **busy-files:** un-escape Debug-quoted backslashes in at-path captures ([51d6ff3](https://github.com/MikeGrier/cargo-mcp-rs/commit/51d6ff3664989f08778e66051c1078292fc54035))
+
 ## [0.5.2](https://github.com/MikeGrier/cargo-mcp-rs/compare/v0.5.1...v0.5.2) (2026-05-09)
 
 
