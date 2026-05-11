@@ -68,11 +68,24 @@ static RETRY_DELAY_MS: AtomicU64 = AtomicU64::new(500);
 /// Maximum total attempts (initial + retries). Must be at least 1.
 static RETRY_MAX_ATTEMPTS: AtomicU32 = AtomicU32::new(3);
 
+/// Whether to call into the Restart Manager (`crate::rm`) to identify the
+/// processes holding a busy file when cargo reports a transient file-lock
+/// error. Off by default because it is the only feature in the production
+/// binary that exercises `unsafe` Win32 FFI; users who want the diagnostic
+/// must opt in via `--unsafe-windows-rm=true` (or the matching VS Code
+/// setting).
+static RM_LOOKUP_ENABLED: AtomicBool = AtomicBool::new(false);
+
 /// Configure retry-on-busy behaviour. Called once from `main` after CLI parse.
 pub fn set_retry_config(enabled: bool, delay_ms: u64, max_attempts: u32) {
     RETRY_ENABLED.store(enabled, Ordering::Relaxed);
     RETRY_DELAY_MS.store(delay_ms, Ordering::Relaxed);
     RETRY_MAX_ATTEMPTS.store(max_attempts.max(1), Ordering::Relaxed);
+}
+
+/// Enable or disable the Restart Manager "who holds this file" lookup.
+pub fn set_rm_lookup_enabled(enabled: bool) {
+    RM_LOOKUP_ENABLED.store(enabled, Ordering::Relaxed);
 }
 
 /// Cargo subcommands whose retry on a transient file-busy error is safe
@@ -440,6 +453,9 @@ fn maybe_append_working_dir_hint(stderr: &mut String, working_dir: Option<&str>)
 /// to stderr but some downstream tools (notably the MSVC linker invoked
 /// via `link.exe`) emit "file in use" errors on stdout instead.
 fn collect_busy_holders(stderr: &str, stdout: &str) -> Vec<crate::busy_files::FileHolders> {
+    if !RM_LOOKUP_ENABLED.load(Ordering::Relaxed) {
+        return Vec::new();
+    }
     let mut paths = crate::busy_files::extract_busy_paths(stderr);
     paths.extend(crate::busy_files::extract_busy_paths(stdout));
     if paths.is_empty() {
