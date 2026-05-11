@@ -160,6 +160,12 @@ fn invocation_header(argv: &[&str], wd: Option<&str>) -> String {
 /// (already delivered as streaming progress), then returns the remainder.
 /// On failure, prepends the exit code and appends stderr for context.
 /// The result is prefixed with [`invocation_header`].
+///
+/// On failure, any non-empty stderr text is appended after the JSON
+/// payload as a `\n[stderr]\n<text>\n` block. This is the channel the
+/// retry-on-busy code path uses to surface the Restart Manager
+/// "who holds this file" report; without this trailer the report is
+/// generated but never reaches the agent or the user.
 fn format_json_output(out: &CargoOutput, argv: &[&str], wd: Option<&str>) -> String {
     let header = invocation_header(argv, wd);
     let body = if out.exit_code == 0 {
@@ -176,13 +182,22 @@ fn format_json_output(out: &CargoOutput, argv: &[&str], wd: Option<&str>) -> Str
             serde_json::to_string(out.stderr.trim()).unwrap_or_default(),
         )
     } else {
-        // JSON stream contains the diagnostics; append a status trailer.
+        // JSON stream contains the diagnostics; append a status trailer
+        // and any stderr (which is where the Restart Manager holder
+        // report and other side-channel diagnostics land).
         let filtered = filter_build_ndjson(&out.stdout);
-        format!(
-            "{}\n{}",
-            filtered.trim_end(),
-            format_args!(r#"{{"status":"error","exit_code":{}}}"#, out.exit_code,),
-        )
+        let trailer = format!(r#"{{"status":"error","exit_code":{}}}"#, out.exit_code);
+        let stderr_trimmed = out.stderr.trim();
+        if stderr_trimmed.is_empty() {
+            format!("{}\n{}", filtered.trim_end(), trailer)
+        } else {
+            format!(
+                "{}\n{}\n[stderr]\n{}\n",
+                filtered.trim_end(),
+                trailer,
+                stderr_trimmed,
+            )
+        }
     };
     format!("{header}{body}")
 }
@@ -1495,4 +1510,61 @@ fn call_diagnostic(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
     });
 
     Ok(serde_json::to_string_pretty(&report)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fake_output(exit_code: i32, stdout: &str, stderr: &str) -> CargoOutput {
+        CargoOutput {
+            exit_code,
+            stdout: stdout.to_owned(),
+            stderr: stderr.to_owned(),
+        }
+    }
+
+    #[test]
+    fn format_json_output_surfaces_stderr_holder_report_on_failure() {
+        // Real-shape NDJSON line so filter_build_ndjson keeps it.
+        let stdout = r#"{"reason":"compiler-message","package_id":"foo 0.1.0","target":{"name":"foo"},"message":{"rendered":"error: linking with `link.exe` failed"}}"#;
+        let stderr = "Holders for `target\\debug\\foo.exe`:\n    PID 1234 - rm-hold-file.exe (C:\\path\\to\\rm-hold-file.exe) [console]\n";
+        let out = fake_output(101, stdout, stderr);
+        let formatted = format_json_output(&out, &["build"], None);
+        assert!(
+            formatted.contains("rm-hold-file.exe"),
+            "stderr holder report missing from formatted output:\n{formatted}"
+        );
+        assert!(
+            formatted.contains("[stderr]"),
+            "expected [stderr] sentinel; got:\n{formatted}"
+        );
+        assert!(
+            formatted.contains(r#""status":"error""#),
+            "status trailer missing:\n{formatted}"
+        );
+    }
+
+    #[test]
+    fn format_json_output_omits_stderr_block_when_empty() {
+        let stdout = r#"{"reason":"compiler-message","package_id":"foo 0.1.0","target":{"name":"foo"},"message":{"rendered":"error"}}"#;
+        let out = fake_output(101, stdout, "");
+        let formatted = format_json_output(&out, &["build"], None);
+        assert!(
+            !formatted.contains("[stderr]"),
+            "should not emit [stderr] block when stderr is empty:\n{formatted}"
+        );
+    }
+
+    #[test]
+    fn format_json_output_success_omits_stderr_block() {
+        let stdout =
+            r#"{"reason":"compiler-artifact","package_id":"foo 0.1.0","target":{"name":"foo"}}"#;
+        let out = fake_output(0, stdout, "noisy progress on stderr\n");
+        let formatted = format_json_output(&out, &["build"], None);
+        assert!(
+            !formatted.contains("[stderr]"),
+            "success path must not append stderr:\n{formatted}"
+        );
+    }
 }

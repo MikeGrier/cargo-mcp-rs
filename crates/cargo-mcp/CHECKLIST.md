@@ -13,9 +13,33 @@ the Win32 lookup wired up but no observed evidence it ever surfaces.
   `cargo-mcp.unsafe.windowsRestartManager` into the spawned server's
   argv as `--unsafe-windows-rm=true`. Verified in
   `crates/cargo-mcp/extension/src/extension.ts` (and built `out/extension.js`).
+- [x] **ROOT CAUSE FOUND: holder report is dropped by the
+  JSON-mode tool formatter.** `crates/cargo-mcp/src/invoke.rs`
+  appends the holder report to `CargoOutput.stderr`, but
+  `format_json_output` in `crates/cargo-mcp/src/tools.rs` (the path
+  used for `cargo build` / `check` / `test` / `clippy`) only
+  surfaces stderr in the empty-stdout error branch. When cargo
+  failed and produced any NDJSON (the normal case for a real build
+  failure), the JSON-mode formatter emits filtered NDJSON + a
+  status trailer and **drops stderr entirely**. Net effect: the
+  holder report makes it as far as `out.stderr` and then vanishes.
+
+### Fix the formatter so the holder report reaches the user
+
+- [x] In `crates/cargo-mcp/src/tools.rs::format_json_output`,
+  always include any non-empty stderr text on failure (both the
+  empty-stdout branch and the JSON-stdout branch). Format proposal:
+  append a literal `\n[stderr]\n<trimmed stderr>\n` block after the
+  status trailer so the NDJSON stream itself stays valid for
+  downstream parsers but the user (and the agent) sees the holder
+  report.
+- [x] Add a unit test in `tools.rs` that constructs a synthetic
+  `CargoOutput { exit_code: 1, stdout: "<one valid compiler-message JSON line>", stderr: "...holder report fixture...\n" }`
+  and asserts the formatted string contains the holder report text.
 - [ ] Capture one real "Access is denied" / "os error 5" /
-  "os error 32" stderr block from an actual failed build and paste it
-  verbatim into a Layer 1 fixture (see below).
+  "os error 32" stderr block from an actual failed build and paste
+  it verbatim into a Layer 1 fixture (see below). With the
+  formatter fix, this should now be observable end-to-end.
 
 ### Sniffer redesign (`crates/rm-test-helpers/src/target_sniffer.rs`)
 
