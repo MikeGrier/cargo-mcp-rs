@@ -93,6 +93,53 @@ Install, reload, run `/cargo-mcp:setup` once per repo. That's it.
 
 ---
 
+## Trust & transparency
+
+Installing a VS Code extension that ships a native binary is a real trust
+decision. Here's what's in the box and what mitigates the risk:
+
+- **Written in Rust.** The MCP server is a single Rust crate. Rust's
+  memory-safety guarantees apply to all of it by default — buffer
+  overflows, use-after-free, and data races in safe code are compile-time
+  errors, not runtime exploits.
+- **All `unsafe` is in one ~600-line submodule.** The production binary's
+  entire `unsafe` surface area lives in
+  [`src/rm/`](https://github.com/MikeGrier/cargo-mcp-rs/tree/main/crates/cargo-mcp/src/rm) —
+  a safe wrapper around the Windows **Restart Manager** API that powers
+  the *"which process is holding this file open?"* diagnostic. Every
+  `unsafe` block is a single Win32 call, wraps a documented API
+  (`RmStartSession` / `RmRegisterResources` / `RmGetList` / `RmEndSession`
+  and `FormatMessageW` / `LocalFree`), uses Microsoft's official
+  [`windows-sys`](https://crates.io/crates/windows-sys) bindings (so
+  there are no hand-rolled FFI declarations to verify), and carries a
+  `// SAFETY:` comment naming the precondition. Session handles are
+  released by an RAII guard so leaks and double-closes are not possible
+  from safe code. The rest of the crate — argument parsing, cargo
+  invocation, output handling, MCP protocol — is `unsafe`-free.
+- **Releases are built entirely in GitHub Actions.** Every published VSIX
+  is produced from a tagged commit by the
+  [`publish-extension`](https://github.com/MikeGrier/cargo-mcp-rs/blob/main/.github/workflows/publish-extension.yml)
+  workflow on GitHub-hosted runners — `cargo build --release --locked`
+  for the bundled binary, then `vsce package --no-dependencies`, then
+  Marketplace upload. The publish step is gated by a required-reviewer
+  environment, so no commit reaches the Marketplace without a human
+  approval *after* CI has built the artifacts. **No developer machine
+  ever touches the published bits.**
+- **Reproducible inputs.** Both the Rust build (`--locked`) and the
+  extension's `npm` install (`npm ci` against a checked-in
+  `package-lock.json`) refuse to use any dependency version not pinned
+  in the lockfiles.
+- **No telemetry, no network calls** beyond the ones `cargo` itself
+  initiates when you invoke `cargo_update`, `cargo_add`, `cargo_publish`,
+  etc.
+- **The source is the source.** The full repository, including all CI
+  configuration, is at
+  [github.com/MikeGrier/cargo-mcp-rs](https://github.com/MikeGrier/cargo-mcp-rs).
+  You can read every line, audit the `unsafe` blocks, and reproduce the
+  build yourself.
+
+---
+
 ## Requirements
 
 - **VS Code** 1.101 or later

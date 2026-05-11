@@ -13,6 +13,7 @@ mod busy_files;
 mod elicit;
 mod invoke;
 mod line_reader;
+mod rm;
 mod suggest;
 mod tools;
 
