@@ -406,6 +406,28 @@ error: failed to remove file `target/debug/b.exe`:
         );
     }
 
+    /// Verbatim shape captured from a real `cargo clean` failure where
+    /// a directory in `target/debug/deps` had an open handle. Includes
+    /// the `Caused by:` indentation and trailing blank line that cargo
+    /// actually emits, so a future change to the extractor doesn't
+    /// silently regress this case.
+    #[test]
+    fn extracts_directory_path_from_real_cargo_clean_error_block() {
+        let stderr = "\
+error: failed to remove directory `C:\\Users\\Me\\AppData\\Local\\Temp\\v\\target\\debug\\deps`
+
+Caused by:
+    The process cannot access the file because it is being used by another process. (os error 32)
+";
+        let paths = extract_busy_paths(stderr);
+        assert_eq!(
+            paths,
+            vec![PathBuf::from(
+                "C:\\Users\\Me\\AppData\\Local\\Temp\\v\\target\\debug\\deps"
+            )]
+        );
+    }
+
     #[test]
     fn dedupes_same_path_reported_twice() {
         let stderr = "\

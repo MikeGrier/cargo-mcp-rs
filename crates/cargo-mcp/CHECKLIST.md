@@ -46,64 +46,70 @@ the Win32 lookup wired up but no observed evidence it ever surfaces.
 Replace the scan-and-poke loop with grab-and-squat, mimicking the real
 offenders (AV, indexers, anything with the dir as CWD).
 
-- [ ] Args: `<dir> [--hold-ms N] [--mode files|dir|both] [--glob *.rlib]`
+- [x] Args: `<dir> [--hold-ms N] [--mode files|dir|both] [--glob *.rlib]`
   (default mode=`both`, hold-ms=`30000`, glob=`*.rlib`).
-- [ ] On startup: walk once, open the requested handles, then print
+- [x] On startup: walk once, open the requested handles, then print
   `READY <pid>` (single line) and flush before sleeping.
-- [ ] `mode=dir`: open the directory itself with
+- [x] `mode=dir`: open the directory itself with
   `CreateFileW(GENERIC_READ, FILE_SHARE_READ, OPEN_EXISTING,
   FILE_FLAG_BACKUP_SEMANTICS)` — the CWD pattern. Children remain
   read/write/createable; only directory delete/rename fails.
-- [ ] `mode=files`: open every glob match with `FILE_SHARE_READ` only
+- [x] `mode=files`: open every glob match with `FILE_SHARE_READ` only
   (deny write + delete) and hold.
-- [ ] Hold until stdin EOF or `--hold-ms` elapses, then close every
+- [x] Hold until stdin EOF or `--hold-ms` elapses, then close every
   handle and exit 0.
-- [ ] Update existing helper unit/integration tests for the new arg shape.
+- [x] No prior helper tests existed for the old shape; smoke-tested
+  manually that `mode=dir` blocks `Remove-Item` and `mode=files
+  --glob *.exe` blocks `cargo clean`.
 
 ### Layer 1 — Unit tests (no subprocess)
 
 In `crates/cargo-mcp/src/busy_files.rs`:
 
-- [ ] Add a fixture that is the real captured directory-deletion error
-  and assert `extract_busy_paths` returns the directory path.
-- [ ] Add a fixture for a real `link.exe LNK1104` / `os error 32`
-  mid-build line and assert the locked artefact is extracted.
-- [ ] If either fails, extend `line_is_busy_indicator` /
-  `harvest_*_paths` until both pass. **Do not** loosen the
-  diagnostic-block heuristic — extend the busy-indicator phrase list
-  instead.
+- [x] Add a fixture that is the real captured directory-deletion error
+  (`error: failed to remove directory \`...\`` followed by indented
+  `Caused by: ... (os error 32)`) and assert `extract_busy_paths`
+  returns the directory path. (See
+  `extracts_directory_path_from_real_cargo_clean_error_block`.)
+- [ ] _(Deferred)_ LNK1104 fixture — not encountered in Layer 2
+  scenarios; capture next time we hit a linker conflict in the field.
+- [x] Existing extractor heuristics already covered the captured
+  shape; no loosening required.
 
 ### Layer 2 — In-process integration
 
-New windows-only test alongside `tests/rm_who_holds.rs`:
+New windows-only test in `crates/cargo-mcp/tests/rm_end_to_end.rs`:
 
-- [ ] Generate a tiny throwaway crate at
-  `%TEMP%\cargo-mcp-it-<pid>\` (write `Cargo.toml` + `src/main.rs` by
-  hand; no need to invoke `cargo new`).
-- [ ] `cargo build` it once so `target/debug/deps/` exists.
-- [ ] Spawn `rm-target-sniffer <victim>\target\debug\deps --mode dir
-  --hold-ms 10000`, await `READY <pid>`.
-- [ ] Call `set_rm_lookup_enabled(true)` and
-  `set_retry_config(true, 200, 3)`, then run `cargo_clean` (or a forced
-  `cargo_build` after `touch`) on the victim crate via
-  `run_cargo_streaming`.
-- [ ] Assert the captured streamed lines OR `CargoOutput.stderr`
-  contains `rm-target-sniffer.exe (` and `(PID <sniffer_pid>)`.
+- [x] Generate a tiny throwaway crate at
+  `%TEMP%\cargo-mcp-l2-<pid>-<nanos>\` (write `Cargo.toml` +
+  `src/main.rs` by hand).
+- [x] `cargo build --quiet` it once so `target/debug/deps/` exists.
+- [x] Spawn `rm-target-sniffer <victim>\target\debug\deps --mode files
+  --glob *.exe --hold-ms 20000`, await `READY <pid>`.
+- [x] Call `set_rm_lookup_enabled(true)` and
+  `set_retry_config(true, 200, 2)`, then run `run_cargo_streaming(&["clean"], ...)`.
+- [x] Assert combined output contains `rm-target-sniffer.exe (` and
+  `PID <sniffer_pid>`.
+- [x] **Real product limitation discovered:** when the busy resource
+  is a *directory*, `RmGetList` returns `ERROR_ACCESS_DENIED (5)` even
+  for same-user processes. The diagnostic surfaces as `(Restart
+  Manager: RmGetList probe failed: Access is denied. (code 5))` with
+  no process name. Documented as `#[ignore]`'d test
+  `cargo_clean_against_held_dir_currently_only_reports_rm_access_denied`
+  so a future workaround (e.g. promoting the dir to a representative
+  child file before registering) can be detected by flipping the
+  ignore.
 
 ### Layer 3 — Subprocess end-to-end
 
 Marked `#[ignore]` (run on demand) — proves what the agent actually sees.
 
-- [ ] Spawn the built `cargo-mcp.exe` as a child with
-  `--unsafe-windows-rm=true`.
-- [ ] Hand-roll an NDJSON / Content-Length framer (~80 LOC). Send
-  `initialize`, then `tools/call` for `cargo_build` against the victim
-  crate while the sniffer is squatting on `deps/`.
-- [ ] Read the JSON-RPC response and the `notifications/message`
-  progress frames.
-- [ ] Assert `result.content[0].text` contains the holder block and at
-  least one progress notification carries the short summary line
-  (`name.exe (...) (PID N)`).
+- [ ] _(Deferred)_ Layer 2 already drives `run_cargo_streaming` and
+  asserts the user-visible stderr/stdout shape. Layer 3's incremental
+  value is verifying the JSON-RPC framing, which the formatter unit
+  tests added in `tools.rs` already cover. Re-prioritise if the agent
+  ever reports something the in-process test cannot reproduce.
+
 
 ### Wrap-up
 
