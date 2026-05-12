@@ -10,8 +10,13 @@
 //!
 //! # Public API
 //!
+//! `cargo-mcp` ships as a binary crate, so this module has no importable
+//! path for downstream users; the snippet below illustrates the in-crate
+//! call shape (and is what a future standalone extraction would expose):
+//!
 //! ```ignore
-//! use cargo_mcp::rm::{who_holds, Holders};
+//! // inside cargo-mcp
+//! use crate::rm::{who_holds, Holders};
 //! let report: Vec<Holders> = who_holds(&[std::path::Path::new("target/debug/foo.exe")]);
 //! ```
 //!

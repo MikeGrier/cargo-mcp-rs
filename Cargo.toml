@@ -8,7 +8,14 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.5.4" # x-release-please-version
+version       = "0.5.4" # x-release-please-version
+authors       = ["Mike Grier"]
+edition       = "2024"
+rust-version  = "1.93"
+license       = "MIT"
+repository    = "https://github.com/MikeGrier/cargo-mcp-rs"
+homepage      = "https://github.com/MikeGrier/cargo-mcp-rs"
+documentation = "https://docs.rs/cargo-mcp"
 
 [workspace.dependencies]
 serde       = { version = "1", features = ["derive"] }
