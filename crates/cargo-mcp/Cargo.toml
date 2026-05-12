@@ -12,3 +12,18 @@ path = "src/main.rs"
 [dependencies]
 serde       = { workspace = true }
 serde_json  = { workspace = true }
+
+# Windows-only Restart Manager bindings, used by `src/rm/` to ask the OS
+# which process is holding a file in `target\` open after a sharing
+# violation. Confined to a single submodule so the rest of the crate
+# stays `unsafe`-free; gated on `cfg(windows)` so non-Windows builds
+# don't pull it.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_RestartManager",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Memory",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Threading",
+] }

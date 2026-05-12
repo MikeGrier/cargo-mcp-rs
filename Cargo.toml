@@ -3,6 +3,7 @@
 [workspace]
 members = [
     "crates/cargo-mcp",
+    "crates/rm-test-helpers",
 ]
 resolver = "2"
 

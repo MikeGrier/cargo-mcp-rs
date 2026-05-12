@@ -13,6 +13,7 @@ mod busy_files;
 mod elicit;
 mod invoke;
 mod line_reader;
+mod rm;
 mod suggest;
 mod tools;
 
@@ -53,6 +54,7 @@ struct StartupConfig {
     retry_on_busy: bool,
     retry_delay_ms: u64,
     retry_max_attempts: u32,
+    rm_lookup_enabled: bool,
     warnings: Vec<String>,
 }
 
@@ -71,6 +73,7 @@ fn parse_config() -> StartupConfig {
         retry_on_busy: true,
         retry_delay_ms: 500,
         retry_max_attempts: 3,
+        rm_lookup_enabled: false,
         warnings: Vec::new(),
     };
     for arg in std::env::args_os().skip(1) {
@@ -122,6 +125,16 @@ fn parse_config() -> StartupConfig {
                     cfg.warnings.push(format!(
                         "ignoring invalid --retry-max-attempts value: {rest:?} \
                          (expected a positive integer)"
+                    ));
+                }
+            }
+        } else if let Some(rest) = s.strip_prefix("--unsafe-windows-rm=") {
+            match parse_bool_flag(rest) {
+                Some(b) => cfg.rm_lookup_enabled = b,
+                None => {
+                    cfg.warnings.push(format!(
+                        "ignoring invalid --unsafe-windows-rm value: {rest:?} \
+                         (expected one of: true/false, 1/0, yes/no, on/off)"
                     ));
                 }
             }
@@ -185,6 +198,7 @@ fn main() {
         cfg.retry_delay_ms,
         cfg.retry_max_attempts,
     );
+    invoke::set_rm_lookup_enabled(cfg.rm_lookup_enabled);
 
     let stdin = io::stdin();
     let stdout = io::stdout();
@@ -231,6 +245,22 @@ fn main() {
             &mut out,
             "retry on transient busy errors: disabled".to_string(),
         );
+    }
+    if cfg.rm_lookup_enabled {
+        if cfg!(windows) {
+            log_info(
+                &mut out,
+                "Restart Manager process lookup: ENABLED (uses unsafe Win32 FFI in src/rm/)"
+                    .to_string(),
+            );
+        } else {
+            log_info(
+                &mut out,
+                "Restart Manager process lookup: requested but unavailable on this host \
+                 (Windows-only; the Win32 FFI in src/rm/ is not compiled in here)"
+                    .to_string(),
+            );
+        }
     }
 
     // Replay any warnings collected during CLI parsing through the MCP log

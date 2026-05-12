@@ -29,11 +29,28 @@
 //!
 //! ## Output shape
 //!
-//! Tool results begin with a one-line invocation header — `$ cargo <argv>` and
-//! a `(cwd: ...)` annotation — produced by [`invocation_header`]. This makes
-//! the *effective* command (including flags the dispatch layer added
-//! implicitly, such as `--message-format=json`) visible in the MCP client's
-//! tool-result panel even when the original `arguments` JSON is sparse.
+//! Tool results begin with a one-line **JSON invocation header** produced by
+//! [`invocation_header`], shaped to look like another cargo NDJSON record:
+//!
+//! ```json
+//! {"reason":"x-cargo-mcp-invocation","argv":["build","--message-format=json"],"cwd":"C:\\path\\to\\workspace"}
+//! ```
+//!
+//! The `reason` value uses an `x-` prefix so it can never collide with a
+//! cargo-defined record type (`compiler-message`, `build-finished`,
+//! `compiler-artifact`, etc.). The header makes the *effective* command
+//! (including flags the dispatch layer added implicitly, such as
+//! `--message-format=json`) visible in the MCP client's tool-result panel
+//! even when the original `arguments` JSON is sparse.
+//!
+//! For **JSON-mode tools** (`check`, `build`, `test`, `clippy`, `doc`,
+//! `metadata`) the *entire* response is a clean NDJSON stream — the
+//! invocation header followed by one JSON object per line, so consumers
+//! can parse the whole response with a single line-by-line JSON parser.
+//! For **text-mode tools** (`fmt`, `tree`, `clean`, `update`, `fix`,
+//! `add`, `remove`, `publish`) only the first line (the invocation
+//! header) is JSON; the body that follows is the cargo child's combined
+//! stdout/stderr and is not guaranteed to be JSON.
 
 use serde_json::Value;
 
@@ -128,7 +145,9 @@ fn opt_bool(args: &Value, key: &str) -> bool {
 /// Retains only `compiler-message` lines (errors and warnings) and the
 /// `build-finished` summary. Everything else — artifacts, build-script events,
 /// etc. — was already surfaced via streaming progress notifications and is not
-/// useful in the final response.
+/// useful in the final response. Non-JSON stdout lines (libtest text events,
+/// stray prints) are dropped so the formatter's output remains a strict
+/// NDJSON stream parseable end-to-end with a single line-by-line JSON parser.
 fn filter_build_ndjson(stdout: &str) -> String {
     stdout
         .lines()
@@ -139,27 +158,69 @@ fn filter_build_ndjson(stdout: &str) -> String {
                     Some("compiler-message") | Some("build-finished")
                 )
             } else {
-                true // keep non-JSON lines (test harness events etc.)
+                false
             }
         })
         .collect::<Vec<_>>()
         .join("\n")
 }
 
-/// Build a one-line header describing the cargo invocation that produced an
-/// output, so the LLM (or a human inspecting the tool result) can see the
-/// effective command and working directory at a glance — including flags that
-/// the dispatch layer added implicitly (e.g. `--message-format=json`).
+/// Build a one-line **JSON invocation header** describing the cargo command
+/// that produced an output, so the LLM (or a human inspecting the tool
+/// result) can see the effective command and working directory at a glance —
+/// including flags that the dispatch layer added implicitly (e.g.
+/// `--message-format=json`).
+///
+/// The header is shaped as a cargo-style NDJSON record with a custom,
+/// `x-`-prefixed `reason` so the tool result remains a valid stream of
+/// JSON-per-line objects:
+///
+/// ```json
+/// {"reason":"x-cargo-mcp-invocation","argv":["build","--message-format=json"],"cwd":"C:\\path"}
+/// ```
+///
+/// The trailing newline is included so the next NDJSON line starts cleanly.
+/// `cwd` is `"."` when no working directory was supplied (the same default
+/// the underlying child inherits).
 fn invocation_header(argv: &[&str], wd: Option<&str>) -> String {
-    format!("$ cargo {}\n(cwd: {})\n", argv.join(" "), wd.unwrap_or("."),)
+    let payload = serde_json::json!({
+        "reason": INVOCATION_REASON,
+        "argv": argv,
+        "cwd": wd.unwrap_or("."),
+    });
+    // serde_json::to_string is infallible for owned `Value`s.
+    let mut s = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".into());
+    s.push('\n');
+    s
 }
+
+/// Discriminator value placed in the `reason` field of cargo-mcp's
+/// invocation-header NDJSON record. Kept as a single constant so consumers
+/// (and grep) only have one string to look for.
+pub(crate) const INVOCATION_REASON: &str = "x-cargo-mcp-invocation";
+
+/// Discriminator for the NDJSON record that carries the cargo child's
+/// stderr (where the Restart Manager holder report and other side-channel
+/// diagnostics land). Emitted only on failure when stderr is non-empty.
+pub(crate) const STDERR_REASON: &str = "x-cargo-mcp-stderr";
 
 /// Format a [`CargoOutput`] from a `--message-format=json` invocation.
 ///
 /// Filters the NDJSON stream to remove dep-artifact and build-script noise
-/// (already delivered as streaming progress), then returns the remainder.
-/// On failure, prepends the exit code and appends stderr for context.
-/// The result is prefixed with [`invocation_header`].
+/// (already delivered as streaming progress), then returns the remainder
+/// prefixed with [`invocation_header`]. The output is always a strict
+/// NDJSON stream — every non-blank line is a JSON object — so consumers
+/// can parse the whole response with a single line-by-line JSON parser.
+///
+/// On failure, a `{"status":"error","exit_code":N}` trailer is appended
+/// after the filtered diagnostics, and any non-empty stderr text is
+/// appended as an extra NDJSON record with `reason = STDERR_REASON`. The
+/// stderr record is the channel the retry-on-busy code path uses to
+/// surface the Restart Manager "who holds this file" report; without it
+/// the report is generated but never reaches the agent or the user.
+/// Both shapes are the same: filtered records (possibly none) → status
+/// trailer → optional stderr record. There is no `message` field on the
+/// trailer; stderr always travels in the dedicated record.
 fn format_json_output(out: &CargoOutput, argv: &[&str], wd: Option<&str>) -> String {
     let header = invocation_header(argv, wd);
     let body = if out.exit_code == 0 {
@@ -168,21 +229,25 @@ fn format_json_output(out: &CargoOutput, argv: &[&str], wd: Option<&str>) -> Str
         } else {
             filter_build_ndjson(&out.stdout)
         }
-    } else if out.stdout.is_empty() {
-        // No JSON at all — stderr has the error (e.g. bad args, missing toolchain).
-        format!(
-            r#"{{"status":"error","exit_code":{},"message":{}}}"#,
-            out.exit_code,
-            serde_json::to_string(out.stderr.trim()).unwrap_or_default(),
-        )
     } else {
-        // JSON stream contains the diagnostics; append a status trailer.
         let filtered = filter_build_ndjson(&out.stdout);
-        format!(
-            "{}\n{}",
-            filtered.trim_end(),
-            format_args!(r#"{{"status":"error","exit_code":{}}}"#, out.exit_code,),
-        )
+        let filtered = filtered.trim_end();
+        let trailer = format!(r#"{{"status":"error","exit_code":{}}}"#, out.exit_code);
+        let stderr_trimmed = out.stderr.trim();
+        let mut parts: Vec<String> = Vec::with_capacity(3);
+        if !filtered.is_empty() {
+            parts.push(filtered.to_owned());
+        }
+        parts.push(trailer);
+        if !stderr_trimmed.is_empty() {
+            let stderr_record = serde_json::to_string(&serde_json::json!({
+                "reason": STDERR_REASON,
+                "text": stderr_trimmed,
+            }))
+            .unwrap_or_else(|_| "{}".into());
+            parts.push(stderr_record);
+        }
+        parts.join("\n")
     };
     format!("{header}{body}")
 }
@@ -1495,4 +1560,112 @@ fn call_diagnostic(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
     });
 
     Ok(serde_json::to_string_pretty(&report)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fake_output(exit_code: i32, stdout: &str, stderr: &str) -> CargoOutput {
+        CargoOutput {
+            exit_code,
+            stdout: stdout.to_owned(),
+            stderr: stderr.to_owned(),
+        }
+    }
+
+    /// Every non-blank line of a JSON-mode failure output must parse as a
+    /// JSON object. Guards against regressions where a non-NDJSON appendix
+    /// (e.g. a bare `[stderr]` sentinel) is reintroduced.
+    fn assert_pure_ndjson(formatted: &str) {
+        for (i, line) in formatted.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            serde_json::from_str::<Value>(line)
+                .unwrap_or_else(|e| panic!("line {} is not JSON: {line:?} ({e})", i + 1));
+        }
+    }
+
+    #[test]
+    fn format_json_output_surfaces_stderr_holder_report_on_failure() {
+        // Real-shape NDJSON line so filter_build_ndjson keeps it.
+        let stdout = r#"{"reason":"compiler-message","package_id":"foo 0.1.0","target":{"name":"foo"},"message":{"rendered":"error: linking with `link.exe` failed"}}"#;
+        let stderr = "Holders for `target\\debug\\foo.exe`:\n    PID 1234 - rm-hold-file.exe (C:\\path\\to\\rm-hold-file.exe) [console]\n";
+        let out = fake_output(101, stdout, stderr);
+        let formatted = format_json_output(&out, &["build"], None);
+        assert_pure_ndjson(&formatted);
+        assert!(
+            formatted.contains("rm-hold-file.exe"),
+            "stderr holder report missing from formatted output:\n{formatted}"
+        );
+        assert!(
+            formatted.contains(STDERR_REASON),
+            "expected stderr NDJSON record (reason={STDERR_REASON}); got:\n{formatted}"
+        );
+        assert!(
+            formatted.contains(r#""status":"error""#),
+            "status trailer missing:\n{formatted}"
+        );
+    }
+
+    #[test]
+    fn format_json_output_omits_stderr_record_when_empty() {
+        let stdout = r#"{"reason":"compiler-message","package_id":"foo 0.1.0","target":{"name":"foo"},"message":{"rendered":"error"}}"#;
+        let out = fake_output(101, stdout, "");
+        let formatted = format_json_output(&out, &["build"], None);
+        assert_pure_ndjson(&formatted);
+        assert!(
+            !formatted.contains(STDERR_REASON),
+            "should not emit stderr NDJSON record when stderr is empty:\n{formatted}"
+        );
+    }
+
+    #[test]
+    fn format_json_output_success_omits_stderr_record() {
+        let stdout =
+            r#"{"reason":"compiler-artifact","package_id":"foo 0.1.0","target":{"name":"foo"}}"#;
+        let out = fake_output(0, stdout, "noisy progress on stderr\n");
+        let formatted = format_json_output(&out, &["build"], None);
+        assert_pure_ndjson(&formatted);
+        assert!(
+            !formatted.contains(STDERR_REASON),
+            "success path must not append stderr record:\n{formatted}"
+        );
+    }
+
+    /// The header must be a single, parseable JSON line ending in `\n`,
+    /// with the documented `reason` discriminator and the argv/cwd echoed
+    /// back so consumers can scan the output as pure NDJSON.
+    #[test]
+    fn invocation_header_is_valid_ndjson_record() {
+        let h = invocation_header(
+            &["build", "--message-format=json", "--all-targets"],
+            Some(r"C:\path\to\workspace"),
+        );
+        assert!(h.ends_with('\n'), "header must end in newline: {h:?}");
+        assert_eq!(
+            h.matches('\n').count(),
+            1,
+            "header must be exactly one line (got {h:?})"
+        );
+        let v: Value = serde_json::from_str(h.trim_end()).expect("header is valid JSON");
+        assert_eq!(v["reason"], INVOCATION_REASON);
+        assert_eq!(v["reason"], "x-cargo-mcp-invocation");
+        assert_eq!(
+            v["argv"],
+            serde_json::json!(["build", "--message-format=json", "--all-targets"])
+        );
+        assert_eq!(v["cwd"], r"C:\path\to\workspace");
+    }
+
+    /// When no working directory was supplied, `cwd` defaults to `"."` so
+    /// the field is always present and the consumer never has to special-case
+    /// a missing key.
+    #[test]
+    fn invocation_header_defaults_cwd_to_dot() {
+        let h = invocation_header(&["fmt", "--check"], None);
+        let v: Value = serde_json::from_str(h.trim_end()).unwrap();
+        assert_eq!(v["cwd"], ".");
+    }
 }
