@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.5.4](https://github.com/MikeGrier/cargo-mcp-rs/compare/v0.5.3...v0.5.4) (2026-05-12)
+
+
+### Features
+
+* **extension:** gate Restart Manager lookup behind opt-in setting ([b600803](https://github.com/MikeGrier/cargo-mcp-rs/commit/b600803842bb58067f14571bcab30f08ec34be9d))
+* **tools:** emit invocation header as NDJSON record instead of shell-style banner ([a7417d4](https://github.com/MikeGrier/cargo-mcp-rs/commit/a7417d49cbce7dfb0b5116891b769a411e5b7eca))
+
+
+### Bug Fixes
+
+* **rm:** opt-in Restart Manager holder reporting + NDJSON invocation header ([cdf6a37](https://github.com/MikeGrier/cargo-mcp-rs/commit/cdf6a371822524ed1bbf3b96e86f7923cc7d7091))
+* **tools:** emit cargo stderr as NDJSON record; address PR review ([e8d154b](https://github.com/MikeGrier/cargo-mcp-rs/commit/e8d154b1711b7fc9752edf447453146c65e9d8e0))
+* **tools:** strict NDJSON output for JSON-mode tools; address PR review ([67ce9a7](https://github.com/MikeGrier/cargo-mcp-rs/commit/67ce9a7e447c1f0aa442ae2842da6b57e671e543))
+* **tools:** surface stderr on JSON-mode tool failures so RM holder report reaches the user ([4f2daaf](https://github.com/MikeGrier/cargo-mcp-rs/commit/4f2daaf1e01128ae7c567631033b556270c991fa))
+
+
+### Miscellaneous Chores
+
+* release 0.5.4 ([1057936](https://github.com/MikeGrier/cargo-mcp-rs/commit/1057936a0c998b280b58d16a5774bd064af10714))
+
 ## [0.5.3](https://github.com/MikeGrier/cargo-mcp-rs/compare/v0.5.2...v0.5.3) (2026-05-11)
 
 
