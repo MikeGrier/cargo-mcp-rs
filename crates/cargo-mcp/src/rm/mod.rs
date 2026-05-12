@@ -11,7 +11,7 @@
 //! # Public API
 //!
 //! ```ignore
-//! use cargo_mcp::rm::{who_holds, Holders};
+//! use crate::rm::{who_holds, Holders};
 //! let report: Vec<Holders> = who_holds(&[std::path::Path::new("target/debug/foo.exe")]);
 //! ```
 //!

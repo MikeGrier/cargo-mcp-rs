@@ -14,6 +14,13 @@ description = "Model Context Protocol (MCP) server that exposes cargo commands (
 readme      = "README.md"
 keywords    = ["cargo", "mcp", "copilot", "llm", "ai"]
 categories  = ["command-line-utilities", "development-tools", "development-tools::cargo-plugins"]
+exclude     = [
+    "extension/",
+    "tests/",
+    "CHECKLIST.md",
+    "COMPLETED-CHECKLIST.md",
+    "DESIGN-NOTES.md",
+]
 
 [[bin]]
 name = "cargo-mcp"
