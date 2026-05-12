@@ -7,7 +7,7 @@
 [package]
 name = "rm-test-helpers"
 version.workspace = true
-edition = "2024"
+edition.workspace = true
 publish = false
 
 [[bin]]
