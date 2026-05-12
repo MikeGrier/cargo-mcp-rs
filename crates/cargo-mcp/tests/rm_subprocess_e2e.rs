@@ -308,9 +308,14 @@ fn cargo_clean_holder_report_reaches_agent_through_mcp_transport() {
         .unwrap_or_else(|| panic!("missing /result/content/0/text in: {call_resp}"));
 
     let pid_token = format!("PID {sniffer_pid}");
+    // Anchor on the full-path tail + closing paren of `name (path)`
+    // because Restart Manager's app-name field is `rm-target-sniffer`
+    // on some hosts and `rm-target-sniffer.exe` on others; the
+    // resolved image path always ends with `\rm-target-sniffer.exe`.
+    let path_marker = r"\rm-target-sniffer.exe)";
     assert!(
-        text.contains("rm-target-sniffer.exe ("),
-        "expected agent-visible text to contain 'rm-target-sniffer.exe ('; \
+        text.contains(path_marker),
+        "expected agent-visible text to contain '{path_marker}'; \
          full text:\n{text}\n--- notifications: {} ---",
         notes.len()
     );

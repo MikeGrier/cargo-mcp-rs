@@ -236,11 +236,18 @@ fn cargo_clean_against_held_file_in_deps_surfaces_holder_in_stderr() {
     );
 
     // The full image path should appear inside parentheses next to
-    // the basename per the documented `name.exe (full\path)` format.
-    let path_marker = "rm-target-sniffer.exe (";
+    // the app name per the documented `name (full\path)` format.
+    // We anchor on the trailing `\rm-target-sniffer.exe)` because
+    // Restart Manager's `strAppName` is sometimes `rm-target-sniffer`
+    // and sometimes `rm-target-sniffer.exe` depending on the host
+    // (observed: with `.exe` on local dev boxes, without on
+    // GitHub-hosted Windows runners), but the resolved image path
+    // always ends with `\rm-target-sniffer.exe` followed by the
+    // closing paren of the `(path)` decoration.
+    let path_marker = r"\rm-target-sniffer.exe)";
     assert!(
         combined.contains(path_marker),
-        "expected '{path_marker}' (basename + open-paren full-path marker) \
+        "expected '{path_marker}' (full-path tail + close-paren marker) \
          in combined output; was:\n{combined}"
     );
 }
