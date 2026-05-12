@@ -28,11 +28,12 @@ the Win32 lookup wired up but no observed evidence it ever surfaces.
 
 - [x] In `crates/cargo-mcp/src/tools.rs::format_json_output`,
   always include any non-empty stderr text on failure (both the
-  empty-stdout branch and the JSON-stdout branch). Format proposal:
-  append a literal `\n[stderr]\n<trimmed stderr>\n` block after the
-  status trailer so the NDJSON stream itself stays valid for
-  downstream parsers but the user (and the agent) sees the holder
-  report.
+  empty-stdout branch and the JSON-stdout branch). Implementation:
+  emit stderr as a dedicated NDJSON record
+  `{"reason":"x-cargo-mcp-stderr","text":...}` after the
+  `{"status":"error","exit_code":N}` trailer so the whole tool
+  result stays a strict one-JSON-object-per-line stream that
+  downstream parsers can consume end-to-end.
 - [x] Add a unit test in `tools.rs` that constructs a synthetic
   `CargoOutput { exit_code: 1, stdout: "<one valid compiler-message JSON line>", stderr: "...holder report fixture...\n" }`
   and asserts the formatted string contains the holder report text.
@@ -119,8 +120,8 @@ Marked `#[ignore]` (run on demand) — proves what the agent actually sees.
 
 ### Wrap-up
 
-- [ ] Build, test, clippy, fmt across the workspace.
-- [ ] Encoding check on every touched file.
-- [ ] Commit on `micgrier/safe-rm-wrapper`. Subject:
+- [x] Build, test, clippy, fmt across the workspace.
+- [x] Encoding check on every touched file.
+- [x] Commit on `micgrier/safe-rm-wrapper`. Subject:
   `test(rm): redesigned sniffer, layered tests for end-to-end RM visibility`.
-- [ ] Push.
+- [x] Push.

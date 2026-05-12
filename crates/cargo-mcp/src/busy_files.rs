@@ -262,8 +262,10 @@ fn normalize_json_lines(s: &str) -> String {
 ///
 /// On Windows this calls into the Restart Manager (`rstrtmgr.dll`). On
 /// every other platform this returns a vector of [`FileHolders`] entries
-/// each carrying `error = Some("Restart Manager is Windows-only")` so
-/// callers can render a uniform diagnostic instead of branching.
+/// each carrying a non-empty `error` string explaining that Restart
+/// Manager diagnostics are Windows-only, so callers can render a uniform
+/// diagnostic instead of branching. The exact wording is owned by
+/// [`crate::rm::who_holds`] — do not match on it.
 ///
 /// Best-effort: a missing or inaccessible `rstrtmgr.dll`, an access-denied
 /// session start, or a path that has already been deleted is reported per

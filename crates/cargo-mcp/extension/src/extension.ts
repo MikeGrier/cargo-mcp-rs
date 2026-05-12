@@ -85,18 +85,20 @@ function buildArgs(): string[] {
         args.push(`--retry-max-attempts=${Math.round(retryMaxAttempts)}`);
     }
 
+    // Memory-unsafe opt-in: Windows Restart Manager "who holds this file"
+    // lookup. Off by default. Only emit the flag when enabled. Emitted
+    // before `extraArgs` so a user override there (e.g.
+    // `--unsafe-windows-rm=false`) wins per the documented precedence.
+    const rmEnabled = config.get<boolean>("unsafe.windowsRestartManager", false);
+    if (rmEnabled === true) {
+        args.push("--unsafe-windows-rm=true");
+    }
+
     const extraArgs = config.get<string[]>("extraArgs", []) ?? [];
     for (const a of extraArgs) {
         if (typeof a === "string" && a.length > 0) {
             args.push(a);
         }
-    }
-
-    // Memory-unsafe opt-in: Windows Restart Manager "who holds this file"
-    // lookup. Off by default. Only emit the flag when enabled.
-    const rmEnabled = config.get<boolean>("unsafe.windowsRestartManager", false);
-    if (rmEnabled === true) {
-        args.push("--unsafe-windows-rm=true");
     }
 
     return args;

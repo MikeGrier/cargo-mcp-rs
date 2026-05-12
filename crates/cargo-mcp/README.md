@@ -128,8 +128,7 @@ cross-platform.
 Every tool result begins with a one-line **JSON invocation header** that
 records the *effective* command cargo-mcp ran, including any flags the
 dispatch layer added implicitly (e.g. `--message-format=json`). The header
-is shaped as a cargo-style NDJSON record so the entire response can be
-parsed with a single line-by-line JSON parser:
+is shaped as a cargo-style NDJSON record:
 
 ```json
 {"reason":"x-cargo-mcp-invocation","argv":["check","--message-format=json","--all-targets"],"cwd":"/path/to/project"}
@@ -142,22 +141,25 @@ invoked from the tool-result panel even when the JSON `arguments` shown
 by the MCP client are sparse (for example, only `working_dir` and a
 single boolean flag).
 
-For JSON-mode tools (`check`, `build`, `test`, `clippy`, `doc`, `metadata`)
-the body of the result is NDJSON — one JSON object per line — filtered to
+For **JSON-mode tools** (`check`, `build`, `test`, `clippy`, `doc`,
+`metadata`) the *entire* response is a strict NDJSON stream — the
+invocation header followed by one JSON object per line — filtered to
 keep only `compiler-message` and `build-finished` records. On failure
-cargo-mcp also appends a `{"reason":"x-cargo-mcp-stderr","text":...}`
-record carrying the cargo child's stderr (where the Restart Manager
-"who holds this file" report and other side-channel diagnostics land), so
-the full response stays parseable end-to-end with a single line-by-line
-JSON parser. While the build runs, streaming progress notifications are
-also emitted; the final notification reads `cargo <verb> finished` (or
-`failed`), with the optional target triplet appended when one is supplied.
-This is what appears as the collapsed summary line in the VS Code chat
-history.
+cargo-mcp appends a `{"status":"error","exit_code":N}` trailer record,
+and when the cargo child wrote anything to stderr (where the Restart
+Manager "who holds this file" report and other side-channel diagnostics
+land) a separate `{"reason":"x-cargo-mcp-stderr","text":...}` record is
+appended after the trailer, so the whole response stays parseable
+end-to-end with a single line-by-line JSON parser. While the build runs,
+streaming progress notifications are also emitted; the final notification
+reads `cargo <verb> finished` (or `failed`), with the optional target
+triplet appended when one is supplied. This is what appears as the
+collapsed summary line in the VS Code chat history.
 
-For tools without a JSON mode (`fmt`, `tree`, `clean`, `update`, `fix`,
-`add`, `remove`, `publish`) the body is the combined stdout/stderr of cargo,
-prefixed with the same invocation header.
+For **text-mode tools** (`fmt`, `tree`, `clean`, `update`, `fix`, `add`,
+`remove`, `publish`) only the first line (the invocation header) is
+JSON; the body that follows is the cargo child's combined stdout/stderr
+and is not guaranteed to be JSON.
 
 When `cargo_check` or `cargo_clippy` produce machine-applicable suggestions
 and the MCP client supports elicitation, a multi-select form is presented

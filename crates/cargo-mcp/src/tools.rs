@@ -30,9 +30,7 @@
 //! ## Output shape
 //!
 //! Tool results begin with a one-line **JSON invocation header** produced by
-//! [`invocation_header`], shaped to look like another cargo NDJSON record so
-//! consumers can parse the entire response with a single line-by-line JSON
-//! parser:
+//! [`invocation_header`], shaped to look like another cargo NDJSON record:
 //!
 //! ```json
 //! {"reason":"x-cargo-mcp-invocation","argv":["build","--message-format=json"],"cwd":"C:\\path\\to\\workspace"}
@@ -43,8 +41,16 @@
 //! `compiler-artifact`, etc.). The header makes the *effective* command
 //! (including flags the dispatch layer added implicitly, such as
 //! `--message-format=json`) visible in the MCP client's tool-result panel
-//! even when the original `arguments` JSON is sparse, without breaking
-//! NDJSON parsing in clients that scan for cargo's own `reason` discriminator.
+//! even when the original `arguments` JSON is sparse.
+//!
+//! For **JSON-mode tools** (`check`, `build`, `test`, `clippy`, `doc`,
+//! `metadata`) the *entire* response is a clean NDJSON stream — the
+//! invocation header followed by one JSON object per line, so consumers
+//! can parse the whole response with a single line-by-line JSON parser.
+//! For **text-mode tools** (`fmt`, `tree`, `clean`, `update`, `fix`,
+//! `add`, `remove`, `publish`) only the first line (the invocation
+//! header) is JSON; the body that follows is the cargo child's combined
+//! stdout/stderr and is not guaranteed to be JSON.
 
 use serde_json::Value;
 
@@ -139,7 +145,9 @@ fn opt_bool(args: &Value, key: &str) -> bool {
 /// Retains only `compiler-message` lines (errors and warnings) and the
 /// `build-finished` summary. Everything else — artifacts, build-script events,
 /// etc. — was already surfaced via streaming progress notifications and is not
-/// useful in the final response.
+/// useful in the final response. Non-JSON stdout lines (libtest text events,
+/// stray prints) are dropped so the formatter's output remains a strict
+/// NDJSON stream parseable end-to-end with a single line-by-line JSON parser.
 fn filter_build_ndjson(stdout: &str) -> String {
     stdout
         .lines()
@@ -150,7 +158,7 @@ fn filter_build_ndjson(stdout: &str) -> String {
                     Some("compiler-message") | Some("build-finished")
                 )
             } else {
-                true // keep non-JSON lines (test harness events etc.)
+                false
             }
         })
         .collect::<Vec<_>>()
@@ -199,16 +207,20 @@ pub(crate) const STDERR_REASON: &str = "x-cargo-mcp-stderr";
 /// Format a [`CargoOutput`] from a `--message-format=json` invocation.
 ///
 /// Filters the NDJSON stream to remove dep-artifact and build-script noise
-/// (already delivered as streaming progress), then returns the remainder.
-/// On failure, prepends the exit code and appends stderr for context.
-/// The result is prefixed with [`invocation_header`].
+/// (already delivered as streaming progress), then returns the remainder
+/// prefixed with [`invocation_header`]. The output is always a strict
+/// NDJSON stream — every non-blank line is a JSON object — so consumers
+/// can parse the whole response with a single line-by-line JSON parser.
 ///
-/// On failure, any non-empty stderr text is appended after the JSON
-/// payload as an extra NDJSON record with `reason = STDERR_REASON` so the
-/// whole tool result remains a clean stream of one-JSON-object-per-line.
-/// This is the channel the retry-on-busy code path uses to surface the
-/// Restart Manager "who holds this file" report; without this record the
-/// report is generated but never reaches the agent or the user.
+/// On failure, a `{"status":"error","exit_code":N}` trailer is appended
+/// after the filtered diagnostics, and any non-empty stderr text is
+/// appended as an extra NDJSON record with `reason = STDERR_REASON`. The
+/// stderr record is the channel the retry-on-busy code path uses to
+/// surface the Restart Manager "who holds this file" report; without it
+/// the report is generated but never reaches the agent or the user.
+/// Both shapes are the same: filtered records (possibly none) → status
+/// trailer → optional stderr record. There is no `message` field on the
+/// trailer; stderr always travels in the dedicated record.
 fn format_json_output(out: &CargoOutput, argv: &[&str], wd: Option<&str>) -> String {
     let header = invocation_header(argv, wd);
     let body = if out.exit_code == 0 {
@@ -217,30 +229,25 @@ fn format_json_output(out: &CargoOutput, argv: &[&str], wd: Option<&str>) -> Str
         } else {
             filter_build_ndjson(&out.stdout)
         }
-    } else if out.stdout.is_empty() {
-        // No JSON at all — stderr has the error (e.g. bad args, missing toolchain).
-        format!(
-            r#"{{"status":"error","exit_code":{},"message":{}}}"#,
-            out.exit_code,
-            serde_json::to_string(out.stderr.trim()).unwrap_or_default(),
-        )
     } else {
-        // JSON stream contains the diagnostics; append a status trailer
-        // and any stderr (which is where the Restart Manager holder
-        // report and other side-channel diagnostics land).
         let filtered = filter_build_ndjson(&out.stdout);
+        let filtered = filtered.trim_end();
         let trailer = format!(r#"{{"status":"error","exit_code":{}}}"#, out.exit_code);
         let stderr_trimmed = out.stderr.trim();
-        if stderr_trimmed.is_empty() {
-            format!("{}\n{}", filtered.trim_end(), trailer)
-        } else {
+        let mut parts: Vec<String> = Vec::with_capacity(3);
+        if !filtered.is_empty() {
+            parts.push(filtered.to_owned());
+        }
+        parts.push(trailer);
+        if !stderr_trimmed.is_empty() {
             let stderr_record = serde_json::to_string(&serde_json::json!({
                 "reason": STDERR_REASON,
                 "text": stderr_trimmed,
             }))
             .unwrap_or_else(|_| "{}".into());
-            format!("{}\n{}\n{}", filtered.trim_end(), trailer, stderr_record,)
+            parts.push(stderr_record);
         }
+        parts.join("\n")
     };
     format!("{header}{body}")
 }
