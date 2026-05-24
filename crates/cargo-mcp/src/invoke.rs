@@ -408,9 +408,9 @@ impl std::fmt::Display for TimeoutError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Operation timed out after {} seconds; cargo subprocess and all \
+            "Operation timed out after {:.3} seconds; cargo subprocess and all \
              of its descendants were terminated.",
-            self.elapsed.as_secs(),
+            self.elapsed.as_secs_f64(),
         )
     }
 }
@@ -906,10 +906,13 @@ fn run_cargo_streaming_once(
     });
 
     // Drain stdout on its own background thread, forwarding each line
-    // through an mpsc channel. The main thread polls the channel with a
-    // short timeout so cancel / wall-clock checks happen even when cargo
-    // is silent (e.g. a slow test running with no progress output).
-    let (tx, rx) = mpsc::channel::<Option<String>>();
+    // through a bounded mpsc channel. The main thread polls the channel
+    // with a short timeout so cancel / wall-clock checks happen even when
+    // cargo is silent (e.g. a slow test running with no progress output).
+    // The channel is bounded so a slow `on_stdout_line` consumer applies
+    // backpressure to the reader thread instead of letting an unbounded
+    // backlog duplicate cargo's stdout in memory on top of `stdout_buf`.
+    let (tx, rx) = mpsc::sync_channel::<Option<String>>(256);
     let stdout_thread = thread::spawn(move || {
         let reader = BufReader::new(stdout_pipe);
         for line in reader.lines() {

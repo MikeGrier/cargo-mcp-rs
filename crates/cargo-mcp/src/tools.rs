@@ -142,16 +142,22 @@ fn opt_bool(args: &Value, key: &str) -> bool {
 
 /// Extract an optional wall-clock timeout (`timeout_secs`) from JSON args.
 ///
-/// Accepts integer seconds. Zero or missing returns `None` ("wait
-/// forever"). Negative numbers (which arrive as `i64` from JSON) are
-/// treated as `None` rather than producing a zero-length deadline that
-/// would fire on the first tick.
-fn opt_timeout(args: &Value) -> Option<std::time::Duration> {
-    let secs = args.get("timeout_secs").and_then(|v| v.as_i64())?;
-    if secs <= 0 {
-        return None;
+/// Accepts non-negative integer seconds (the tool schemas declare
+/// `minimum: 0`). Zero or missing returns `Ok(None)` ("wait forever").
+/// A negative value is rejected with an error rather than silently
+/// coerced, so bad client input surfaces immediately instead of
+/// producing an unexpectedly unbounded run.
+fn opt_timeout(args: &Value) -> Result<Option<std::time::Duration>, Box<dyn std::error::Error>> {
+    let Some(secs) = args.get("timeout_secs").and_then(|v| v.as_i64()) else {
+        return Ok(None);
+    };
+    if secs < 0 {
+        return Err(format!("timeout_secs must be >= 0, got {secs}").into());
     }
-    Some(std::time::Duration::from_secs(secs as u64))
+    if secs == 0 {
+        return Ok(None);
+    }
+    Ok(Some(std::time::Duration::from_secs(secs as u64)))
 }
 
 /// Filter `--message-format=json` NDJSON output to keep only actionable lines.
@@ -1200,7 +1206,7 @@ fn call_check(
     if opt_bool(args, "locked") {
         argv.push("--locked");
     }
-    let out = run_cargo_maybe_streaming(&argv, wd, opt_timeout(args), on_progress)?;
+    let out = run_cargo_maybe_streaming(&argv, wd, opt_timeout(args)?, on_progress)?;
     let output = format_json_output(&out, &argv, wd);
     let suggestions = suggest::extract_suggestions(&out.stdout);
     Ok(ToolResult::WithSuggestions {
@@ -1234,7 +1240,7 @@ fn call_build(
     if opt_bool(args, "locked") {
         argv.push("--locked");
     }
-    let out = run_cargo_maybe_streaming(&argv, wd, opt_timeout(args), on_progress)?;
+    let out = run_cargo_maybe_streaming(&argv, wd, opt_timeout(args)?, on_progress)?;
     Ok(format_json_output(&out, &argv, wd))
 }
 
@@ -1282,7 +1288,7 @@ fn call_test(
             argv.push("--exact");
         }
     }
-    let out = run_cargo_maybe_streaming(&argv, wd, opt_timeout(args), on_progress)?;
+    let out = run_cargo_maybe_streaming(&argv, wd, opt_timeout(args)?, on_progress)?;
     // Test output is a mix: JSON from compilation, text from the test harness.
     // Return both stdout (JSON + test results) and stderr on failure.
     Ok(format_json_output(&out, &argv, wd))
@@ -1310,7 +1316,7 @@ fn call_clippy(
     if opt_bool(args, "locked") {
         argv.push("--locked");
     }
-    let out = run_cargo_maybe_streaming(&argv, wd, opt_timeout(args), on_progress)?;
+    let out = run_cargo_maybe_streaming(&argv, wd, opt_timeout(args)?, on_progress)?;
     let output = format_json_output(&out, &argv, wd);
     let suggestions = suggest::extract_suggestions(&out.stdout);
     Ok(ToolResult::WithSuggestions {
