@@ -51,9 +51,10 @@ use std::process::{Command, Stdio};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+    mpsc,
 };
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // ── retry-on-busy configuration ──────────────────────────────────────────────
 
@@ -393,6 +394,26 @@ impl std::fmt::Display for CancelledError {
 
 impl std::error::Error for CancelledError {}
 
+/// Error returned when a cargo operation exceeds its `timeout_secs` budget.
+#[derive(Debug)]
+pub struct TimeoutError {
+    /// The wall-clock budget that was exceeded.
+    pub elapsed: Duration,
+}
+
+impl std::fmt::Display for TimeoutError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Operation timed out after {} seconds; cargo subprocess and all \
+             of its descendants were terminated.",
+            self.elapsed.as_secs(),
+        )
+    }
+}
+
+impl std::error::Error for TimeoutError {}
+
 thread_local! {
     /// The cancel token for the cargo operation currently running on this thread.
     /// Set by [`set_cancel_token`]; polled inside the subprocess runners.
@@ -514,22 +535,208 @@ fn append_holder_report(stderr: &mut String, report: &[crate::busy_files::FileHo
 
 // ── subprocess runners ────────────────────────────────────────────────────────
 
+/// Cross-platform wrapper around [`std::process::Child`] that owns the OS
+/// objects needed to terminate the **entire descendant tree** of the spawned
+/// process — not just the immediate child.
+///
+/// This matters for `cargo test` (and `cargo run`, `cargo build` via build
+/// scripts, etc.): cargo spawns `rustc` and the compiled test binaries as
+/// its own children, and a plain `Child::kill()` only stops `cargo` itself,
+/// leaving rustc and any running tests behind to consume CPU until they
+/// finish on their own.
+///
+/// ## Platform mechanics
+///
+/// - **Windows.** The child is assigned to a Job Object configured with
+///   `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`. Dropping the job handle causes
+///   the kernel to terminate every process in the job, including
+///   grandchildren that inherit the job assignment automatically.
+/// - **Unix.** The child is spawned into its own process group (PGID =
+///   child PID) via [`CommandExt::process_group`]. On cancel we send
+///   `SIGKILL` to the negated PGID, which delivers to every process whose
+///   group leader is the cargo we spawned.
+///
+/// There is a microscopic window between `spawn` and "assigned to job" on
+/// Windows where a grandchild could escape; in practice cargo does not
+/// fork that fast, and assigning immediately after spawn is the standard
+/// production pattern.
+///
+/// [`CommandExt::process_group`]: std::os::unix::process::CommandExt::process_group
+struct ManagedChild {
+    child: std::process::Child,
+    #[cfg(windows)]
+    job: Option<job_object::Job>,
+}
+
+impl ManagedChild {
+    fn spawn(cmd: &mut Command) -> std::io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
+        let child = cmd.spawn()?;
+        #[cfg(windows)]
+        let job = job_object::Job::new_kill_on_close()
+            .and_then(|j| j.assign(&child).map(|_| j))
+            .ok();
+        Ok(Self {
+            child,
+            #[cfg(windows)]
+            job,
+        })
+    }
+
+    fn take_stdout(&mut self) -> Option<std::process::ChildStdout> {
+        self.child.stdout.take()
+    }
+
+    fn take_stderr(&mut self) -> Option<std::process::ChildStderr> {
+        self.child.stderr.take()
+    }
+
+    fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        self.child.wait()
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.child.try_wait()
+    }
+
+    /// Terminate the child **and all of its descendants**, then reap.
+    fn kill_tree(&mut self) {
+        #[cfg(unix)]
+        {
+            // SAFETY: kill() with a process-group target (negative PID) is
+            // async-signal-safe and operates on the kernel's PID table.
+            let pgid = self.child.id() as i32;
+            unsafe {
+                libc::kill(-pgid, libc::SIGKILL);
+            }
+        }
+        #[cfg(windows)]
+        {
+            // Closing the job (drop) triggers KILL_ON_JOB_CLOSE.
+            self.job = None;
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[cfg(windows)]
+mod job_object {
+    //! Minimal Job Object wrapper for tree-killing cargo subprocesses.
+
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+        SetInformationJobObject,
+    };
+
+    pub(super) struct Job(HANDLE);
+
+    // HANDLE is just a pointer; Send/Sync are fine because the kernel
+    // object is reference-counted internally.
+    unsafe impl Send for Job {}
+    unsafe impl Sync for Job {}
+
+    impl Job {
+        pub(super) fn new_kill_on_close() -> std::io::Result<Self> {
+            // SAFETY: NULL attributes/name are documented as valid;
+            // a NULL return indicates failure and sets GetLastError().
+            unsafe {
+                let h = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+                if h.is_null() {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+                info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                let ok = SetInformationJobObject(
+                    h,
+                    JobObjectExtendedLimitInformation,
+                    &info as *const _ as *const _,
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                );
+                if ok == 0 {
+                    let e = std::io::Error::last_os_error();
+                    CloseHandle(h);
+                    return Err(e);
+                }
+                Ok(Job(h))
+            }
+        }
+
+        pub(super) fn assign(&self, child: &std::process::Child) -> std::io::Result<()> {
+            // SAFETY: `child`'s process handle is valid for the lifetime
+            // of the Child value, which the caller continues to own.
+            unsafe {
+                if AssignProcessToJobObject(self.0, child.as_raw_handle() as HANDLE) == 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        }
+    }
+
+    impl Drop for Job {
+        fn drop(&mut self) {
+            // SAFETY: handle came from CreateJobObjectW and is closed at
+            // most once (Drop runs once). Closing the last handle on a
+            // KILL_ON_JOB_CLOSE job kills every assigned process.
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+}
+
+/// Outcome of polling [`ManagedChild`] for completion while watching the
+/// thread-local cancel token and an optional wall-clock deadline.
+enum WaitOutcome {
+    /// Child exited cleanly; treat its output normally.
+    Exited,
+    /// Cancel token was set; child has been killed.
+    Cancelled,
+    /// Wall-clock deadline elapsed before the child finished; child has
+    /// been killed.
+    TimedOut(Duration),
+}
+
 /// Run `cargo <args>`, calling `on_stdout_line` for each stdout line as it
 /// arrives, and return the complete output after the process exits.
 ///
-/// Stderr is drained in a background thread to prevent pipe-buffer deadlock
-/// when the process produces large amounts of output on both streams.
-/// The `on_stdout_line` callback is invoked on the calling thread only.
-///
-/// If the thread-local cancel token is set mid-run, the child is killed and
-/// [`CancelledError`] is returned.
-///
-/// Returns a [`CargoOutput`] on success (even if cargo itself reports errors —
-/// the exit code distinguishes success from failure). Returns `Err` only for
-/// OS-level spawn failures or cancellation.
+/// Convenience wrapper around [`run_cargo_streaming_with_timeout`] for call
+/// sites that don't need a wall-clock cap. Equivalent to passing
+/// `timeout = None`.
+#[allow(dead_code)] // used by `#[path = "../src/invoke.rs"]` integration tests
 pub fn run_cargo_streaming(
     args: &[&str],
     working_dir: Option<&str>,
+    on_stdout_line: &mut dyn FnMut(&str),
+) -> Result<CargoOutput, Box<dyn std::error::Error>> {
+    run_cargo_streaming_with_timeout(args, working_dir, None, on_stdout_line)
+}
+
+/// Run `cargo <args>` with a wall-clock budget, streaming stdout.
+///
+/// Stderr is drained in a background thread to prevent pipe-buffer deadlock
+/// when the process produces large amounts of output on both streams.
+/// Stdout is drained on a second background thread so the main thread can
+/// poll the cancel token and the optional deadline on a short tick — a
+/// blocking line-read could otherwise wedge the runner while `cargo test`
+/// silently executes a slow test.
+///
+/// If the thread-local cancel token is set or the deadline elapses mid-run,
+/// the **entire process tree** (cargo, rustc, spawned test binaries, …) is
+/// killed via [`ManagedChild::kill_tree`] and [`CancelledError`] or
+/// [`TimeoutError`] is returned respectively.
+pub fn run_cargo_streaming_with_timeout(
+    args: &[&str],
+    working_dir: Option<&str>,
+    timeout: Option<Duration>,
     on_stdout_line: &mut dyn FnMut(&str),
 ) -> Result<CargoOutput, Box<dyn std::error::Error>> {
     // Retry only for cargo subcommands that are inherently idempotent. This
@@ -545,7 +752,7 @@ pub fn run_cargo_streaming(
 
     let mut last: Option<CargoOutput> = None;
     for attempt in 1..=max_attempts {
-        let mut out = run_cargo_streaming_once(args, working_dir, on_stdout_line)?;
+        let mut out = run_cargo_streaming_once(args, working_dir, timeout, on_stdout_line)?;
         let busy = out.exit_code != 0
             && (is_transient_busy_error(&out.stderr) || is_transient_busy_error(&out.stdout));
         if !busy {
@@ -602,6 +809,7 @@ pub fn run_cargo_streaming(
 fn run_cargo_streaming_once(
     args: &[&str],
     working_dir: Option<&str>,
+    timeout: Option<Duration>,
     on_stdout_line: &mut dyn FnMut(&str),
 ) -> Result<CargoOutput, Box<dyn std::error::Error>> {
     let (cargo_path, source) = resolve_cargo_binary();
@@ -619,9 +827,9 @@ fn run_cargo_streaming_once(
         cmd.current_dir(dir);
     }
 
-    let mut child = cmd.spawn()?;
-    let stdout_pipe = child.stdout.take().expect("stdout is piped");
-    let stderr_pipe = child.stderr.take().expect("stderr is piped");
+    let mut child = ManagedChild::spawn(&mut cmd)?;
+    let stdout_pipe = child.take_stdout().expect("stdout is piped");
+    let stderr_pipe = child.take_stderr().expect("stderr is piped");
 
     // Drain stderr on a background thread to avoid deadlock when the stdout
     // pipe buffer fills while stderr is also accumulating.
@@ -631,30 +839,76 @@ fn run_cargo_streaming_once(
         buf
     });
 
-    // Stream stdout line by line on the calling thread.
+    // Drain stdout on its own background thread, forwarding each line
+    // through an mpsc channel. The main thread polls the channel with a
+    // short timeout so cancel / wall-clock checks happen even when cargo
+    // is silent (e.g. a slow test running with no progress output).
+    let (tx, rx) = mpsc::channel::<Option<String>>();
+    let stdout_thread = thread::spawn(move || {
+        let reader = BufReader::new(stdout_pipe);
+        for line in reader.lines() {
+            match line {
+                Ok(l) => {
+                    if tx.send(Some(l)).is_err() {
+                        return;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = tx.send(None); // EOF sentinel
+    });
+
+    let deadline = timeout.map(|t| (Instant::now() + t, t));
     let mut stdout_buf = String::new();
-    let mut cancelled = false;
-    for line in BufReader::new(stdout_pipe).lines() {
-        match line {
-            Ok(l) => {
+    let mut outcome = WaitOutcome::Exited;
+    let tick = Duration::from_millis(50);
+    loop {
+        if is_cancelled() {
+            outcome = WaitOutcome::Cancelled;
+            break;
+        }
+        if let Some((d, total)) = deadline
+            && Instant::now() >= d
+        {
+            outcome = WaitOutcome::TimedOut(total);
+            break;
+        }
+        match rx.recv_timeout(tick) {
+            Ok(Some(l)) => {
                 on_stdout_line(&l);
                 stdout_buf.push_str(&l);
                 stdout_buf.push('\n');
             }
-            Err(_) => break,
-        }
-        if is_cancelled() {
-            cancelled = true;
-            break;
+            Ok(None) => break, // stdout EOF
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
 
-    if cancelled {
-        let _ = child.kill();
-        let _ = child.wait();
-        let _ = stderr_thread.join();
-        return Err(Box::new(CancelledError));
+    match outcome {
+        WaitOutcome::Cancelled => {
+            child.kill_tree();
+            let _ = stdout_thread.join();
+            let _ = stderr_thread.join();
+            return Err(Box::new(CancelledError));
+        }
+        WaitOutcome::TimedOut(elapsed) => {
+            child.kill_tree();
+            let _ = stdout_thread.join();
+            let _ = stderr_thread.join();
+            return Err(Box::new(TimeoutError { elapsed }));
+        }
+        WaitOutcome::Exited => {}
     }
+
+    // Drain any lines the stdout thread buffered after we broke the loop.
+    while let Ok(Some(l)) = rx.try_recv() {
+        on_stdout_line(&l);
+        stdout_buf.push_str(&l);
+        stdout_buf.push('\n');
+    }
+    let _ = stdout_thread.join();
 
     let mut stderr_buf = stderr_thread.join().unwrap_or_default();
     let status = child.wait()?;
@@ -672,13 +926,23 @@ fn run_cargo_streaming_once(
 
 /// Run `cargo <args>` and capture the complete output without streaming.
 ///
-/// Convenience wrapper around [`run_cargo_streaming`] for call sites that do
-/// not need incremental progress callbacks.
+/// Convenience wrapper around [`run_cargo_with_timeout`] that passes
+/// `timeout = None` ("wait forever"). Use [`run_cargo_with_timeout`] when
+/// you need a wall-clock cap.
 pub fn run_cargo(
     args: &[&str],
     working_dir: Option<&str>,
 ) -> Result<CargoOutput, Box<dyn std::error::Error>> {
-    run_cargo_streaming(args, working_dir, &mut |_| {})
+    run_cargo_with_timeout(args, working_dir, None)
+}
+
+/// Run `cargo <args>` with a wall-clock budget; no streaming callback.
+pub fn run_cargo_with_timeout(
+    args: &[&str],
+    working_dir: Option<&str>,
+    timeout: Option<Duration>,
+) -> Result<CargoOutput, Box<dyn std::error::Error>> {
+    run_cargo_streaming_with_timeout(args, working_dir, timeout, &mut |_| {})
 }
 
 /// Run `cargo <args>`, piping stdout **directly** into `dest_file` at the OS
@@ -689,8 +953,10 @@ pub fn run_cargo(
 /// plumbs the pipe straight to the file, the Rust process's heap is never
 /// charged for the output.
 ///
-/// If the thread-local cancel token is set mid-run, the child is killed and
-/// [`CancelledError`] is returned.
+/// If the thread-local cancel token is set mid-run, the **entire process
+/// tree** is killed and [`CancelledError`] is returned. If a `timeout` is
+/// supplied and elapses, the tree is killed and [`TimeoutError`] is
+/// returned.
 ///
 /// `CargoOutput::stdout` is always empty when this function is used; only
 /// `stderr` and `exit_code` are meaningful in the returned value.
@@ -698,6 +964,7 @@ pub fn run_cargo_to_file(
     args: &[&str],
     working_dir: Option<&str>,
     dest_file: std::fs::File,
+    timeout: Option<Duration>,
 ) -> Result<CargoOutput, Box<dyn std::error::Error>> {
     let (cargo_path, source) = resolve_cargo_binary();
     log_invocation(&cargo_path, source, working_dir, args);
@@ -714,8 +981,8 @@ pub fn run_cargo_to_file(
         cmd.current_dir(dir);
     }
 
-    let mut child = cmd.spawn()?;
-    let stderr_pipe = child.stderr.take().expect("stderr is piped");
+    let mut child = ManagedChild::spawn(&mut cmd)?;
+    let stderr_pipe = child.take_stderr().expect("stderr is piped");
 
     // Drain stderr on a background thread to avoid deadlock when stdout
     // fills the pipe buffer while stderr is also accumulating.
@@ -725,16 +992,22 @@ pub fn run_cargo_to_file(
         buf
     });
 
-    // Poll for completion, checking the cancel token every 50 ms.
+    let deadline = timeout.map(|t| (Instant::now() + t, t));
     let status = loop {
         match child.try_wait()? {
             Some(s) => break s,
             None => {
                 if is_cancelled() {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    child.kill_tree();
                     let _ = stderr_thread.join();
                     return Err(Box::new(CancelledError));
+                }
+                if let Some((d, total)) = deadline
+                    && Instant::now() >= d
+                {
+                    child.kill_tree();
+                    let _ = stderr_thread.join();
+                    return Err(Box::new(TimeoutError { elapsed: total }));
                 }
                 thread::sleep(Duration::from_millis(50));
             }
