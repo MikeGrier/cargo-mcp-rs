@@ -43,4 +43,12 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Memory",
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Threading",
+    "Win32_System_JobObjects",
+    "Win32_Security",
 ] }
+
+# Unix-only: used by `invoke::ManagedChild` to send SIGKILL to the entire
+# process group of a spawned cargo subprocess, so cancelling `cargo test`
+# also stops the test binary cargo spawned underneath it.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

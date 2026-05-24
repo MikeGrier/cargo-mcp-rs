@@ -140,6 +140,34 @@ fn opt_bool(args: &Value, key: &str) -> bool {
     args.get(key).and_then(|v| v.as_bool()).unwrap_or(false)
 }
 
+/// Extract an optional wall-clock timeout (`timeout_secs`) from JSON args.
+///
+/// Accepts non-negative integer seconds (the tool schemas declare
+/// `minimum: 0`). Missing, `null`, or zero returns `Ok(None)`
+/// ("wait forever"). Any other shape — a negative integer, a float,
+/// a string, a boolean, an integer outside `u64`, etc. — is rejected
+/// with an error rather than silently coerced or dropped, so bad
+/// client input surfaces immediately instead of producing an
+/// unexpectedly unbounded run.
+fn opt_timeout(args: &Value) -> Result<Option<std::time::Duration>, Box<dyn std::error::Error>> {
+    let Some(v) = args.get("timeout_secs") else {
+        return Ok(None);
+    };
+    if v.is_null() {
+        return Ok(None);
+    }
+    let Some(n) = v.as_number() else {
+        return Err(format!("timeout_secs must be a non-negative integer, got {v}").into());
+    };
+    let secs = n.as_u64().ok_or_else(|| -> Box<dyn std::error::Error> {
+        format!("timeout_secs must be a non-negative integer, got {n}").into()
+    })?;
+    if secs == 0 {
+        return Ok(None);
+    }
+    Ok(Some(std::time::Duration::from_secs(secs)))
+}
+
 /// Filter `--message-format=json` NDJSON output to keep only actionable lines.
 ///
 /// Retains only `compiler-message` lines (errors and warnings) and the
@@ -283,11 +311,12 @@ fn format_text_output(out: &CargoOutput, argv: &[&str], wd: Option<&str>) -> Str
 fn run_cargo_maybe_streaming(
     argv: &[&str],
     wd: Option<&str>,
+    timeout: Option<std::time::Duration>,
     on_progress: Option<&mut dyn FnMut(&str)>,
 ) -> Result<CargoOutput, Box<dyn std::error::Error>> {
     match on_progress {
-        Some(cb) => invoke::run_cargo_streaming(argv, wd, cb),
-        None => invoke::run_cargo(argv, wd),
+        Some(cb) => invoke::run_cargo_streaming_with_timeout(argv, wd, timeout, cb),
+        None => invoke::run_cargo_with_timeout(argv, wd, timeout),
     }
 }
 
@@ -377,6 +406,16 @@ pub fn list() -> Value {
                             "If true, pass --locked: error if Cargo.lock is out of date \
                              rather than updating it. Use in CI to enforce a committed lockfile. \
                              Default: false."
+                    },
+                    "timeout_secs": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description":
+                            "Optional wall-clock budget in seconds. When the budget elapses, \
+                             cargo and the entire subprocess tree (rustc, test binaries, \
+                             build scripts) are terminated and the call returns a timeout \
+                             error. 0 or omitted means no timeout (the default). Recommended \
+                             for bounding runaway test runs."
                     }
                 },
                 "required": []
@@ -428,6 +467,16 @@ pub fn list() -> Value {
                             "If true, pass --locked: error if Cargo.lock is out of date \
                              rather than updating it. Use in CI to enforce a committed lockfile. \
                              Default: false."
+                    },
+                    "timeout_secs": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description":
+                            "Optional wall-clock budget in seconds. When the budget elapses, \
+                             cargo and the entire subprocess tree (rustc, test binaries, \
+                             build scripts) are terminated and the call returns a timeout \
+                             error. 0 or omitted means no timeout (the default). Recommended \
+                             for bounding runaway test runs."
                     }
                 },
                 "required": []
@@ -504,6 +553,16 @@ pub fn list() -> Value {
                             "If true, pass --locked: error if Cargo.lock is out of date \
                              rather than updating it. Use in CI to enforce a committed lockfile. \
                              Default: false."
+                    },
+                    "timeout_secs": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description":
+                            "Optional wall-clock budget in seconds. When the budget elapses, \
+                             cargo and the entire subprocess tree (rustc, test binaries, \
+                             build scripts) are terminated and the call returns a timeout \
+                             error. 0 or omitted means no timeout (the default). Recommended \
+                             for bounding runaway test runs."
                     }
                 },
                 "required": []
@@ -549,6 +608,16 @@ pub fn list() -> Value {
                             "If true, pass --locked: error if Cargo.lock is out of date \
                              rather than updating it. Use in CI to enforce a committed lockfile. \
                              Default: false."
+                    },
+                    "timeout_secs": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description":
+                            "Optional wall-clock budget in seconds. When the budget elapses, \
+                             cargo and the entire subprocess tree (rustc, test binaries, \
+                             build scripts) are terminated and the call returns a timeout \
+                             error. 0 or omitted means no timeout (the default). Recommended \
+                             for bounding runaway test runs."
                     }
                 },
                 "required": []
@@ -1092,7 +1161,7 @@ fn call_metadata(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
         // buffering the JSON blob in the server's heap — the whole point of
         // the output_file escape hatch for large workspaces.
         let dest = std::fs::File::create(path)?;
-        let out = invoke::run_cargo_to_file(&argv, wd, dest)?;
+        let out = invoke::run_cargo_to_file(&argv, wd, dest, None)?;
         if out.exit_code != 0 {
             // Best-effort cleanup: remove the partial/empty file on failure.
             let _ = std::fs::remove_file(path);
@@ -1145,7 +1214,7 @@ fn call_check(
     if opt_bool(args, "locked") {
         argv.push("--locked");
     }
-    let out = run_cargo_maybe_streaming(&argv, wd, on_progress)?;
+    let out = run_cargo_maybe_streaming(&argv, wd, opt_timeout(args)?, on_progress)?;
     let output = format_json_output(&out, &argv, wd);
     let suggestions = suggest::extract_suggestions(&out.stdout);
     Ok(ToolResult::WithSuggestions {
@@ -1179,7 +1248,7 @@ fn call_build(
     if opt_bool(args, "locked") {
         argv.push("--locked");
     }
-    let out = run_cargo_maybe_streaming(&argv, wd, on_progress)?;
+    let out = run_cargo_maybe_streaming(&argv, wd, opt_timeout(args)?, on_progress)?;
     Ok(format_json_output(&out, &argv, wd))
 }
 
@@ -1227,7 +1296,7 @@ fn call_test(
             argv.push("--exact");
         }
     }
-    let out = run_cargo_maybe_streaming(&argv, wd, on_progress)?;
+    let out = run_cargo_maybe_streaming(&argv, wd, opt_timeout(args)?, on_progress)?;
     // Test output is a mix: JSON from compilation, text from the test harness.
     // Return both stdout (JSON + test results) and stderr on failure.
     Ok(format_json_output(&out, &argv, wd))
@@ -1255,7 +1324,7 @@ fn call_clippy(
     if opt_bool(args, "locked") {
         argv.push("--locked");
     }
-    let out = run_cargo_maybe_streaming(&argv, wd, on_progress)?;
+    let out = run_cargo_maybe_streaming(&argv, wd, opt_timeout(args)?, on_progress)?;
     let output = format_json_output(&out, &argv, wd);
     let suggestions = suggest::extract_suggestions(&out.stdout);
     Ok(ToolResult::WithSuggestions {
@@ -1339,7 +1408,7 @@ fn call_doc(
     if opt_bool(args, "locked") {
         argv.push("--locked");
     }
-    let out = run_cargo_maybe_streaming(&argv, wd, on_progress)?;
+    let out = run_cargo_maybe_streaming(&argv, wd, None, on_progress)?;
     Ok(format_json_output(&out, &argv, wd))
 }
 
