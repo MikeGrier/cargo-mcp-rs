@@ -397,7 +397,10 @@ impl std::error::Error for CancelledError {}
 /// Error returned when a cargo operation exceeds its `timeout_secs` budget.
 #[derive(Debug)]
 pub struct TimeoutError {
-    /// The wall-clock budget that was exceeded.
+    /// Actual wall-clock duration measured from subprocess spawn until the
+    /// timeout trigger fired. This will be slightly greater than the
+    /// configured budget due to the polling interval used to detect the
+    /// deadline.
     pub elapsed: Duration,
 }
 
@@ -701,7 +704,8 @@ enum WaitOutcome {
     /// Cancel token was set; child has been killed.
     Cancelled,
     /// Wall-clock deadline elapsed before the child finished; child has
-    /// been killed.
+    /// been killed. Carries the real elapsed duration measured at the
+    /// point the deadline was detected.
     TimedOut(Duration),
 }
 
@@ -859,7 +863,10 @@ fn run_cargo_streaming_once(
         let _ = tx.send(None); // EOF sentinel
     });
 
-    let deadline = timeout.map(|t| (Instant::now() + t, t));
+    let start = Instant::now();
+    // checked_add: a caller-supplied timeout near Duration::MAX would panic
+    // on `start + t`. Treat overflow as "no deadline" rather than crashing.
+    let deadline = timeout.and_then(|t| start.checked_add(t));
     let mut stdout_buf = String::new();
     let mut outcome = WaitOutcome::Exited;
     let tick = Duration::from_millis(50);
@@ -868,10 +875,10 @@ fn run_cargo_streaming_once(
             outcome = WaitOutcome::Cancelled;
             break;
         }
-        if let Some((d, total)) = deadline
+        if let Some(d) = deadline
             && Instant::now() >= d
         {
-            outcome = WaitOutcome::TimedOut(total);
+            outcome = WaitOutcome::TimedOut(start.elapsed());
             break;
         }
         match rx.recv_timeout(tick) {
@@ -992,7 +999,9 @@ pub fn run_cargo_to_file(
         buf
     });
 
-    let deadline = timeout.map(|t| (Instant::now() + t, t));
+    let start = Instant::now();
+    // checked_add: see run_cargo_streaming_with_timeout for rationale.
+    let deadline = timeout.and_then(|t| start.checked_add(t));
     let status = loop {
         match child.try_wait()? {
             Some(s) => break s,
@@ -1002,12 +1011,14 @@ pub fn run_cargo_to_file(
                     let _ = stderr_thread.join();
                     return Err(Box::new(CancelledError));
                 }
-                if let Some((d, total)) = deadline
+                if let Some(d) = deadline
                     && Instant::now() >= d
                 {
                     child.kill_tree();
                     let _ = stderr_thread.join();
-                    return Err(Box::new(TimeoutError { elapsed: total }));
+                    return Err(Box::new(TimeoutError {
+                        elapsed: start.elapsed(),
+                    }));
                 }
                 thread::sleep(Duration::from_millis(50));
             }
