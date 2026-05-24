@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.5.5](https://github.com/MikeGrier/cargo-mcp-rs/compare/v0.5.4...v0.5.5) (2026-05-24)
+
+
+### Bug Fixes
+
+* **invoke:** add timeout_secs and tree-kill on cancel/timeout ([74b66ee](https://github.com/MikeGrier/cargo-mcp-rs/commit/74b66eee37652e466485e56e85da256fd5ddcd9f))
+* **invoke:** add timeout_secs and tree-kill on cancel/timeout ([4ba3429](https://github.com/MikeGrier/cargo-mcp-rs/commit/4ba3429ed9f5e9baa11221d0c2cf8f357714ba30))
+* **invoke:** use checked_add for deadline and report real elapsed on timeout ([ecace29](https://github.com/MikeGrier/cargo-mcp-rs/commit/ecace29886e19093967f2639ecd5da1143875f76))
+
 ## [0.5.4](https://github.com/MikeGrier/cargo-mcp-rs/compare/v0.5.3...v0.5.4) (2026-05-12)
 
 
