@@ -35,6 +35,52 @@ use std::time::{Duration, Instant};
 /// `CARGO` is process-global; serialize the two tests that mutate it.
 static CARGO_ENV_LOCK: Mutex<()> = Mutex::new(());
 
+/// Returns true if a process with `pid` is still live (running or a
+/// zombie that hasn't been reaped). Used to verify that the timeout /
+/// cancellation paths actually terminated the spawned sleeper.
+#[cfg(unix)]
+fn process_is_alive(pid: u32) -> bool {
+    // `kill(pid, 0)` performs the permission/existence check without
+    // delivering a signal. ESRCH means no such process; EPERM means it
+    // exists but we lack permission — for our own child either is
+    // unlikely once it's been reaped.
+    // SAFETY: `kill` with sig=0 has no side effects.
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+}
+
+#[cfg(windows)]
+fn process_is_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    // SAFETY: OpenProcess returns NULL on failure (e.g. PID gone), which
+    // we treat as "not alive". On success we query the exit code and
+    // always close the handle.
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h.is_null() {
+            return false;
+        }
+        let mut code: u32 = 0;
+        let ok = GetExitCodeProcess(h, &mut code);
+        CloseHandle(h);
+        ok != 0 && code == STILL_ACTIVE as u32
+    }
+}
+
+/// Poll `process_is_alive` for up to ~2s to allow the OS a brief moment
+/// to finish tearing the child down after `wait()` returns.
+fn wait_for_process_exit(pid: u32) -> bool {
+    for _ in 0..40 {
+        if !process_is_alive(pid) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    !process_is_alive(pid)
+}
+
 fn build_sleeper() -> PathBuf {
     let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -116,14 +162,16 @@ fn timeout_returns_timeout_error_and_terminates_subprocess() {
     let _env = CargoEnvGuard::set(&sleeper);
 
     let mut saw_started = false;
+    let mut sleeper_pid: Option<u32> = None;
     let started = Instant::now();
     let result = invoke::run_cargo_streaming_with_timeout(
         &["check"],
         None,
         Some(Duration::from_millis(500)),
         &mut |line| {
-            if line.starts_with("STARTED ") {
+            if let Some(rest) = line.strip_prefix("STARTED ") {
                 saw_started = true;
+                sleeper_pid = rest.trim().parse::<u32>().ok();
             }
         },
     );
@@ -140,6 +188,11 @@ fn timeout_returns_timeout_error_and_terminates_subprocess() {
     assert!(
         saw_started,
         "sleeper never printed STARTED — shim was not actually spawned",
+    );
+    let pid = sleeper_pid.expect("sleeper STARTED line did not contain a parseable PID");
+    assert!(
+        wait_for_process_exit(pid),
+        "sleeper process (pid={pid}) still alive after timeout path returned",
     );
     // Sanity bound: the call must return well before the sleeper's 600s
     // sleep would naturally complete. Allow generous slack for slow CI.
@@ -172,14 +225,16 @@ fn cancellation_returns_cancelled_error_and_terminates_subprocess() {
     });
 
     let mut saw_started = false;
+    let mut sleeper_pid: Option<u32> = None;
     let started = Instant::now();
     let result = invoke::run_cargo_streaming_with_timeout(
         &["check"],
         None,
         None, // no wall-clock cap — cancellation is the only exit path
         &mut |line| {
-            if line.starts_with("STARTED ") {
+            if let Some(rest) = line.strip_prefix("STARTED ") {
                 saw_started = true;
+                sleeper_pid = rest.trim().parse::<u32>().ok();
             }
         },
     );
@@ -198,6 +253,11 @@ fn cancellation_returns_cancelled_error_and_terminates_subprocess() {
     assert!(
         saw_started,
         "sleeper never printed STARTED — shim was not actually spawned",
+    );
+    let pid = sleeper_pid.expect("sleeper STARTED line did not contain a parseable PID");
+    assert!(
+        wait_for_process_exit(pid),
+        "sleeper process (pid={pid}) still alive after cancel path returned",
     );
     assert!(
         elapsed < Duration::from_secs(30),

@@ -397,10 +397,12 @@ impl std::error::Error for CancelledError {}
 /// Error returned when a cargo operation exceeds its `timeout_secs` budget.
 #[derive(Debug)]
 pub struct TimeoutError {
-    /// Actual wall-clock duration measured from subprocess spawn until the
-    /// timeout trigger fired. This will be slightly greater than the
-    /// configured budget due to the polling interval used to detect the
-    /// deadline.
+    /// Actual wall-clock duration measured from the start of the overall
+    /// operation (before the first subprocess spawn) until the timeout
+    /// trigger fired. This spans every attempt including any retry
+    /// backoff sleeps, not just the currently-running subprocess, so the
+    /// value will be slightly greater than the configured budget due to
+    /// the polling interval used to detect the deadline.
     pub elapsed: Duration,
 }
 
@@ -580,24 +582,23 @@ impl ManagedChild {
         }
         let child = cmd.spawn()?;
         #[cfg(windows)]
-        let job = match job_object::Job::new_kill_on_close()
-            .and_then(|j| j.assign(&child).map(|_| j))
-        {
-            Ok(j) => Some(j),
-            Err(e) => {
-                emit_mcp_log(
-                    "warning",
-                    &format!(
-                        "failed to assign cargo subprocess (pid={}) to a Job Object: {e}. \
+        let job =
+            match job_object::Job::new_kill_on_close().and_then(|j| j.assign(&child).map(|_| j)) {
+                Ok(j) => Some(j),
+                Err(e) => {
+                    emit_mcp_log(
+                        "warning",
+                        &format!(
+                            "failed to assign cargo subprocess (pid={}) to a Job Object: {e}. \
                          Cancellation/timeout will fall back to taskkill /T /F, which is \
                          best-effort and may leave grandchildren running if they detach \
                          from the parent before kill.",
-                        child.id(),
-                    ),
-                );
-                None
-            }
-        };
+                            child.id(),
+                        ),
+                    );
+                    None
+                }
+            };
         Ok(Self {
             child,
             #[cfg(windows)]
@@ -804,8 +805,20 @@ pub fn run_cargo_streaming_with_timeout(
                 elapsed: overall_start.elapsed(),
             }));
         }
-        let mut out =
-            run_cargo_streaming_once(args, working_dir, attempt_budget, on_stdout_line)?;
+        let mut out = run_cargo_streaming_once(args, working_dir, attempt_budget, on_stdout_line)
+            .map_err(|e| -> Box<dyn std::error::Error> {
+            // Normalize any timeout from the inner attempt to the
+            // overall wall-clock elapsed across all attempts and backoff
+            // sleeps, so callers see a consistent value regardless of
+            // which branch detected the deadline.
+            if e.is::<TimeoutError>() {
+                Box::new(TimeoutError {
+                    elapsed: overall_start.elapsed(),
+                })
+            } else {
+                e
+            }
+        })?;
         let busy = out.exit_code != 0
             && (is_transient_busy_error(&out.stderr) || is_transient_busy_error(&out.stdout));
         if !busy {

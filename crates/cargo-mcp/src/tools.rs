@@ -157,10 +157,7 @@ fn opt_timeout(args: &Value) -> Result<Option<std::time::Duration>, Box<dyn std:
         return Ok(None);
     }
     let Some(n) = v.as_number() else {
-        return Err(format!(
-            "timeout_secs must be a non-negative integer, got {v}"
-        )
-        .into());
+        return Err(format!("timeout_secs must be a non-negative integer, got {v}").into());
     };
     let secs = n.as_u64().ok_or_else(|| -> Box<dyn std::error::Error> {
         format!("timeout_secs must be a non-negative integer, got {n}").into()
