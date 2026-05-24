@@ -143,21 +143,32 @@ fn opt_bool(args: &Value, key: &str) -> bool {
 /// Extract an optional wall-clock timeout (`timeout_secs`) from JSON args.
 ///
 /// Accepts non-negative integer seconds (the tool schemas declare
-/// `minimum: 0`). Zero or missing returns `Ok(None)` ("wait forever").
-/// A negative value is rejected with an error rather than silently
-/// coerced, so bad client input surfaces immediately instead of
-/// producing an unexpectedly unbounded run.
+/// `minimum: 0`). Missing, `null`, or zero returns `Ok(None)`
+/// ("wait forever"). Any other shape — a negative integer, a float,
+/// a string, a boolean, an integer outside `u64`, etc. — is rejected
+/// with an error rather than silently coerced or dropped, so bad
+/// client input surfaces immediately instead of producing an
+/// unexpectedly unbounded run.
 fn opt_timeout(args: &Value) -> Result<Option<std::time::Duration>, Box<dyn std::error::Error>> {
-    let Some(secs) = args.get("timeout_secs").and_then(|v| v.as_i64()) else {
+    let Some(v) = args.get("timeout_secs") else {
         return Ok(None);
     };
-    if secs < 0 {
-        return Err(format!("timeout_secs must be >= 0, got {secs}").into());
+    if v.is_null() {
+        return Ok(None);
     }
+    let Some(n) = v.as_number() else {
+        return Err(format!(
+            "timeout_secs must be a non-negative integer, got {v}"
+        )
+        .into());
+    };
+    let secs = n.as_u64().ok_or_else(|| -> Box<dyn std::error::Error> {
+        format!("timeout_secs must be a non-negative integer, got {n}").into()
+    })?;
     if secs == 0 {
         return Ok(None);
     }
-    Ok(Some(std::time::Duration::from_secs(secs as u64)))
+    Ok(Some(std::time::Duration::from_secs(secs)))
 }
 
 /// Filter `--message-format=json` NDJSON output to keep only actionable lines.

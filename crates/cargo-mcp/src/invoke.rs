@@ -961,12 +961,21 @@ fn run_cargo_streaming_once(
     match outcome {
         WaitOutcome::Cancelled => {
             child.kill_tree();
+            // Drop the receiver before joining so the stdout reader thread,
+            // which may be parked in a bounded `tx.send`, observes a
+            // disconnect and exits instead of blocking `join` forever.
+            drop(rx);
             let _ = stdout_thread.join();
             let _ = stderr_thread.join();
             return Err(Box::new(CancelledError));
         }
         WaitOutcome::TimedOut(elapsed) => {
             child.kill_tree();
+            // Drop the receiver before joining for the same reason as the
+            // cancellation branch above: the stdout reader thread may be
+            // parked in a bounded `tx.send`, and needs to observe a
+            // disconnect to exit instead of blocking `join` forever.
+            drop(rx);
             let _ = stdout_thread.join();
             let _ = stderr_thread.join();
             return Err(Box::new(TimeoutError { elapsed }));
