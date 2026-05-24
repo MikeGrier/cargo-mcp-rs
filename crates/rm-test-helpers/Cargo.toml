@@ -18,6 +18,12 @@ path = "src/hold_file.rs"
 name = "rm-target-sniffer"
 path = "src/target_sniffer.rs"
 
+# Cross-platform sleeper used as a fake `cargo` shim by cargo-mcp's
+# `invoke_timeout` integration test.
+[[bin]]
+name = "rm-sleeper"
+path = "src/sleeper.rs"
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",

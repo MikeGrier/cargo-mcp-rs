@@ -580,9 +580,24 @@ impl ManagedChild {
         }
         let child = cmd.spawn()?;
         #[cfg(windows)]
-        let job = job_object::Job::new_kill_on_close()
+        let job = match job_object::Job::new_kill_on_close()
             .and_then(|j| j.assign(&child).map(|_| j))
-            .ok();
+        {
+            Ok(j) => Some(j),
+            Err(e) => {
+                emit_mcp_log(
+                    "warning",
+                    &format!(
+                        "failed to assign cargo subprocess (pid={}) to a Job Object: {e}. \
+                         Cancellation/timeout will fall back to taskkill /T /F, which is \
+                         best-effort and may leave grandchildren running if they detach \
+                         from the parent before kill.",
+                        child.id(),
+                    ),
+                );
+                None
+            }
+        };
         Ok(Self {
             child,
             #[cfg(windows)]
@@ -619,8 +634,24 @@ impl ManagedChild {
         }
         #[cfg(windows)]
         {
-            // Closing the job (drop) triggers KILL_ON_JOB_CLOSE.
-            self.job = None;
+            // Closing the job (drop) triggers KILL_ON_JOB_CLOSE. If we
+            // never managed to assign the child to a job (see the warning
+            // emitted in `spawn`), fall back to `taskkill /T /F /PID`,
+            // which walks the parent/child tree the Windows scheduler
+            // tracks and is the standard escape hatch when Job Objects
+            // are unavailable (e.g. running inside another job that
+            // disallows breakaway).
+            if self.job.is_some() {
+                self.job = None;
+            } else {
+                let pid = self.child.id();
+                let _ = Command::new("taskkill")
+                    .args(["/T", "/F", "/PID", &pid.to_string()])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
         }
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -754,9 +785,27 @@ pub fn run_cargo_streaming_with_timeout(
     };
     let delay = Duration::from_millis(RETRY_DELAY_MS.load(Ordering::Relaxed));
 
+    // Compute a single overall deadline so retries + backoff cannot exceed
+    // the caller's wall-clock budget. Each attempt gets only the remaining
+    // slice; sleeps between attempts are also bounded by it.
+    let overall_start = Instant::now();
+    let overall_deadline = timeout.and_then(|t| overall_start.checked_add(t));
+    let remaining = |now: Instant| -> Option<Duration> {
+        overall_deadline.map(|d| d.saturating_duration_since(now))
+    };
+
     let mut last: Option<CargoOutput> = None;
     for attempt in 1..=max_attempts {
-        let mut out = run_cargo_streaming_once(args, working_dir, timeout, on_stdout_line)?;
+        let attempt_budget = remaining(Instant::now());
+        if let Some(r) = attempt_budget
+            && r.is_zero()
+        {
+            return Err(Box::new(TimeoutError {
+                elapsed: overall_start.elapsed(),
+            }));
+        }
+        let mut out =
+            run_cargo_streaming_once(args, working_dir, attempt_budget, on_stdout_line)?;
         let busy = out.exit_code != 0
             && (is_transient_busy_error(&out.stderr) || is_transient_busy_error(&out.stdout));
         if !busy {
@@ -788,16 +837,29 @@ pub fn run_cargo_streaming_with_timeout(
         );
         on_stdout_line(&msg);
         last = Some(out);
-        // Honour cancellation while sleeping.
+        // Honour cancellation and the overall deadline while sleeping.
         let step = Duration::from_millis(50);
-        let mut remaining = delay;
-        while remaining > Duration::ZERO {
+        let mut sleep_left = delay;
+        while sleep_left > Duration::ZERO {
             if is_cancelled() {
                 return Err(Box::new(CancelledError));
             }
-            let s = std::cmp::min(step, remaining);
+            if let Some(r) = remaining(Instant::now())
+                && r.is_zero()
+            {
+                return Err(Box::new(TimeoutError {
+                    elapsed: overall_start.elapsed(),
+                }));
+            }
+            let mut s = std::cmp::min(step, sleep_left);
+            if let Some(r) = remaining(Instant::now()) {
+                s = std::cmp::min(s, r);
+            }
+            if s.is_zero() {
+                s = Duration::from_millis(1);
+            }
             thread::sleep(s);
-            remaining -= s;
+            sleep_left = sleep_left.saturating_sub(s);
         }
     }
     // Unreachable (loop returns inside), but keep a safe fallback.
