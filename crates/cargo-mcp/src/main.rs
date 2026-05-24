@@ -473,6 +473,19 @@ fn handle_tool_call(
         .and_then(|m| m.get("progressToken"))
         .cloned();
 
+    // Diagnostic trace of the raw tools/call as received over JSON-RPC,
+    // logged BEFORE dispatch. This makes it possible to prove what `name`
+    // the client actually sent, independent of any client-side UI label.
+    log_info(
+        writer,
+        format!(
+            "tools/call received: id={} name={:?} arguments={}",
+            serde_json::to_string(request_id).unwrap_or_else(|_| "<unrepr>".into()),
+            name,
+            serde_json::to_string(&args).unwrap_or_else(|_| "<unrepr>".into()),
+        ),
+    );
+
     let result = if let Some(ref token) = progress_token {
         let mut notification_count: u32 = 0;
         // Derive a human-friendly verb ("check", "build", ...) from the tool

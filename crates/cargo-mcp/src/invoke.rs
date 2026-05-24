@@ -40,11 +40,12 @@
 //! ## Logging
 //!
 //! Each invocation writes a one-line `cargo-mcp: invoking <path> ...` record
-//! to stderr (which VS Code surfaces in the *MCP Logs: cargo* output channel)
-//! so the resolved binary is visible without enabling any extra tracing.
+//! to the MCP `notifications/message` channel at `info` level, so the
+//! resolved binary is visible in the client's MCP output pane without
+//! enabling any extra tracing.
 
 use std::cell::RefCell;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{
@@ -326,26 +327,55 @@ pub fn find_toolchain_file(start: &Path) -> Option<PathBuf> {
     None
 }
 
-/// Emit a one-line diagnostic to stderr describing a cargo invocation.
+/// Emit a one-line diagnostic describing a cargo invocation.
 ///
-/// VS Code captures the cargo-mcp server's stderr in the "MCP Logs: cargo"
-/// output channel, so this surfaces "which cargo did I just run" without
-/// requiring the caller to wire through an MCP log channel.
+/// Routed through the MCP `notifications/message` channel so the client
+/// displays it at the intended level (`info` for the invocation record,
+/// `warning` for the no-sibling-rustup advisory) in its MCP output pane,
+/// rather than as untyped stderr output.
 fn log_invocation(path: &Path, source: ResolutionSource, working_dir: Option<&str>, args: &[&str]) {
-    eprintln!(
-        "cargo-mcp: invoking {} (source={:?}, step={}) cwd={:?} args={:?}",
-        path.display(),
-        source,
-        source.step(),
-        working_dir.unwrap_or("."),
-        args,
+    emit_mcp_log(
+        "info",
+        &format!(
+            "invoking {} (source={:?}, step={}) cwd={:?} args={:?}",
+            path.display(),
+            source,
+            source.step(),
+            working_dir.unwrap_or("."),
+            args,
+        ),
     );
     if matches!(source, ResolutionSource::RustupProxyNoSibling) {
-        eprintln!(
-            "cargo-mcp: warning: {} exists but no sibling rustup found \
-             — rust-toolchain.toml may not be honoured",
-            path.display(),
+        emit_mcp_log(
+            "warning",
+            &format!(
+                "{} exists but no sibling rustup found — rust-toolchain.toml may not be honoured",
+                path.display(),
+            ),
         );
+    }
+}
+
+/// Send a `notifications/message` JSON-RPC frame to stdout.
+///
+/// `io::Stdout` uses a reentrant mutex, so locking here is safe even when
+/// the main loop is already holding the stdout lock between message reads.
+fn emit_mcp_log(level: &str, message: &str) {
+    let frame = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/message",
+        "params": {
+            "level": level,
+            "logger": "cargo-mcp",
+            "data": format!("cargo-mcp: {message}"),
+        },
+    });
+    if let Ok(mut s) = serde_json::to_string(&frame) {
+        s.push('\n');
+        let stdout = std::io::stdout();
+        let mut guard = stdout.lock();
+        let _ = guard.write_all(s.as_bytes());
+        let _ = guard.flush();
     }
 }
 
