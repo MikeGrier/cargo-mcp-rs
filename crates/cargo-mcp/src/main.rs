@@ -686,7 +686,16 @@ impl BuildTracker {
         }
         let v = match serde_json::from_str::<Value>(line) {
             Ok(v) => v,
-            Err(_) => return String::new(),
+            Err(_) => {
+                // Non-JSON line from cargo test: libtest harness output
+                // ("running N tests", "test foo ... ok", etc.) or captured
+                // println! replays. Forward verbatim so the MCP client can
+                // show test progress in real time.
+                if line.is_empty() {
+                    return String::new();
+                }
+                return line.to_owned();
+            }
         };
         match v.get("reason").and_then(|r| r.as_str()) {
             Some("compiler-artifact") => {

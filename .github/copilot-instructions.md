@@ -46,6 +46,25 @@ terminal for cargo just because a previous step used the terminal.
 - **`cargo_publish`** — always run with `dry_run: true` first to validate;
   only publish for real when the dry-run succeeds.
 
+### Reading cargo_test output
+
+`cargo_test` returns a strict NDJSON stream. Parse it line-by-line; every
+non-blank line is a JSON object. The `reason` field identifies the record type:
+
+| `reason` | Content | Key fields |
+|---|---|---|
+| `x-cargo-mcp-invocation` | Effective command and working dir (first line) | `argv`, `cwd` |
+| `compiler-message` | Compilation error or warning | `message` (rustc diagnostic) |
+| `build-finished` | Build phase outcome | `success` (bool) |
+| `x-cargo-mcp-test-output` | One line of libtest harness output or captured `println!` | `text` |
+| `x-cargo-mcp-stderr` | `eprintln!` and other test stderr (when non-empty) | `text` |
+| *(last line)* | Exit status | `status` (`"success"` or `"error"`), `exit_code` (on error) |
+
+`println!` inside tests is captured by libtest and replayed as
+`x-cargo-mcp-test-output` lines only when the test fails (standard
+libtest behaviour). `eprintln!` bypasses libtest capture and always
+appears in `x-cargo-mcp-stderr`.
+
 ## File encoding
 
 Source files in this repository may contain non-ASCII characters. When editing
