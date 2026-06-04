@@ -119,13 +119,14 @@ for cargo just because a previous step used the terminal.\n\n\
 | `cargo_setup` | *(no terminal equivalent)* |\n\
 | `cargo_diagnostic` | *(no terminal equivalent)* |\n\n\
 ### cargo_test — timeout\n\n\
-`cargo_test` has a server-side default timeout configured by the\n\
-`cargo-mcp.test.timeoutSecs` VS Code setting (default: **30 seconds**).\n\
-- You do NOT need to pass `timeout_secs` for a normal test run; the default\n\
-  applies automatically.\n\
-- Pass `timeout_secs: N` to override the default for a single run.\n\
-- Pass `timeout_secs: 0` to disable the timeout entirely for a single run\n\
-  (e.g. a test suite known to take several minutes).\n\n\
+When launched by the VS Code extension, `cargo_test` applies a server-side\n\
+default timeout from the `cargo-mcp.test.timeoutSecs` setting (**30 seconds**\n\
+by default). Without the extension (or with `cargo-mcp.test.timeoutSecs: 0`),\n\
+the server has no default timeout.\n\
+- Omit `timeout_secs` to let the server default apply.\n\
+- Pass `timeout_secs: N` to use a specific budget for this run.\n\
+- Pass `timeout_secs: 0` to disable the timeout for this run, regardless of\n\
+  the server default.\n\n\
 ### Reading cargo_test output\n\n\
 `cargo_test` returns a strict NDJSON stream. Parse it line-by-line; every\n\
 non-blank line is a JSON object. The `reason` field identifies the record type:\n\n\
@@ -734,10 +735,10 @@ pub fn list() -> Value {
                         "description":
                             "Wall-clock budget in seconds for this test run. When the budget \
                              elapses, cargo and the entire subprocess tree (rustc, test binaries, \
-                             build scripts) are terminated. If omitted, the server default \
-                             configured by the `cargo-mcp.test.timeoutSecs` VS Code setting is \
-                             used (30 seconds by default). Pass 0 to disable the timeout for \
-                             this run only."
+                             build scripts) are terminated. If omitted, the server-configured \
+                             default applies (30 seconds when launched by the VS Code extension; \
+                             no timeout otherwise). Pass 0 to disable the timeout for this run \
+                             regardless of the server default."
                     }
                 },
                 "required": []
@@ -1923,5 +1924,78 @@ mod tests {
         let h = invocation_header(&["fmt", "--check"], None);
         let v: Value = serde_json::from_str(h.trim_end()).unwrap();
         assert_eq!(v["cwd"], ".");
+    }
+
+    // ── opt_timeout_explicit + default_test_timeout tests ────────────────────
+
+    use std::sync::Mutex;
+    /// Serializes tests that read/write the process-global DEFAULT_TEST_TIMEOUT_SECS.
+    static DEFAULT_TIMEOUT_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn opt_timeout_explicit_absent_returns_none() {
+        let args = serde_json::json!({});
+        assert!(matches!(opt_timeout_explicit(&args), Ok(None)));
+    }
+
+    #[test]
+    fn opt_timeout_explicit_null_returns_none() {
+        let args = serde_json::json!({"timeout_secs": null});
+        assert!(matches!(opt_timeout_explicit(&args), Ok(None)));
+    }
+
+    #[test]
+    fn opt_timeout_explicit_zero_returns_some_none() {
+        let args = serde_json::json!({"timeout_secs": 0});
+        assert!(matches!(opt_timeout_explicit(&args), Ok(Some(None))));
+    }
+
+    #[test]
+    fn opt_timeout_explicit_positive_returns_duration() {
+        let args = serde_json::json!({"timeout_secs": 30});
+        match opt_timeout_explicit(&args) {
+            Ok(Some(Some(d))) => assert_eq!(d, std::time::Duration::from_secs(30)),
+            other => panic!("expected Ok(Some(Some(30s))), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn opt_timeout_explicit_invalid_returns_err() {
+        let args = serde_json::json!({"timeout_secs": "thirty"});
+        assert!(opt_timeout_explicit(&args).is_err());
+    }
+
+    /// Verify the three-state timeout selection used by `call_test`:
+    /// absent → server default; explicit 0 → no timeout; positive → caller budget.
+    #[test]
+    fn call_test_timeout_selection_covers_all_three_states() {
+        let _g = DEFAULT_TIMEOUT_TEST_LOCK.lock().unwrap();
+        set_default_test_timeout(Some(30));
+
+        // State 1: absent → server default applies
+        let absent = serde_json::json!({});
+        let t = match opt_timeout_explicit(&absent).unwrap() {
+            None => default_test_timeout(),
+            Some(explicit) => explicit,
+        };
+        assert_eq!(t, Some(std::time::Duration::from_secs(30)));
+
+        // State 2: explicit 0 → no timeout, even with server default set
+        let zero = serde_json::json!({"timeout_secs": 0});
+        let t = match opt_timeout_explicit(&zero).unwrap() {
+            None => default_test_timeout(),
+            Some(explicit) => explicit,
+        };
+        assert_eq!(t, None);
+
+        // State 3: explicit positive → caller's budget wins over server default
+        let sixty = serde_json::json!({"timeout_secs": 60});
+        let t = match opt_timeout_explicit(&sixty).unwrap() {
+            None => default_test_timeout(),
+            Some(explicit) => explicit,
+        };
+        assert_eq!(t, Some(std::time::Duration::from_secs(60)));
+
+        set_default_test_timeout(None); // restore
     }
 }
