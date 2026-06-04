@@ -1134,18 +1134,32 @@ pub fn run_cargo_to_file(
 
 // ── tests ─────────────────────────────────────────────────────────────────────
 
+/// Serializes every test (unit **or** integration) that reads or mutates the
+/// process-global environment variables consulted by [`resolve_cargo_binary`]
+/// and [`resolve_rustc_binary`]: `CARGO`, `RUSTC`, `CARGO_HOME`, `HOME`,
+/// `USERPROFILE`.
+///
+/// Exposed `pub(crate)` so integration test binaries that mount `invoke.rs`
+/// via `#[path]` can acquire the same lock, preventing a race where a unit
+/// test temporarily sets `CARGO` to a fake path while an integration test is
+/// mid-way through `run_cargo_streaming_with_timeout` calling
+/// `resolve_cargo_binary`.
+#[cfg(test)]
+pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     //! Tests for [`resolve_cargo_binary`] et al.
     //!
     //! These tests mutate process-global environment variables, so they
-    //! serialize through [`ENV_LOCK`]. Each test snapshots the relevant vars
-    //! up front and restores them on drop via [`EnvGuard`].
+    //! serialize through [`super::TEST_ENV_LOCK`]. Each test snapshots the
+    //! relevant vars up front and restores them on drop via [`EnvGuard`].
     use super::*;
     use std::ffi::{OsStr, OsString};
     use std::sync::Mutex;
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    // Convenience alias so test bodies can still write `ENV_LOCK`.
+    use super::TEST_ENV_LOCK as ENV_LOCK;
 
     /// Serializes any test that mutates the global `RETRY_*` atomics, so
     /// parallel test execution can't race on shared retry config.

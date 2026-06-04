@@ -55,6 +55,9 @@ struct StartupConfig {
     retry_delay_ms: u64,
     retry_max_attempts: u32,
     rm_lookup_enabled: bool,
+    /// Default wall-clock timeout for `cargo_test` calls that do not supply
+    /// an explicit `timeout_secs`. `None` means no default (wait forever).
+    test_timeout_secs: Option<u64>,
     warnings: Vec<String>,
 }
 
@@ -74,6 +77,7 @@ fn parse_config() -> StartupConfig {
         retry_delay_ms: 500,
         retry_max_attempts: 3,
         rm_lookup_enabled: false,
+        test_timeout_secs: None,
         warnings: Vec::new(),
     };
     for arg in std::env::args_os().skip(1) {
@@ -138,6 +142,17 @@ fn parse_config() -> StartupConfig {
                     ));
                 }
             }
+        } else if let Some(rest) = s.strip_prefix("--test-timeout-secs=") {
+            match rest.parse::<u64>() {
+                Ok(0) => cfg.test_timeout_secs = None,
+                Ok(n) => cfg.test_timeout_secs = Some(n),
+                Err(_) => {
+                    cfg.warnings.push(format!(
+                        "ignoring invalid --test-timeout-secs value: {rest:?} \
+                         (expected a non-negative integer; 0 disables the default timeout)"
+                    ));
+                }
+            }
         }
     }
     cfg
@@ -199,6 +214,7 @@ fn main() {
         cfg.retry_max_attempts,
     );
     invoke::set_rm_lookup_enabled(cfg.rm_lookup_enabled);
+    tools::set_default_test_timeout(cfg.test_timeout_secs);
 
     let stdin = io::stdin();
     let stdout = io::stdout();

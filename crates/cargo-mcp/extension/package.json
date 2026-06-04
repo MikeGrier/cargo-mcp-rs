@@ -121,6 +121,12 @@
                     "maximum": 10,
                     "markdownDescription": "Maximum total attempts (initial try + retries) when `#cargo-mcp.retry.onBusy#` is enabled. Default is `3`."
                 },
+                "cargo-mcp.test.timeoutSecs": {
+                    "type": "number",
+                    "default": 30,
+                    "minimum": 0,
+                    "markdownDescription": "Default wall-clock timeout in seconds applied to every `cargo_test` call that does not supply an explicit `timeout_secs`. When the budget elapses, cargo and all spawned test binaries are terminated. Set to `0` to disable the default timeout and allow test runs to run indefinitely."
+                },
                 "cargo-mcp.extraArgs": {
                     "type": "array",
                     "items": {
