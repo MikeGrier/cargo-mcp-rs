@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.5.7](https://github.com/MikeGrier/cargo-mcp-rs/compare/v0.5.6...v0.5.7) (2026-06-04)
+
+
+### Bug Fixes
+
+* clarify timeout default scope and add unit tests for opt_timeout_explicit ([fa404a3](https://github.com/MikeGrier/cargo-mcp-rs/commit/fa404a34cf8d15acf20a8399846429e520e5310b))
+* distinguish explicit timeout_secs:0 from omitted in cargo_test\n\nAdd opt_timeout_explicit() returning Option&lt;Option&lt;Duration&gt;&gt; so\ncall_test() can tell the caller explicitly disabled the timeout\n(Some(None)) from the caller not supplying the field at all (None).\nWhen absent, the server default (cargo-mcp.test.timeoutSecs) applies;\nwhen explicitly 0, no timeout is used for that run regardless of the\nserver default. ([f7dd1c7](https://github.com/MikeGrier/cargo-mcp-rs/commit/f7dd1c78e6a11ee66c2f77db6d2c0ffc343e4e0e))
+* expose cargo_test timeout options ([b0115fb](https://github.com/MikeGrier/cargo-mcp-rs/commit/b0115fbe9577d01a5d425c00c0b8c41bc5738ebc))
+* expose cargo_test timeout options ([4d8d918](https://github.com/MikeGrier/cargo-mcp-rs/commit/4d8d918cb3f5116bf119341caf8c6902c14d8d93))
+
 ## [0.5.6](https://github.com/MikeGrier/cargo-mcp-rs/compare/v0.5.5...v0.5.6) (2026-06-04)
 
 
