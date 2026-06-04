@@ -68,7 +68,28 @@ use crate::{
     suggest::{self, Suggestion},
 };
 
-use std::sync::{Arc, atomic::AtomicBool};
+use std::sync::{Arc, atomic::{AtomicBool, AtomicU64, Ordering}};
+
+/// Default wall-clock timeout for `cargo_test` when the caller does not
+/// supply an explicit `timeout_secs`. `0` means no default (wait forever).
+/// Set once at startup via [`set_default_test_timeout`].
+static DEFAULT_TEST_TIMEOUT_SECS: AtomicU64 = AtomicU64::new(0);
+
+/// Configure the per-test-run default timeout. Called once from `main` after
+/// CLI parse. `None` (or `Some(0)`) means no default timeout.
+pub fn set_default_test_timeout(secs: Option<u64>) {
+    DEFAULT_TEST_TIMEOUT_SECS.store(secs.unwrap_or(0), Ordering::Relaxed);
+}
+
+/// Returns the configured default test timeout, or `None` if no default is set.
+fn default_test_timeout() -> Option<std::time::Duration> {
+    let secs = DEFAULT_TEST_TIMEOUT_SECS.load(Ordering::Relaxed);
+    if secs > 0 {
+        Some(std::time::Duration::from_secs(secs))
+    } else {
+        None
+    }
+}
 
 /// The section appended to (or used to create) `.github/copilot-instructions.md`
 /// during `cargo_setup`. Kept here so the tool description and the written
@@ -97,6 +118,14 @@ for cargo just because a previous step used the terminal.\n\n\
 | `cargo_publish` | `cargo publish` |\n\
 | `cargo_setup` | *(no terminal equivalent)* |\n\
 | `cargo_diagnostic` | *(no terminal equivalent)* |\n\n\
+### cargo_test — timeout\n\n\
+`cargo_test` has a server-side default timeout configured by the\n\
+`cargo-mcp.test.timeoutSecs` VS Code setting (default: **30 seconds**).\n\
+- You do NOT need to pass `timeout_secs` for a normal test run; the default\n\
+  applies automatically.\n\
+- Pass `timeout_secs: N` to override the default for a single run.\n\
+- Pass `timeout_secs: 0` to disable the timeout entirely for a single run\n\
+  (e.g. a test suite known to take several minutes).\n\n\
 ### Reading cargo_test output\n\n\
 `cargo_test` returns a strict NDJSON stream. Parse it line-by-line; every\n\
 non-blank line is a JSON object. The `reason` field identifies the record type:\n\n\
@@ -678,11 +707,12 @@ pub fn list() -> Value {
                         "type": "integer",
                         "minimum": 0,
                         "description":
-                            "Optional wall-clock budget in seconds. When the budget elapses, \
-                             cargo and the entire subprocess tree (rustc, test binaries, \
-                             build scripts) are terminated and the call returns a timeout \
-                             error. 0 or omitted means no timeout (the default). Recommended \
-                             for bounding runaway test runs."
+                            "Wall-clock budget in seconds for this test run. When the budget \
+                             elapses, cargo and the entire subprocess tree (rustc, test binaries, \
+                             build scripts) are terminated. If omitted, the server default \
+                             configured by the `cargo-mcp.test.timeoutSecs` VS Code setting is \
+                             used (30 seconds by default). Pass 0 to disable the timeout for \
+                             this run only."
                     }
                 },
                 "required": []
@@ -1416,7 +1446,11 @@ fn call_test(
             argv.push("--exact");
         }
     }
-    let out = run_cargo_maybe_streaming(&argv, wd, opt_timeout(args)?, on_progress)?;
+    // Caller-supplied timeout wins; fall back to the server-configured default
+    // (cargo-mcp.test.timeoutSecs VS Code setting, default 30s). Passing
+    // timeout_secs: 0 explicitly means "no limit for this run".
+    let timeout = opt_timeout(args)?.or_else(default_test_timeout);
+    let out = run_cargo_maybe_streaming(&argv, wd, timeout, on_progress)?;
     // Test output is a mix: JSON from compilation, text from the test harness.
     // Use format_test_output so that non-JSON lines (libtest harness text,
     // captured println! replays) are preserved as x-cargo-mcp-test-output

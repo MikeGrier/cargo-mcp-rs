@@ -94,6 +94,14 @@ function buildArgs(): string[] {
         args.push("--unsafe-windows-rm=true");
     }
 
+    // Default timeout for cargo_test runs. 0 means no timeout. The server's
+    // built-in default is no timeout, so we always emit this flag when the
+    // value is positive so the user's setting takes effect.
+    const testTimeoutSecs = config.get<number>("test.timeoutSecs", 30) ?? 30;
+    if (typeof testTimeoutSecs === "number" && testTimeoutSecs > 0) {
+        args.push(`--test-timeout-secs=${Math.round(testTimeoutSecs)}`);
+    }
+
     const extraArgs = config.get<string[]>("extraArgs", []) ?? [];
     for (const a of extraArgs) {
         if (typeof a === "string" && a.length > 0) {

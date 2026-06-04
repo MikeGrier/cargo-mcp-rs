@@ -157,7 +157,10 @@ impl Drop for CargoEnvGuard {
 
 #[test]
 fn timeout_returns_timeout_error_and_terminates_subprocess() {
-    let _g = CARGO_ENV_LOCK.lock().unwrap();
+    // Acquire both locks to prevent unit tests from transiently changing
+    // CARGO while resolve_cargo_binary runs inside the streaming call.
+    let _cargo_g = CARGO_ENV_LOCK.lock().unwrap();
+    let _env_g = invoke::TEST_ENV_LOCK.lock().unwrap();
     let sleeper = build_sleeper();
     let _env = CargoEnvGuard::set(&sleeper);
 
@@ -209,18 +212,27 @@ fn timeout_returns_timeout_error_and_terminates_subprocess() {
 
 #[test]
 fn cancellation_returns_cancelled_error_and_terminates_subprocess() {
-    let _g = CARGO_ENV_LOCK.lock().unwrap();
+    // Acquire both locks to prevent unit tests from transiently changing
+    // CARGO while resolve_cargo_binary runs inside the streaming call.
+    let _cargo_g = CARGO_ENV_LOCK.lock().unwrap();
+    let _env_g = invoke::TEST_ENV_LOCK.lock().unwrap();
     let sleeper = build_sleeper();
     let _env = CargoEnvGuard::set(&sleeper);
 
     let token = Arc::new(AtomicBool::new(false));
     invoke::set_cancel_token(Some(token.clone()));
 
-    // Flip the cancel token from a sidecar thread shortly after the
-    // sleeper has had time to spawn and emit STARTED.
+    // Cancel from a sidecar thread, but only AFTER the streaming callback
+    // has observed the STARTED line.  A fixed-delay approach (e.g. 500ms)
+    // races with spawn latency: the cancel check runs at the *top* of the
+    // poll loop, so if the token fires before the STARTED line is dequeued
+    // the line is discarded (rx is dropped on the cancel path) and
+    // saw_started stays false even though we correctly get CancelledError.
+    let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
     let token_setter = token.clone();
     let setter = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(500));
+        // Wait until STARTED is confirmed received; 30s is a generous CI cap.
+        let _ = started_rx.recv_timeout(Duration::from_secs(30));
         token_setter.store(true, Ordering::Release);
     });
 
@@ -235,6 +247,9 @@ fn cancellation_returns_cancelled_error_and_terminates_subprocess() {
             if let Some(rest) = line.strip_prefix("STARTED ") {
                 saw_started = true;
                 sleeper_pid = rest.trim().parse::<u32>().ok();
+                // Signal the setter thread; it will set the cancel token
+                // now that we know the callback has processed STARTED.
+                let _ = started_tx.send(());
             }
         },
     );

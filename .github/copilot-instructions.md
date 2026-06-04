@@ -46,6 +46,16 @@ terminal for cargo just because a previous step used the terminal.
 - **`cargo_publish`** — always run with `dry_run: true` first to validate;
   only publish for real when the dry-run succeeds.
 
+### cargo_test — timeout
+
+`cargo_test` has a server-side default timeout configured by the
+`cargo-mcp.test.timeoutSecs` VS Code setting (default: **30 seconds**).
+- You do NOT need to pass `timeout_secs` for a normal test run; the default
+  applies automatically.
+- Pass `timeout_secs: N` to override the default for a single run.
+- Pass `timeout_secs: 0` to disable the timeout entirely for a single run
+  (e.g. a test suite known to take several minutes).
+
 ### Reading cargo_test output
 
 `cargo_test` returns a strict NDJSON stream. Parse it line-by-line; every
