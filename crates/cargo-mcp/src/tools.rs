@@ -221,6 +221,31 @@ fn opt_timeout(args: &Value) -> Result<Option<std::time::Duration>, Box<dyn std:
     Ok(Some(std::time::Duration::from_secs(secs)))
 }
 
+/// Like [`opt_timeout`] but distinguishes three states:
+/// - `Ok(None)` — key absent or null (caller did not supply a value)
+/// - `Ok(Some(None))` — explicitly `0` (caller wants no timeout for this run)
+/// - `Ok(Some(Some(d)))` — positive value (caller-specified budget)
+fn opt_timeout_explicit(
+    args: &Value,
+) -> Result<Option<Option<std::time::Duration>>, Box<dyn std::error::Error>> {
+    let Some(v) = args.get("timeout_secs") else {
+        return Ok(None);
+    };
+    if v.is_null() {
+        return Ok(None);
+    }
+    let Some(n) = v.as_number() else {
+        return Err(format!("timeout_secs must be a non-negative integer, got {v}").into());
+    };
+    let secs = n.as_u64().ok_or_else(|| -> Box<dyn std::error::Error> {
+        format!("timeout_secs must be a non-negative integer, got {n}").into()
+    })?;
+    if secs == 0 {
+        return Ok(Some(None)); // explicit disable
+    }
+    Ok(Some(Some(std::time::Duration::from_secs(secs))))
+}
+
 /// Filter `--message-format=json` NDJSON output to keep only actionable lines.
 ///
 /// Retains only `compiler-message` lines (errors and warnings) and the
@@ -1447,9 +1472,15 @@ fn call_test(
         }
     }
     // Caller-supplied timeout wins; fall back to the server-configured default
-    // (cargo-mcp.test.timeoutSecs VS Code setting, default 30s). Passing
-    // timeout_secs: 0 explicitly means "no limit for this run".
-    let timeout = opt_timeout(args)?.or_else(default_test_timeout);
+    // (cargo-mcp.test.timeoutSecs VS Code setting, default 30s).
+    // opt_timeout_explicit distinguishes three cases:
+    //   None         → key absent: apply server default
+    //   Some(None)   → explicit 0: disable timeout for this run
+    //   Some(Some(d))→ explicit positive: use caller's budget
+    let timeout = match opt_timeout_explicit(args)? {
+        None => default_test_timeout(),           // use server default
+        Some(explicit) => explicit,               // caller wins (including None=disable)
+    };
     let out = run_cargo_maybe_streaming(&argv, wd, timeout, on_progress)?;
     // Test output is a mix: JSON from compilation, text from the test harness.
     // Use format_test_output so that non-JSON lines (libtest harness text,
