@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.5.6](https://github.com/MikeGrier/cargo-mcp-rs/compare/v0.5.5...v0.5.6) (2026-06-04)
+
+
+### Bug Fixes
+
+* preserve cargo test output in ndjson stream ([7e86bfe](https://github.com/MikeGrier/cargo-mcp-rs/commit/7e86bfe756c763e6e233dc335aea19bffa3e3b64))
+* preserve cargo test output in ndjson stream ([547dd3b](https://github.com/MikeGrier/cargo-mcp-rs/commit/547dd3bc54d0177312f6f0204187d61a7a206c8c))
+
 ## [0.5.5](https://github.com/MikeGrier/cargo-mcp-rs/compare/v0.5.4...v0.5.5) (2026-05-24)
 
 
