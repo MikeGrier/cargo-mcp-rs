@@ -43,10 +43,19 @@
 //! `--message-format=json`) visible in the MCP client's tool-result panel
 //! even when the original `arguments` JSON is sparse.
 //!
-//! For **JSON-mode tools** (`check`, `build`, `test`, `clippy`, `doc`,
+//! For **JSON-mode tools** (`check`, `build`, `clippy`, `doc`,
 //! `metadata`) the *entire* response is a clean NDJSON stream — the
 //! invocation header followed by one JSON object per line, so consumers
 //! can parse the whole response with a single line-by-line JSON parser.
+//!
+//! **`cargo_test`** is a special case: the test execution phase emits
+//! plain-text libtest output (harness lines, captured `println!` replays)
+//! that is not valid JSON. Each such line is wrapped in an
+//! `{"reason":"x-cargo-mcp-test-output","text":"..."}` NDJSON record so the
+//! stream remains strictly parseable line-by-line. `eprintln!` from test
+//! code bypasses libtest capture and is always included (even on success)
+//! as `{"reason":"x-cargo-mcp-stderr","text":"..."}`.
+//!
 //! For **text-mode tools** (`fmt`, `tree`, `clean`, `update`, `fix`,
 //! `add`, `remove`, `publish`) only the first line (the invocation
 //! header) is JSON; the body that follows is the cargo child's combined
@@ -87,7 +96,22 @@ for cargo just because a previous step used the terminal.\n\n\
 | `cargo_remove` | `cargo remove` |\n\
 | `cargo_publish` | `cargo publish` |\n\
 | `cargo_setup` | *(no terminal equivalent)* |\n\
-| `cargo_diagnostic` | *(no terminal equivalent)* |\n";
+| `cargo_diagnostic` | *(no terminal equivalent)* |\n\n\
+### Reading cargo_test output\n\n\
+`cargo_test` returns a strict NDJSON stream. Parse it line-by-line; every\n\
+non-blank line is a JSON object. The `reason` field identifies the record type:\n\n\
+| `reason` | Content | Key fields |\n\
+|---|---|---|\n\
+| `x-cargo-mcp-invocation` | Effective command and working dir (first line) | `argv`, `cwd` |\n\
+| `compiler-message` | Compilation error or warning | `message` (rustc diagnostic) |\n\
+| `build-finished` | Build phase outcome | `success` (bool) |\n\
+| `x-cargo-mcp-test-output` | One line of libtest harness output or captured `println!` | `text` |\n\
+| `x-cargo-mcp-stderr` | `eprintln!` and other test stderr (when non-empty) | `text` |\n\
+| *(last line)* | Exit status | `status` (`\"success\"` or `\"error\"`), `exit_code` (on error) |\n\n\
+`println!` inside tests is captured by libtest and replayed as\n\
+`x-cargo-mcp-test-output` lines only when the test fails (standard\n\
+libtest behaviour). `eprintln!` bypasses libtest capture and always\n\
+appears in `x-cargo-mcp-stderr`.\n";
 
 /// Description for the `working_dir` parameter, shared across every tool.
 ///
@@ -193,6 +217,47 @@ fn filter_build_ndjson(stdout: &str) -> String {
         .join("\n")
 }
 
+/// Like [`filter_build_ndjson`] but also preserves non-JSON stdout lines
+/// produced by the test binary (libtest harness output, captured `println!`
+/// replays on failure) by wrapping each one in an
+/// `x-cargo-mcp-test-output` NDJSON record.
+///
+/// The whole response remains a strict NDJSON stream — every non-blank line
+/// is a JSON object — so consumers can parse it with a single line-by-line
+/// JSON parser while still seeing the test output.
+fn filter_test_ndjson(stdout: &str) -> String {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            if line.trim().is_empty() {
+                return None;
+            }
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                // Same filtering as filter_build_ndjson: keep compiler
+                // diagnostics and the build-finished summary; drop artifact
+                // and build-script noise already delivered via streaming.
+                match v.get("reason").and_then(|r| r.as_str()) {
+                    Some("compiler-message") | Some("build-finished") => {
+                        Some(line.to_owned())
+                    }
+                    _ => None,
+                }
+            } else {
+                // Non-JSON line: libtest harness text or captured test stdout.
+                // Wrap in a custom NDJSON record so the stream stays parseable.
+                Some(
+                    serde_json::to_string(&serde_json::json!({
+                        "reason": TEST_OUTPUT_REASON,
+                        "text": line,
+                    }))
+                    .unwrap_or_else(|_| "{}".into()),
+                )
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Build a one-line **JSON invocation header** describing the cargo command
 /// that produced an output, so the LLM (or a human inspecting the tool
 /// result) can see the effective command and working directory at a glance —
@@ -231,6 +296,13 @@ pub(crate) const INVOCATION_REASON: &str = "x-cargo-mcp-invocation";
 /// stderr (where the Restart Manager holder report and other side-channel
 /// diagnostics land). Emitted only on failure when stderr is non-empty.
 pub(crate) const STDERR_REASON: &str = "x-cargo-mcp-stderr";
+
+/// Discriminator for the NDJSON record that wraps one line of test harness
+/// output (libtest's `running N tests`, `test foo ... ok`, `FAILED` lines,
+/// and any captured `println!` replays) in a `cargo_test` result.
+/// Each non-JSON stdout line is wrapped individually so the whole response
+/// remains a strict NDJSON stream parseable line-by-line.
+pub(crate) const TEST_OUTPUT_REASON: &str = "x-cargo-mcp-test-output";
 
 /// Format a [`CargoOutput`] from a `--message-format=json` invocation.
 ///
@@ -277,6 +349,50 @@ fn format_json_output(out: &CargoOutput, argv: &[&str], wd: Option<&str>) -> Str
         }
         parts.join("\n")
     };
+    format!("{header}{body}")
+}
+
+/// Format a [`CargoOutput`] from `cargo test --message-format=json`.
+///
+/// Behaves like [`format_json_output`] for the compilation phase (filtered
+/// NDJSON), but also preserves non-JSON stdout lines (libtest harness output,
+/// captured `println!` replays on failure) by wrapping each one in an
+/// `x-cargo-mcp-test-output` record.  Non-empty stderr — which carries any
+/// `eprintln!` output from test code, since libtest does **not** capture
+/// stderr — is always included regardless of exit code, wrapped in the usual
+/// `x-cargo-mcp-stderr` record.
+///
+/// Output shape (every line is a JSON object):
+/// - `x-cargo-mcp-invocation` — first line, effective command + cwd
+/// - `compiler-message` — zero or more compilation errors/warnings
+/// - `build-finished` — build phase outcome
+/// - `x-cargo-mcp-test-output` — zero or more test harness / captured output
+/// - `{"status":"success"}` or `{"status":"error","exit_code":N}` — trailer
+/// - `x-cargo-mcp-stderr` — optional, when stderr is non-empty
+fn format_test_output(out: &CargoOutput, argv: &[&str], wd: Option<&str>) -> String {
+    let header = invocation_header(argv, wd);
+    let filtered = filter_test_ndjson(&out.stdout);
+    let filtered = filtered.trim_end();
+    let trailer = if out.exit_code == 0 {
+        r#"{"status":"success"}"#.to_owned()
+    } else {
+        format!(r#"{{"status":"error","exit_code":{}}}"#, out.exit_code)
+    };
+    let stderr_trimmed = out.stderr.trim();
+    let mut parts: Vec<String> = Vec::with_capacity(3);
+    if !filtered.is_empty() {
+        parts.push(filtered.to_owned());
+    }
+    parts.push(trailer);
+    if !stderr_trimmed.is_empty() {
+        let stderr_record = serde_json::to_string(&serde_json::json!({
+            "reason": STDERR_REASON,
+            "text": stderr_trimmed,
+        }))
+        .unwrap_or_else(|_| "{}".into());
+        parts.push(stderr_record);
+    }
+    let body = parts.join("\n");
     format!("{header}{body}")
 }
 
@@ -488,8 +604,12 @@ pub fn list() -> Value {
             "description":
                 "ALWAYS use this tool instead of running `cargo test` in a terminal \
                  when working in a Rust/Cargo project. Executes the project's test \
-                 suite and returns compilation diagnostics as structured NDJSON plus \
-                 the test harness output (pass/fail counts and failure details). \
+                 suite and returns an NDJSON stream containing: compilation diagnostics \
+                 (reason=compiler-message), build outcome (reason=build-finished), \
+                 libtest harness output and captured println! replays \
+                 (reason=x-cargo-mcp-test-output, field: text), and any stderr \
+                 from test code such as eprintln! \
+                 (reason=x-cargo-mcp-stderr, field: text). \
                  Supports filtering by test name, running only library tests, \
                  targeting a specific integration-test file, and continuing past \
                  failures with no_fail_fast. ALWAYS pass `working_dir` set to the absolute path of your workspace root \u{2014} the default is the cargo-mcp server's own working directory and will usually cause the call to fail.",
@@ -1298,8 +1418,10 @@ fn call_test(
     }
     let out = run_cargo_maybe_streaming(&argv, wd, opt_timeout(args)?, on_progress)?;
     // Test output is a mix: JSON from compilation, text from the test harness.
-    // Return both stdout (JSON + test results) and stderr on failure.
-    Ok(format_json_output(&out, &argv, wd))
+    // Use format_test_output so that non-JSON lines (libtest harness text,
+    // captured println! replays) are preserved as x-cargo-mcp-test-output
+    // records, and stderr (eprintln! from test code) is always included.
+    Ok(format_test_output(&out, &argv, wd))
 }
 
 fn call_clippy(

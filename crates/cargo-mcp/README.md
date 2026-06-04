@@ -141,7 +141,7 @@ invoked from the tool-result panel even when the JSON `arguments` shown
 by the MCP client are sparse (for example, only `working_dir` and a
 single boolean flag).
 
-For **JSON-mode tools** (`check`, `build`, `test`, `clippy`, `doc`,
+For **JSON-mode tools** (`check`, `build`, `clippy`, `doc`,
 `metadata`) the *entire* response is a strict NDJSON stream — the
 invocation header followed by one JSON object per line — filtered to
 keep only `compiler-message` and `build-finished` records. On failure
@@ -150,11 +150,35 @@ and when the cargo child wrote anything to stderr (where the Restart
 Manager "who holds this file" report and other side-channel diagnostics
 land) a separate `{"reason":"x-cargo-mcp-stderr","text":...}` record is
 appended after the trailer, so the whole response stays parseable
-end-to-end with a single line-by-line JSON parser. While the build runs,
-streaming progress notifications are also emitted; the final notification
-reads `cargo <verb> finished` (or `failed`), with the optional target
-triplet appended when one is supplied. This is what appears as the
-collapsed summary line in the VS Code chat history.
+end-to-end with a single line-by-line JSON parser.
+
+**`cargo_test`** is a special case. The test execution phase produces
+plain-text libtest output (harness lines like `test foo ... ok` and
+pass/fail summaries, plus captured `println!` replays on failure) that
+is not valid JSON. Each such line is wrapped in a custom NDJSON record:
+
+```json
+{"reason":"x-cargo-mcp-test-output","text":"test foo::bar ... ok"}
+```
+
+`eprintln!` from test code bypasses libtest capture and goes directly to
+stderr; it is always included — even on success — as an
+`{"reason":"x-cargo-mcp-stderr","text":"..."}` record. The complete
+output shape for `cargo_test` is therefore:
+
+```
+{x-cargo-mcp-invocation}          ← effective command + cwd
+{compiler-message} ...             ← zero or more compile errors/warnings
+{build-finished}                   ← build phase outcome
+{x-cargo-mcp-test-output} ...      ← zero or more test harness lines
+{"status":"success"|"error",...}   ← always present
+{x-cargo-mcp-stderr}               ← optional, when stderr non-empty
+```
+
+While the build runs, streaming progress notifications are also emitted;
+the final notification reads `cargo <verb> finished` (or `failed`), with
+the optional target triplet appended when one is supplied. This is what
+appears as the collapsed summary line in the VS Code chat history.
 
 For **text-mode tools** (`fmt`, `tree`, `clean`, `update`, `fix`, `add`,
 `remove`, `publish`) only the first line (the invocation header) is
