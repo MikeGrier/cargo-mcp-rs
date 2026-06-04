@@ -2,7 +2,7 @@
     "name": "cargo-mcp",
     "displayName": "Cargo MCP",
     "description": "MCP server for Cargo workspace operations: check, build, test, clippy, fmt, tree, doc, and clean — callable directly from Copilot Chat with structured JSON output.",
-    "version": "0.5.5",
+    "version": "0.5.6",
     "publisher": "MikeGrierTools",
     "license": "MIT",
     "author": {
