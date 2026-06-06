@@ -51,7 +51,9 @@ terminal for cargo just because a previous step used the terminal.
 When launched by the VS Code extension, `cargo_test` applies a server-side
 default timeout from the `cargo-mcp.test.timeoutSecs` setting (**30 seconds**
 by default). Without the extension (or with `cargo-mcp.test.timeoutSecs` set
-to `0`), the server has no default timeout.
+to `0`), the server has no default timeout. The budget covers only test
+**execution** — the clock starts when compilation and linking finish (cargo's
+`build-finished` record), so a slow build never trips the timeout.
 - Omit `timeout_secs` to let the server default apply.
 - Pass `timeout_secs: N` to use a specific budget for this run.
 - Pass `timeout_secs: 0` to disable the timeout for this run, regardless of

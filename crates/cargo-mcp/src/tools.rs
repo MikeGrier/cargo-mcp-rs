@@ -68,7 +68,10 @@ use crate::{
     suggest::{self, Suggestion},
 };
 
-use std::sync::{Arc, atomic::{AtomicBool, AtomicU64, Ordering}};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+};
 
 /// Default wall-clock timeout for `cargo_test` when the caller does not
 /// supply an explicit `timeout_secs`. `0` means no default (wait forever).
@@ -122,7 +125,9 @@ for cargo just because a previous step used the terminal.\n\n\
 When launched by the VS Code extension, `cargo_test` applies a server-side\n\
 default timeout from the `cargo-mcp.test.timeoutSecs` setting (**30 seconds**\n\
 by default). Without the extension (or with `cargo-mcp.test.timeoutSecs: 0`),\n\
-the server has no default timeout.\n\
+the server has no default timeout. The budget covers only test **execution** —\n\
+the clock starts when compilation and linking finish (cargo's `build-finished`\n\
+record), so a slow build never trips the timeout.\n\
 - Omit `timeout_secs` to let the server default apply.\n\
 - Pass `timeout_secs: N` to use a specific budget for this run.\n\
 - Pass `timeout_secs: 0` to disable the timeout for this run, regardless of\n\
@@ -292,9 +297,7 @@ fn filter_test_ndjson(stdout: &str) -> String {
                 // diagnostics and the build-finished summary; drop artifact
                 // and build-script noise already delivered via streaming.
                 match v.get("reason").and_then(|r| r.as_str()) {
-                    Some("compiler-message") | Some("build-finished") => {
-                        Some(line.to_owned())
-                    }
+                    Some("compiler-message") | Some("build-finished") => Some(line.to_owned()),
                     _ => None,
                 }
             } else {
@@ -483,12 +486,21 @@ fn run_cargo_maybe_streaming(
     argv: &[&str],
     wd: Option<&str>,
     timeout: Option<std::time::Duration>,
+    arm_deadline: Option<invoke::ArmDeadline<'_>>,
     on_progress: Option<&mut dyn FnMut(&str)>,
 ) -> Result<CargoOutput, Box<dyn std::error::Error>> {
     match on_progress {
-        Some(cb) => invoke::run_cargo_streaming_with_timeout(argv, wd, timeout, cb),
-        None => invoke::run_cargo_with_timeout(argv, wd, timeout),
+        Some(cb) => invoke::run_cargo_streaming_with_timeout(argv, wd, timeout, arm_deadline, cb),
+        None => invoke::run_cargo_with_timeout(argv, wd, timeout, arm_deadline),
     }
+}
+
+/// True for cargo's `build-finished` JSON record. With `--message-format=json`
+/// this line is emitted exactly when compilation and linking are complete and
+/// (for `cargo test`) immediately before the test binaries start executing, so
+/// it marks the boundary used to arm the `cargo_test` execution-only timeout.
+fn is_build_finished_line(line: &str) -> bool {
+    line.contains(r#""reason":"build-finished""#)
 }
 
 // ── tool list ─────────────────────────────────────────────────────────────────
@@ -733,12 +745,14 @@ pub fn list() -> Value {
                         "type": "integer",
                         "minimum": 0,
                         "description":
-                            "Wall-clock budget in seconds for this test run. When the budget \
-                             elapses, cargo and the entire subprocess tree (rustc, test binaries, \
-                             build scripts) are terminated. If omitted, the server-configured \
-                             default applies (30 seconds when launched by the VS Code extension; \
-                             no timeout otherwise). Pass 0 to disable the timeout for this run \
-                             regardless of the server default."
+                            "Wall-clock budget in seconds for test execution. The clock starts \
+                             when compilation and linking finish (cargo's build-finished record), \
+                             so the build phase is never timed — only the running tests. When the \
+                             budget elapses, cargo and the entire subprocess tree (test binaries, \
+                             etc.) are terminated. If omitted, the server-configured default \
+                             applies (30 seconds when launched by the VS Code extension; no timeout \
+                             otherwise). Pass 0 to disable the timeout for this run regardless of \
+                             the server default."
                     }
                 },
                 "required": []
@@ -1390,7 +1404,7 @@ fn call_check(
     if opt_bool(args, "locked") {
         argv.push("--locked");
     }
-    let out = run_cargo_maybe_streaming(&argv, wd, opt_timeout(args)?, on_progress)?;
+    let out = run_cargo_maybe_streaming(&argv, wd, opt_timeout(args)?, None, on_progress)?;
     let output = format_json_output(&out, &argv, wd);
     let suggestions = suggest::extract_suggestions(&out.stdout);
     Ok(ToolResult::WithSuggestions {
@@ -1424,7 +1438,7 @@ fn call_build(
     if opt_bool(args, "locked") {
         argv.push("--locked");
     }
-    let out = run_cargo_maybe_streaming(&argv, wd, opt_timeout(args)?, on_progress)?;
+    let out = run_cargo_maybe_streaming(&argv, wd, opt_timeout(args)?, None, on_progress)?;
     Ok(format_json_output(&out, &argv, wd))
 }
 
@@ -1479,10 +1493,19 @@ fn call_test(
     //   Some(None)   → explicit 0: disable timeout for this run
     //   Some(Some(d))→ explicit positive: use caller's budget
     let timeout = match opt_timeout_explicit(args)? {
-        None => default_test_timeout(),           // use server default
-        Some(explicit) => explicit,               // caller wins (including None=disable)
+        None => default_test_timeout(), // use server default
+        Some(explicit) => explicit,     // caller wins (including None=disable)
     };
-    let out = run_cargo_maybe_streaming(&argv, wd, timeout, on_progress)?;
+    // Arm the timeout only once compilation/linking finishes (cargo emits the
+    // `build-finished` record), so the budget bounds test *execution* and not
+    // the build phase.
+    let out = run_cargo_maybe_streaming(
+        &argv,
+        wd,
+        timeout,
+        Some(&is_build_finished_line),
+        on_progress,
+    )?;
     // Test output is a mix: JSON from compilation, text from the test harness.
     // Use format_test_output so that non-JSON lines (libtest harness text,
     // captured println! replays) are preserved as x-cargo-mcp-test-output
@@ -1512,7 +1535,7 @@ fn call_clippy(
     if opt_bool(args, "locked") {
         argv.push("--locked");
     }
-    let out = run_cargo_maybe_streaming(&argv, wd, opt_timeout(args)?, on_progress)?;
+    let out = run_cargo_maybe_streaming(&argv, wd, opt_timeout(args)?, None, on_progress)?;
     let output = format_json_output(&out, &argv, wd);
     let suggestions = suggest::extract_suggestions(&out.stdout);
     Ok(ToolResult::WithSuggestions {
@@ -1596,7 +1619,7 @@ fn call_doc(
     if opt_bool(args, "locked") {
         argv.push("--locked");
     }
-    let out = run_cargo_maybe_streaming(&argv, wd, None, on_progress)?;
+    let out = run_cargo_maybe_streaming(&argv, wd, None, None, on_progress)?;
     Ok(format_json_output(&out, &argv, wd))
 }
 
@@ -1997,5 +2020,26 @@ mod tests {
         assert_eq!(t, Some(std::time::Duration::from_secs(60)));
 
         set_default_test_timeout(None); // restore
+    }
+
+    #[test]
+    fn is_build_finished_line_matches_cargo_record() {
+        // The exact compact JSON cargo emits with --message-format=json.
+        assert!(is_build_finished_line(
+            r#"{"reason":"build-finished","success":true}"#
+        ));
+        assert!(is_build_finished_line(
+            r#"{"reason":"build-finished","success":false}"#
+        ));
+    }
+
+    #[test]
+    fn is_build_finished_line_rejects_other_records() {
+        assert!(!is_build_finished_line(
+            r#"{"reason":"compiler-message","message":{}}"#
+        ));
+        assert!(!is_build_finished_line(r#"{"reason":"compiler-artifact"}"#));
+        assert!(!is_build_finished_line("running 3 tests"));
+        assert!(!is_build_finished_line(""));
     }
 }
