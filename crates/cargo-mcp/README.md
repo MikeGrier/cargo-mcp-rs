@@ -216,16 +216,61 @@ list.
 
 ### Common parameters
 
-Most tools accept these optional parameters:
+Most tools accept these optional parameters. Not every option applies to
+every tool — `cargo doc` has no `--tests`/`--benches`/`--all-targets`,
+`cargo test` has no `--keep-going` (but adds `doc` and `no_run`), and
+`cargo tree` takes only `target` from the compilation group. Each tool's
+schema advertises exactly the options it accepts.
+
+**Package selection**
 
 | Parameter | Type | Description |
 |---|---|---|
 | `working_dir` | string | Absolute path to the directory containing the workspace `Cargo.toml`. **Strongly recommended to pass explicitly.** If omitted, defaults to the cargo-mcp server process's working directory — typically not your workspace, and usually fatal to manifest or `rust-toolchain.toml` resolution. See [Toolchain resolution](#toolchain-resolution) and `cargo_diagnostic`. |
-| `package` | string | Target a specific package within the workspace |
-| `release` | boolean | Use the release profile |
-| `features` | string | Comma-separated list of features to activate |
-| `all_targets` | boolean | Include all targets (lib, bins, tests, benches, examples) |
-| `locked` | boolean | Require `Cargo.lock` to remain unchanged (useful in CI) |
+| `package` | string | Operate on a specific package (`-p`/`--package`) |
+| `workspace` | boolean | Operate on all packages in the workspace (`--workspace`) |
+| `exclude` | string | Exclude a package from a `workspace` operation (`--exclude`) |
+
+**Target selection** (check, build, test, clippy; reduced set for doc)
+
+| Parameter | Type | Description |
+|---|---|---|
+| `lib` | boolean | Only the library target (`--lib`) |
+| `bins` / `bin` | boolean / string | All binaries (`--bins`) or one named binary (`--bin`) |
+| `examples` / `example` | boolean / string | All examples (`--examples`) or one named example (`--example`) |
+| `tests` / `test` | boolean / string | All test targets (`--tests`) or one named test (`--test`) |
+| `benches` / `bench` | boolean / string | All benches (`--benches`) or one named bench (`--bench`) |
+| `all_targets` | boolean | All targets (`--all-targets`) |
+
+**Feature selection**
+
+| Parameter | Type | Description |
+|---|---|---|
+| `features` | string | Comma-separated list of features to activate (`--features`) |
+| `all_features` | boolean | Activate all features (`--all-features`) |
+| `no_default_features` | boolean | Do not activate the `default` feature (`--no-default-features`) |
+
+**Compilation options**
+
+| Parameter | Type | Description |
+|---|---|---|
+| `release` | boolean | Use the release profile (`--release`) |
+| `profile` | string | Build with a named profile (`--profile`) |
+| `jobs` | integer | Number of parallel jobs (`--jobs`) |
+| `keep_going` | boolean | Build as many targets as possible on error (`--keep-going`; not on test) |
+| `target` | string | Build for a target triple (`--target`) |
+| `target_dir` | string | Directory for generated artifacts (`--target-dir`) |
+| `timings` | boolean | Emit an HTML build-timing report (`--timings`) |
+
+**Manifest options**
+
+| Parameter | Type | Description |
+|---|---|---|
+| `manifest_path` | string | Path to `Cargo.toml` (`--manifest-path`) |
+| `ignore_rust_version` | boolean | Ignore the `rust-version` field (`--ignore-rust-version`; not on tree) |
+| `locked` | boolean | Require `Cargo.lock` to remain unchanged (`--locked`) |
+| `offline` | boolean | Run without accessing the network (`--offline`) |
+| `frozen` | boolean | Equivalent to `--locked` plus `--offline` (`--frozen`) |
 
 ### `cargo_metadata`
 

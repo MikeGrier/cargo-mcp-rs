@@ -9,6 +9,11 @@
 //! stderr. This keeps the MCP server as a thin dispatch layer — all build
 //! logic lives in Cargo itself.
 
+// The tool-definition table in `tools.rs` is built with a single large
+// `serde_json::json!` literal; the default recursion limit (128) is not enough
+// to expand it once every subcommand advertises its full option set.
+#![recursion_limit = "512"]
+
 mod busy_files;
 mod elicit;
 mod invoke;
