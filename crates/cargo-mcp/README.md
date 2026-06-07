@@ -225,6 +225,12 @@ every tool — `cargo doc` has no `--tests`/`--benches`/`--all-targets`,
 `cargo tree` takes only `target` from the compilation group. Each tool's
 schema advertises exactly the options it accepts.
 
+**Toolchain override**
+
+| Parameter | Type | Description |
+|---|---|---|
+| `toolchain` | string | Rustup toolchain to run the command with, passed as a leading `+<toolchain>` token (e.g. `cargo +nightly ...`). Accepts any rustup toolchain name — `nightly`, `stable`, `1.78`, or a custom toolchain such as `ms-prod`. Requires rustup. Supported on `cargo_check`, `cargo_build`, `cargo_test`, `cargo_clippy`, `cargo_doc`, `cargo_tree`, `cargo_fmt`, and `cargo_fmt_check`. Omit to use the toolchain selected by `rust-toolchain.toml` or the environment. |
+
 **Package selection**
 
 | Parameter | Type | Description |

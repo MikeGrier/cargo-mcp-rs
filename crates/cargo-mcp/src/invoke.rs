@@ -108,11 +108,17 @@ const IDEMPOTENT_SUBCOMMANDS: &[&str] = &[
     "check", "build", "test", "clippy", "fmt", "doc", "tree", "clean", "metadata",
 ];
 
-/// Returns `true` iff `args[0]` (the cargo subcommand) is in
-/// [`IDEMPOTENT_SUBCOMMANDS`].
+/// Returns `true` iff the cargo subcommand is in [`IDEMPOTENT_SUBCOMMANDS`].
+///
+/// A leading `+<toolchain>` override (e.g. `+nightly`) may precede the
+/// subcommand (`cargo +nightly test ...`); it is skipped when locating the
+/// subcommand so toolchain-pinned invocations remain retry-eligible.
 fn is_retry_safe(args: &[&str]) -> bool {
-    args.first()
-        .is_some_and(|sub| IDEMPOTENT_SUBCOMMANDS.contains(sub))
+    let sub = match args.first() {
+        Some(first) if first.starts_with('+') => args.get(1),
+        other => other,
+    };
+    sub.is_some_and(|sub| IDEMPOTENT_SUBCOMMANDS.contains(sub))
 }
 
 /// Is the given combined cargo stderr/stdout indicative of a transient
@@ -1635,6 +1641,17 @@ mod tests {
     #[test]
     fn is_retry_safe_rejects_empty_args() {
         assert!(!is_retry_safe(&[]));
+    }
+
+    #[test]
+    fn is_retry_safe_skips_leading_toolchain_override() {
+        // A `+toolchain` token precedes the subcommand; retry-safety must be
+        // judged on the subcommand, not the override.
+        assert!(is_retry_safe(&["+nightly", "test"]));
+        assert!(is_retry_safe(&["+ms-prod", "check", "--all-targets"]));
+        assert!(!is_retry_safe(&["+nightly", "publish"]));
+        // A lone toolchain token with no subcommand is not retry-safe.
+        assert!(!is_retry_safe(&["+nightly"]));
     }
 
     #[test]

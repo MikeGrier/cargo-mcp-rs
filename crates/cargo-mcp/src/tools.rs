@@ -231,6 +231,13 @@ const TEST_DOC_DESC: &str = "If true, run only documentation tests (--doc). Defa
 const NO_RUN_DESC: &str =
     "If true, compile the tests but do not run them (--no-run). Default: false.";
 
+// Toolchain override (valid for every subcommand)
+const TOOLCHAIN_DESC: &str = "Rustup toolchain to run this command with, passed as a leading \
+     `+<toolchain>` argument (e.g. cargo +nightly ...). Accepts any rustup \
+     toolchain name such as \"nightly\", \"stable\", \"1.78\", or a custom \
+     toolchain like \"ms-prod\". Requires rustup. Omit to use the toolchain \
+     selected by rust-toolchain.toml or the environment.";
+
 /// The result of a tool call, which may carry actionable suggestions.
 pub enum ToolResult {
     /// Plain text output (no suggestions to extract).
@@ -263,6 +270,23 @@ fn opt_int_str(args: &Value, key: &str) -> Option<String> {
     args.get(key)
         .and_then(|v| v.as_i64())
         .map(|n| n.to_string())
+}
+
+/// Build cargo's optional toolchain-override token (`+<name>`) from `args`.
+///
+/// rustup interprets a leading `+<toolchain>` argument (e.g. `cargo +nightly
+/// build`) as a one-shot toolchain selection. Callers insert the returned
+/// token at index 0 of `argv` so cargo sees it immediately after the binary
+/// name. Any leading `+` the caller may have included is stripped first so a
+/// value of `"+nightly"` does not become `++nightly`. Returns `None` when the
+/// field is absent or blank.
+fn toolchain_arg(args: &Value) -> Option<String> {
+    let raw = opt_str(args, "toolchain")?.trim();
+    let name = raw.strip_prefix('+').unwrap_or(raw);
+    if name.is_empty() {
+        return None;
+    }
+    Some(format!("+{name}"))
 }
 
 /// Owned string values for the standard cargo options, extracted up front so
@@ -832,6 +856,7 @@ pub fn list() -> Value {
                         "type": "string",
                         "description": WORKING_DIR_DESC
                     },
+                    "toolchain": { "type": "string", "description": TOOLCHAIN_DESC },
                     "package": {
                         "type": "string",
                         "description":
@@ -925,6 +950,7 @@ pub fn list() -> Value {
                         "type": "string",
                         "description": WORKING_DIR_DESC
                     },
+                    "toolchain": { "type": "string", "description": TOOLCHAIN_DESC },
                     "package": {
                         "type": "string",
                         "description":
@@ -1025,6 +1051,7 @@ pub fn list() -> Value {
                         "type": "string",
                         "description": WORKING_DIR_DESC
                     },
+                    "toolchain": { "type": "string", "description": TOOLCHAIN_DESC },
                     "package": {
                         "type": "string",
                         "description":
@@ -1145,6 +1172,7 @@ pub fn list() -> Value {
                         "type": "string",
                         "description": WORKING_DIR_DESC
                     },
+                    "toolchain": { "type": "string", "description": TOOLCHAIN_DESC },
                     "package": {
                         "type": "string",
                         "description":
@@ -1233,6 +1261,7 @@ pub fn list() -> Value {
                         "type": "string",
                         "description": WORKING_DIR_DESC
                     },
+                    "toolchain": { "type": "string", "description": TOOLCHAIN_DESC },
                     "package": {
                         "type": "string",
                         "description":
@@ -1259,6 +1288,7 @@ pub fn list() -> Value {
                         "type": "string",
                         "description": WORKING_DIR_DESC
                     },
+                    "toolchain": { "type": "string", "description": TOOLCHAIN_DESC },
                     "package": {
                         "type": "string",
                         "description":
@@ -1286,6 +1316,7 @@ pub fn list() -> Value {
                         "type": "string",
                         "description": WORKING_DIR_DESC
                     },
+                    "toolchain": { "type": "string", "description": TOOLCHAIN_DESC },
                     "package": {
                         "type": "string",
                         "description":
@@ -1354,6 +1385,7 @@ pub fn list() -> Value {
                         "type": "string",
                         "description": WORKING_DIR_DESC
                     },
+                    "toolchain": { "type": "string", "description": TOOLCHAIN_DESC },
                     "package": {
                         "type": "string",
                         "description":
@@ -1842,6 +1874,7 @@ fn call_check(
     on_progress: Option<&mut dyn FnMut(&str)>,
 ) -> Result<ToolResult, Box<dyn std::error::Error>> {
     let wd = opt_str(args, "working_dir");
+    let tc = toolchain_arg(args);
     let mut argv: Vec<&str> = vec!["check", "--message-format=json"];
     let o = CommonOpts::from_args(args);
     push_package_selection(&mut argv, args, &o);
@@ -1849,6 +1882,9 @@ fn call_check(
     push_feature_flags(&mut argv, args, &o);
     push_compilation_options(&mut argv, args, &o, true);
     push_manifest_options(&mut argv, args, &o, true);
+    if let Some(ref t) = tc {
+        argv.insert(0, t);
+    }
     let out = run_cargo_maybe_streaming(&argv, wd, opt_timeout(args)?, None, on_progress)?;
     let output = format_json_output(&out, &argv, wd);
     let suggestions = suggest::extract_suggestions(&out.stdout);
@@ -1863,6 +1899,7 @@ fn call_build(
     on_progress: Option<&mut dyn FnMut(&str)>,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let wd = opt_str(args, "working_dir");
+    let tc = toolchain_arg(args);
     let mut argv: Vec<&str> = vec!["build", "--message-format=json"];
     let o = CommonOpts::from_args(args);
     push_package_selection(&mut argv, args, &o);
@@ -1870,6 +1907,9 @@ fn call_build(
     push_feature_flags(&mut argv, args, &o);
     push_compilation_options(&mut argv, args, &o, true);
     push_manifest_options(&mut argv, args, &o, true);
+    if let Some(ref t) = tc {
+        argv.insert(0, t);
+    }
     let out = run_cargo_maybe_streaming(&argv, wd, opt_timeout(args)?, None, on_progress)?;
     Ok(format_json_output(&out, &argv, wd))
 }
@@ -1879,6 +1919,7 @@ fn call_test(
     on_progress: Option<&mut dyn FnMut(&str)>,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let wd = opt_str(args, "working_dir");
+    let tc = toolchain_arg(args);
     let mut argv: Vec<&str> = vec!["test", "--message-format=json"];
     let o = CommonOpts::from_args(args);
     let test_name = opt_str(args, "test_name").map(String::from);
@@ -1908,6 +1949,9 @@ fn call_test(
         if opt_bool(args, "exact") {
             argv.push("--exact");
         }
+    }
+    if let Some(ref t) = tc {
+        argv.insert(0, t);
     }
     // Caller-supplied timeout wins; fall back to the server-configured default
     // (cargo-mcp.test.timeoutSecs VS Code setting, default 30s).
@@ -1941,6 +1985,7 @@ fn call_clippy(
     on_progress: Option<&mut dyn FnMut(&str)>,
 ) -> Result<ToolResult, Box<dyn std::error::Error>> {
     let wd = opt_str(args, "working_dir");
+    let tc = toolchain_arg(args);
     let mut argv: Vec<&str> = vec!["clippy", "--message-format=json"];
     let o = CommonOpts::from_args(args);
     push_package_selection(&mut argv, args, &o);
@@ -1948,6 +1993,9 @@ fn call_clippy(
     push_feature_flags(&mut argv, args, &o);
     push_compilation_options(&mut argv, args, &o, true);
     push_manifest_options(&mut argv, args, &o, true);
+    if let Some(ref t) = tc {
+        argv.insert(0, t);
+    }
     let out = run_cargo_maybe_streaming(&argv, wd, opt_timeout(args)?, None, on_progress)?;
     let output = format_json_output(&out, &argv, wd);
     let suggestions = suggest::extract_suggestions(&out.stdout);
@@ -1959,11 +2007,15 @@ fn call_clippy(
 
 fn call_fmt_check(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
     let wd = opt_str(args, "working_dir");
+    let tc = toolchain_arg(args);
     let mut argv: Vec<&str> = vec!["fmt", "--check"];
     let pkg = opt_str(args, "package").map(String::from);
     if let Some(ref p) = pkg {
         argv.push("--package");
         argv.push(p);
+    }
+    if let Some(ref t) = tc {
+        argv.insert(0, t);
     }
     let out = invoke::run_cargo(&argv, wd)?;
     Ok(format_text_output(&out, &argv, wd))
@@ -1971,11 +2023,15 @@ fn call_fmt_check(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
 
 fn call_fmt(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
     let wd = opt_str(args, "working_dir");
+    let tc = toolchain_arg(args);
     let mut argv: Vec<&str> = vec!["fmt"];
     let pkg = opt_str(args, "package").map(String::from);
     if let Some(ref p) = pkg {
         argv.push("--package");
         argv.push(p);
+    }
+    if let Some(ref t) = tc {
+        argv.insert(0, t);
     }
     let out = invoke::run_cargo(&argv, wd)?;
     Ok(format_text_output(&out, &argv, wd))
@@ -1983,6 +2039,7 @@ fn call_fmt(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
 
 fn call_tree(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
     let wd = opt_str(args, "working_dir");
+    let tc = toolchain_arg(args);
     let mut argv: Vec<&str> = vec!["tree"];
     let o = CommonOpts::from_args(args);
     let invert = opt_str(args, "invert").map(String::from);
@@ -2008,6 +2065,9 @@ fn call_tree(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
     }
     // `cargo tree` has no --ignore-rust-version.
     push_manifest_options(&mut argv, args, &o, false);
+    if let Some(ref t) = tc {
+        argv.insert(0, t);
+    }
     let out = invoke::run_cargo(&argv, wd)?;
     Ok(format_text_output(&out, &argv, wd))
 }
@@ -2017,6 +2077,7 @@ fn call_doc(
     on_progress: Option<&mut dyn FnMut(&str)>,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let wd = opt_str(args, "working_dir");
+    let tc = toolchain_arg(args);
     let mut argv: Vec<&str> = vec!["doc", "--message-format=json"];
     let o = CommonOpts::from_args(args);
     push_package_selection(&mut argv, args, &o);
@@ -2031,6 +2092,9 @@ fn call_doc(
     push_feature_flags(&mut argv, args, &o);
     push_compilation_options(&mut argv, args, &o, true);
     push_manifest_options(&mut argv, args, &o, true);
+    if let Some(ref t) = tc {
+        argv.insert(0, t);
+    }
     let out = run_cargo_maybe_streaming(&argv, wd, None, None, on_progress)?;
     Ok(format_json_output(&out, &argv, wd))
 }
@@ -2485,6 +2549,41 @@ mod tests {
         let mut argv: Vec<&str> = vec!["check"];
         push_feature_flags(&mut argv, &args, &o);
         assert_eq!(argv, vec!["check"]);
+    }
+
+    #[test]
+    fn toolchain_arg_prefixes_plus() {
+        let args = serde_json::json!({ "toolchain": "nightly" });
+        assert_eq!(toolchain_arg(&args).as_deref(), Some("+nightly"));
+    }
+
+    #[test]
+    fn toolchain_arg_strips_existing_plus() {
+        // A caller that already wrote `+nightly` must not become `++nightly`.
+        let args = serde_json::json!({ "toolchain": "+ms-prod" });
+        assert_eq!(toolchain_arg(&args).as_deref(), Some("+ms-prod"));
+    }
+
+    #[test]
+    fn toolchain_arg_absent_or_blank_is_none() {
+        assert_eq!(toolchain_arg(&serde_json::json!({})), None);
+        assert_eq!(toolchain_arg(&serde_json::json!({ "toolchain": "" })), None);
+        assert_eq!(
+            toolchain_arg(&serde_json::json!({ "toolchain": "   " })),
+            None
+        );
+    }
+
+    #[test]
+    fn toolchain_token_goes_first_in_argv() {
+        // Mirror how call_* functions prepend the override at index 0 so cargo
+        // sees `+<toolchain>` immediately after the binary name.
+        let tc = toolchain_arg(&serde_json::json!({ "toolchain": "ms-prod" }));
+        let mut argv: Vec<&str> = vec!["test", "--message-format=json"];
+        if let Some(ref t) = tc {
+            argv.insert(0, t);
+        }
+        assert_eq!(argv, vec!["+ms-prod", "test", "--message-format=json"]);
     }
 
     #[test]
