@@ -171,6 +171,7 @@ fn timeout_returns_timeout_error_and_terminates_subprocess() {
         &["check"],
         None,
         Some(Duration::from_millis(500)),
+        None,
         &mut |line| {
             if let Some(rest) = line.strip_prefix("STARTED ") {
                 saw_started = true;
@@ -243,6 +244,7 @@ fn cancellation_returns_cancelled_error_and_terminates_subprocess() {
         &["check"],
         None,
         None, // no wall-clock cap — cancellation is the only exit path
+        None,
         &mut |line| {
             if let Some(rest) = line.strip_prefix("STARTED ") {
                 saw_started = true;

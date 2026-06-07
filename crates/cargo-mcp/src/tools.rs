@@ -68,7 +68,10 @@ use crate::{
     suggest::{self, Suggestion},
 };
 
-use std::sync::{Arc, atomic::{AtomicBool, AtomicU64, Ordering}};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+};
 
 /// Default wall-clock timeout for `cargo_test` when the caller does not
 /// supply an explicit `timeout_secs`. `0` means no default (wait forever).
@@ -122,7 +125,9 @@ for cargo just because a previous step used the terminal.\n\n\
 When launched by the VS Code extension, `cargo_test` applies a server-side\n\
 default timeout from the `cargo-mcp.test.timeoutSecs` setting (**30 seconds**\n\
 by default). Without the extension (or with `cargo-mcp.test.timeoutSecs: 0`),\n\
-the server has no default timeout.\n\
+the server has no default timeout. The budget covers only test **execution** —\n\
+the clock starts when compilation and linking finish (cargo's `build-finished`\n\
+record), so a slow build never trips the timeout.\n\
 - Omit `timeout_secs` to let the server default apply.\n\
 - Pass `timeout_secs: N` to use a specific budget for this run.\n\
 - Pass `timeout_secs: 0` to disable the timeout for this run, regardless of\n\
@@ -169,6 +174,70 @@ const WORKING_DIR_DESC_DIAGNOSTIC: &str = "Absolute path to the directory to dia
      a cargo command misbehaved. If omitted, defaults to the cargo-mcp server \
      process's working directory, which is typically NOT your workspace.";
 
+// ── shared cargo-option descriptions ──────────────────────────────────────────
+// These describe the standard cargo flag groups (package / target / feature /
+// compilation / manifest selection) that every build-graph subcommand accepts.
+// Centralised as consts so the per-tool JSON schemas stay compact and the
+// wording stays consistent.
+
+// Package selection
+const WORKSPACE_DESC: &str =
+    "If true, operate on all packages in the workspace (--workspace). Default: false.";
+const EXCLUDE_DESC: &str = "Package to exclude from a workspace operation (--exclude <SPEC>). \
+     Only meaningful together with workspace=true.";
+
+// Target selection
+const LIB_DESC: &str = "If true, restrict to the package's library target (--lib). Default: false.";
+const BINS_DESC: &str = "If true, select all binary targets (--bins). Default: false.";
+const BIN_DESC: &str = "Select only the named binary target (--bin <NAME>).";
+const EXAMPLES_DESC: &str = "If true, select all example targets (--examples). Default: false.";
+const EXAMPLE_DESC: &str = "Select only the named example target (--example <NAME>).";
+const TESTS_DESC: &str = "If true, select all test targets (--tests). Default: false.";
+const TEST_TARGET_DESC: &str = "Select only the named integration-test target \
+     (--test <NAME>, the filename without .rs under tests/).";
+const BENCHES_DESC: &str = "If true, select all benchmark targets (--benches). Default: false.";
+const BENCH_DESC: &str = "Select only the named benchmark target (--bench <NAME>).";
+const ALL_TARGETS_DESC: &str = "If true, select all targets \
+     (lib, bins, tests, benches, examples) (--all-targets). Default: false.";
+
+// Compilation options
+const PROFILE_DESC: &str = "Build with the named profile (--profile <NAME>), \
+     e.g. a custom profile defined in Cargo.toml. Mutually exclusive with `release`.";
+const JOBS_DESC: &str = "Number of parallel build jobs (--jobs <N>). \
+     Defaults to the number of logical CPUs.";
+const KEEP_GOING_DESC: &str = "If true, build as many targets as possible instead of \
+     aborting on the first error (--keep-going). Default: false.";
+const TARGET_DESC: &str = "Build for the given target triple (--target <TRIPLE>), \
+     e.g. x86_64-unknown-linux-gnu. Omit to build for the host platform.";
+const TARGET_DIR_DESC: &str = "Directory for all generated artifacts (--target-dir <DIR>).";
+const TIMINGS_DESC: &str = "If true, emit an HTML build-timing report at the end of the \
+     build (--timings). Default: false.";
+
+// Manifest options
+const IGNORE_RUST_VERSION_DESC: &str = "If true, ignore the `rust-version` field in the \
+     affected packages (--ignore-rust-version). Default: false.";
+const OFFLINE_DESC: &str =
+    "If true, run without accessing the network (--offline). Default: false.";
+const FROZEN_DESC: &str = "If true, require Cargo.lock and the cache to be up to date; \
+     equivalent to --locked plus --offline (--frozen). Default: false.";
+const MANIFEST_PATH_DESC: &str = "Path to the Cargo.toml to operate on (--manifest-path <PATH>).";
+const LOCKED_DESC: &str = "If true, assert that Cargo.lock will remain unchanged \
+     (--locked): error if it is out of date rather than updating it. Default: false.";
+
+// Subcommand-specific variants
+const TREE_TARGET_DESC: &str = "Filter dependencies matching the given target triple \
+     (--target <TRIPLE>). Pass `all` to include all targets. Defaults to the host platform.";
+const TEST_DOC_DESC: &str = "If true, run only documentation tests (--doc). Default: false.";
+const NO_RUN_DESC: &str =
+    "If true, compile the tests but do not run them (--no-run). Default: false.";
+
+// Toolchain override (valid for every subcommand)
+const TOOLCHAIN_DESC: &str = "Rustup toolchain to run this command with, passed as a leading \
+     `+<toolchain>` argument (e.g. cargo +nightly ...). Accepts any rustup \
+     toolchain name such as \"nightly\", \"stable\", \"1.78\", or a custom \
+     toolchain like \"ms-prod\". Requires rustup. Omit to use the toolchain \
+     selected by rust-toolchain.toml or the environment.";
+
 /// The result of a tool call, which may carry actionable suggestions.
 pub enum ToolResult {
     /// Plain text output (no suggestions to extract).
@@ -192,6 +261,236 @@ fn opt_str<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
 /// Extract an optional boolean field from JSON args (defaults to false).
 fn opt_bool(args: &Value, key: &str) -> bool {
     args.get(key).and_then(|v| v.as_bool()).unwrap_or(false)
+}
+
+/// Extract an optional integer field from JSON args as its string form, for
+/// flags whose value cargo expects as text (e.g. `--jobs 4`). Non-integer
+/// shapes are ignored (treated as absent).
+fn opt_int_str(args: &Value, key: &str) -> Option<String> {
+    args.get(key)
+        .and_then(|v| v.as_i64())
+        .map(|n| n.to_string())
+}
+
+/// Build cargo's optional toolchain-override token (`+<name>`) from `args`.
+///
+/// rustup interprets a leading `+<toolchain>` argument (e.g. `cargo +nightly
+/// build`) as a one-shot toolchain selection. Callers insert the returned
+/// token at index 0 of `argv` so cargo sees it immediately after the binary
+/// name. Any leading `+` the caller may have included is stripped first so a
+/// value of `"+nightly"` does not become `++nightly`. Returns `None` when the
+/// field is absent or blank.
+fn toolchain_arg(args: &Value) -> Option<String> {
+    let raw = opt_str(args, "toolchain")?.trim();
+    let name = raw.strip_prefix('+').unwrap_or(raw);
+    if name.is_empty() {
+        return None;
+    }
+    Some(format!("+{name}"))
+}
+
+/// Owned string values for the standard cargo options, extracted up front so
+/// the borrowed `&str`s pushed into `argv` outlive the vector. Boolean flags
+/// are read directly from `args` at push time and do not need to be stored.
+#[derive(Default)]
+struct CommonOpts {
+    package: Option<String>,
+    exclude: Option<String>,
+    bin: Option<String>,
+    example: Option<String>,
+    test: Option<String>,
+    bench: Option<String>,
+    features: Option<String>,
+    profile: Option<String>,
+    jobs: Option<String>,
+    target: Option<String>,
+    target_dir: Option<String>,
+    manifest_path: Option<String>,
+}
+
+impl CommonOpts {
+    fn from_args(args: &Value) -> Self {
+        Self {
+            package: opt_str(args, "package").map(String::from),
+            exclude: opt_str(args, "exclude").map(String::from),
+            bin: opt_str(args, "bin").map(String::from),
+            example: opt_str(args, "example").map(String::from),
+            test: opt_str(args, "test").map(String::from),
+            bench: opt_str(args, "bench").map(String::from),
+            features: opt_str(args, "features").map(String::from),
+            profile: opt_str(args, "profile").map(String::from),
+            jobs: opt_int_str(args, "jobs"),
+            target: opt_str(args, "target").map(String::from),
+            target_dir: opt_str(args, "target_dir").map(String::from),
+            manifest_path: opt_str(args, "manifest_path").map(String::from),
+        }
+    }
+}
+
+/// Append cargo's package-selection flags: `--package <SPEC>`, `--workspace`,
+/// and `--exclude <SPEC>`. Accepted by every build-graph command.
+fn push_package_selection<'a>(argv: &mut Vec<&'a str>, args: &Value, o: &'a CommonOpts) {
+    if let Some(p) = &o.package {
+        argv.push("--package");
+        argv.push(p);
+    }
+    let workspace = opt_bool(args, "workspace");
+    if workspace {
+        argv.push("--workspace");
+    }
+    // `--exclude` is only meaningful together with `--workspace`; cargo rejects
+    // it otherwise, so suppress it when `workspace` is not set.
+    if workspace && let Some(e) = &o.exclude {
+        argv.push("--exclude");
+        argv.push(e);
+    }
+}
+
+/// Append cargo's full target-selection flags (`--lib`, `--bins`, `--bin`,
+/// `--examples`, `--example`, `--tests`, `--test`, `--benches`, `--bench`,
+/// `--all-targets`). Accepted by check, build, test, and clippy. `cargo doc`
+/// supports only a subset — use [`push_doc_target_selection`] for it.
+fn push_target_selection<'a>(argv: &mut Vec<&'a str>, args: &Value, o: &'a CommonOpts) {
+    if opt_bool(args, "lib") {
+        argv.push("--lib");
+    }
+    if opt_bool(args, "bins") {
+        argv.push("--bins");
+    }
+    if let Some(b) = &o.bin {
+        argv.push("--bin");
+        argv.push(b);
+    }
+    if opt_bool(args, "examples") {
+        argv.push("--examples");
+    }
+    if let Some(e) = &o.example {
+        argv.push("--example");
+        argv.push(e);
+    }
+    if opt_bool(args, "tests") {
+        argv.push("--tests");
+    }
+    if let Some(t) = &o.test {
+        argv.push("--test");
+        argv.push(t);
+    }
+    if opt_bool(args, "benches") {
+        argv.push("--benches");
+    }
+    if let Some(b) = &o.bench {
+        argv.push("--bench");
+        argv.push(b);
+    }
+    if opt_bool(args, "all_targets") {
+        argv.push("--all-targets");
+    }
+}
+
+/// Append the reduced target-selection flags supported by `cargo doc`
+/// (`--lib`, `--bins`, `--bin`, `--examples`, `--example`). `cargo doc`
+/// has no `--tests`, `--benches`, `--test`, `--bench`, or `--all-targets`.
+fn push_doc_target_selection<'a>(argv: &mut Vec<&'a str>, args: &Value, o: &'a CommonOpts) {
+    if opt_bool(args, "lib") {
+        argv.push("--lib");
+    }
+    if opt_bool(args, "bins") {
+        argv.push("--bins");
+    }
+    if let Some(b) = &o.bin {
+        argv.push("--bin");
+        argv.push(b);
+    }
+    if opt_bool(args, "examples") {
+        argv.push("--examples");
+    }
+    if let Some(e) = &o.example {
+        argv.push("--example");
+        argv.push(e);
+    }
+}
+
+/// Append cargo's feature-selection flags: `--features <list>`,
+/// `--all-features`, and `--no-default-features`. Accepted by every
+/// build-graph command (check, build, test, clippy, doc, tree).
+fn push_feature_flags<'a>(argv: &mut Vec<&'a str>, args: &Value, o: &'a CommonOpts) {
+    if let Some(f) = &o.features {
+        argv.push("--features");
+        argv.push(f);
+    }
+    if opt_bool(args, "all_features") {
+        argv.push("--all-features");
+    }
+    if opt_bool(args, "no_default_features") {
+        argv.push("--no-default-features");
+    }
+}
+
+/// Append cargo's compilation-option flags: `--release`, `--profile <NAME>`,
+/// `--jobs <N>`, `--target <TRIPLE>`, `--target-dir <DIR>`, `--timings`, and
+/// (when `keep_going` is true, i.e. the subcommand supports it) `--keep-going`.
+/// `cargo test` accepts every flag here except `--keep-going`.
+fn push_compilation_options<'a>(
+    argv: &mut Vec<&'a str>,
+    args: &Value,
+    o: &'a CommonOpts,
+    keep_going: bool,
+) {
+    // `profile` is mutually exclusive with `release` and takes precedence when
+    // both are provided, matching the schema docs (PROFILE_DESC) and avoiding
+    // a cargo argument error.
+    if let Some(p) = &o.profile {
+        argv.push("--profile");
+        argv.push(p);
+    } else if opt_bool(args, "release") {
+        argv.push("--release");
+    }
+    if let Some(j) = &o.jobs {
+        argv.push("--jobs");
+        argv.push(j);
+    }
+    if keep_going && opt_bool(args, "keep_going") {
+        argv.push("--keep-going");
+    }
+    if let Some(t) = &o.target {
+        argv.push("--target");
+        argv.push(t);
+    }
+    if let Some(d) = &o.target_dir {
+        argv.push("--target-dir");
+        argv.push(d);
+    }
+    if opt_bool(args, "timings") {
+        argv.push("--timings");
+    }
+}
+
+/// Append cargo's manifest-option flags: `--manifest-path <PATH>`, `--locked`,
+/// `--offline`, `--frozen`, and (when `ignore_rust_version` is true, i.e. the
+/// subcommand supports it) `--ignore-rust-version`. `cargo tree` accepts every
+/// flag here except `--ignore-rust-version`.
+fn push_manifest_options<'a>(
+    argv: &mut Vec<&'a str>,
+    args: &Value,
+    o: &'a CommonOpts,
+    ignore_rust_version: bool,
+) {
+    if let Some(m) = &o.manifest_path {
+        argv.push("--manifest-path");
+        argv.push(m);
+    }
+    if ignore_rust_version && opt_bool(args, "ignore_rust_version") {
+        argv.push("--ignore-rust-version");
+    }
+    if opt_bool(args, "locked") {
+        argv.push("--locked");
+    }
+    if opt_bool(args, "offline") {
+        argv.push("--offline");
+    }
+    if opt_bool(args, "frozen") {
+        argv.push("--frozen");
+    }
 }
 
 /// Extract an optional wall-clock timeout (`timeout_secs`) from JSON args.
@@ -292,9 +591,7 @@ fn filter_test_ndjson(stdout: &str) -> String {
                 // diagnostics and the build-finished summary; drop artifact
                 // and build-script noise already delivered via streaming.
                 match v.get("reason").and_then(|r| r.as_str()) {
-                    Some("compiler-message") | Some("build-finished") => {
-                        Some(line.to_owned())
-                    }
+                    Some("compiler-message") | Some("build-finished") => Some(line.to_owned()),
                     _ => None,
                 }
             } else {
@@ -483,12 +780,21 @@ fn run_cargo_maybe_streaming(
     argv: &[&str],
     wd: Option<&str>,
     timeout: Option<std::time::Duration>,
+    arm_deadline: Option<invoke::ArmDeadline<'_>>,
     on_progress: Option<&mut dyn FnMut(&str)>,
 ) -> Result<CargoOutput, Box<dyn std::error::Error>> {
     match on_progress {
-        Some(cb) => invoke::run_cargo_streaming_with_timeout(argv, wd, timeout, cb),
-        None => invoke::run_cargo_with_timeout(argv, wd, timeout),
+        Some(cb) => invoke::run_cargo_streaming_with_timeout(argv, wd, timeout, arm_deadline, cb),
+        None => invoke::run_cargo_with_timeout(argv, wd, timeout, arm_deadline),
     }
+}
+
+/// True for cargo's `build-finished` JSON record. With `--message-format=json`
+/// this line is emitted exactly when compilation and linking are complete and
+/// (for `cargo test`) immediately before the test binaries start executing, so
+/// it marks the boundary used to arm the `cargo_test` execution-only timeout.
+fn is_build_finished_line(line: &str) -> bool {
+    line.contains(r#""reason":"build-finished""#)
 }
 
 // ── tool list ─────────────────────────────────────────────────────────────────
@@ -548,6 +854,7 @@ pub fn list() -> Value {
                         "type": "string",
                         "description": WORKING_DIR_DESC
                     },
+                    "toolchain": { "type": "string", "description": TOOLCHAIN_DESC },
                     "package": {
                         "type": "string",
                         "description":
@@ -565,11 +872,44 @@ pub fn list() -> Value {
                             "If true, check all targets (lib, bins, tests, benches, examples). \
                              Default: false."
                     },
+                    "workspace": { "type": "boolean", "description": WORKSPACE_DESC },
+                    "exclude": { "type": "string", "description": EXCLUDE_DESC },
+                    "lib": { "type": "boolean", "description": LIB_DESC },
+                    "bins": { "type": "boolean", "description": BINS_DESC },
+                    "bin": { "type": "string", "description": BIN_DESC },
+                    "examples": { "type": "boolean", "description": EXAMPLES_DESC },
+                    "example": { "type": "string", "description": EXAMPLE_DESC },
+                    "tests": { "type": "boolean", "description": TESTS_DESC },
+                    "test": { "type": "string", "description": TEST_TARGET_DESC },
+                    "benches": { "type": "boolean", "description": BENCHES_DESC },
+                    "bench": { "type": "string", "description": BENCH_DESC },
+                    "profile": { "type": "string", "description": PROFILE_DESC },
+                    "jobs": { "type": "integer", "minimum": 1, "description": JOBS_DESC },
+                    "keep_going": { "type": "boolean", "description": KEEP_GOING_DESC },
+                    "target": { "type": "string", "description": TARGET_DESC },
+                    "target_dir": { "type": "string", "description": TARGET_DIR_DESC },
+                    "timings": { "type": "boolean", "description": TIMINGS_DESC },
+                    "ignore_rust_version": { "type": "boolean", "description": IGNORE_RUST_VERSION_DESC },
+                    "manifest_path": { "type": "string", "description": MANIFEST_PATH_DESC },
+                    "offline": { "type": "boolean", "description": OFFLINE_DESC },
+                    "frozen": { "type": "boolean", "description": FROZEN_DESC },
                     "features": {
                         "type": "string",
                         "description":
                             "Comma-separated list of features to activate. \
                              Omit to use default features."
+                    },
+                    "all_features": {
+                        "type": "boolean",
+                        "description":
+                            "If true, activate all features of all selected packages \
+                             (passes --all-features). Default: false."
+                    },
+                    "no_default_features": {
+                        "type": "boolean",
+                        "description":
+                            "If true, do not activate the `default` feature \
+                             (passes --no-default-features). Default: false."
                     },
                     "locked": {
                         "type": "boolean",
@@ -608,6 +948,7 @@ pub fn list() -> Value {
                         "type": "string",
                         "description": WORKING_DIR_DESC
                     },
+                    "toolchain": { "type": "string", "description": TOOLCHAIN_DESC },
                     "package": {
                         "type": "string",
                         "description":
@@ -626,11 +967,44 @@ pub fn list() -> Value {
                             "If true, build all targets (lib, bins, tests, benches, examples). \
                              Default: false."
                     },
+                    "workspace": { "type": "boolean", "description": WORKSPACE_DESC },
+                    "exclude": { "type": "string", "description": EXCLUDE_DESC },
+                    "lib": { "type": "boolean", "description": LIB_DESC },
+                    "bins": { "type": "boolean", "description": BINS_DESC },
+                    "bin": { "type": "string", "description": BIN_DESC },
+                    "examples": { "type": "boolean", "description": EXAMPLES_DESC },
+                    "example": { "type": "string", "description": EXAMPLE_DESC },
+                    "tests": { "type": "boolean", "description": TESTS_DESC },
+                    "test": { "type": "string", "description": TEST_TARGET_DESC },
+                    "benches": { "type": "boolean", "description": BENCHES_DESC },
+                    "bench": { "type": "string", "description": BENCH_DESC },
+                    "profile": { "type": "string", "description": PROFILE_DESC },
+                    "jobs": { "type": "integer", "minimum": 1, "description": JOBS_DESC },
+                    "keep_going": { "type": "boolean", "description": KEEP_GOING_DESC },
+                    "target": { "type": "string", "description": TARGET_DESC },
+                    "target_dir": { "type": "string", "description": TARGET_DIR_DESC },
+                    "timings": { "type": "boolean", "description": TIMINGS_DESC },
+                    "ignore_rust_version": { "type": "boolean", "description": IGNORE_RUST_VERSION_DESC },
+                    "manifest_path": { "type": "string", "description": MANIFEST_PATH_DESC },
+                    "offline": { "type": "boolean", "description": OFFLINE_DESC },
+                    "frozen": { "type": "boolean", "description": FROZEN_DESC },
                     "features": {
                         "type": "string",
                         "description":
                             "Comma-separated list of features to activate. \
                              Omit to use default features."
+                    },
+                    "all_features": {
+                        "type": "boolean",
+                        "description":
+                            "If true, activate all features of all selected packages \
+                             (passes --all-features). Default: false."
+                    },
+                    "no_default_features": {
+                        "type": "boolean",
+                        "description":
+                            "If true, do not activate the `default` feature \
+                             (passes --no-default-features). Default: false."
                     },
                     "locked": {
                         "type": "boolean",
@@ -675,6 +1049,7 @@ pub fn list() -> Value {
                         "type": "string",
                         "description": WORKING_DIR_DESC
                     },
+                    "toolchain": { "type": "string", "description": TOOLCHAIN_DESC },
                     "package": {
                         "type": "string",
                         "description":
@@ -698,11 +1073,44 @@ pub fn list() -> Value {
                             "If true, run all tests even if some fail. Default: false \
                              (stop after first failure)."
                     },
+                    "no_run": { "type": "boolean", "description": NO_RUN_DESC },
+                    "doc": { "type": "boolean", "description": TEST_DOC_DESC },
+                    "workspace": { "type": "boolean", "description": WORKSPACE_DESC },
+                    "exclude": { "type": "string", "description": EXCLUDE_DESC },
+                    "bins": { "type": "boolean", "description": BINS_DESC },
+                    "bin": { "type": "string", "description": BIN_DESC },
+                    "examples": { "type": "boolean", "description": EXAMPLES_DESC },
+                    "example": { "type": "string", "description": EXAMPLE_DESC },
+                    "tests": { "type": "boolean", "description": TESTS_DESC },
+                    "benches": { "type": "boolean", "description": BENCHES_DESC },
+                    "bench": { "type": "string", "description": BENCH_DESC },
+                    "all_targets": { "type": "boolean", "description": ALL_TARGETS_DESC },
+                    "profile": { "type": "string", "description": PROFILE_DESC },
+                    "jobs": { "type": "integer", "minimum": 1, "description": JOBS_DESC },
+                    "target": { "type": "string", "description": TARGET_DESC },
+                    "target_dir": { "type": "string", "description": TARGET_DIR_DESC },
+                    "timings": { "type": "boolean", "description": TIMINGS_DESC },
+                    "ignore_rust_version": { "type": "boolean", "description": IGNORE_RUST_VERSION_DESC },
+                    "manifest_path": { "type": "string", "description": MANIFEST_PATH_DESC },
+                    "offline": { "type": "boolean", "description": OFFLINE_DESC },
+                    "frozen": { "type": "boolean", "description": FROZEN_DESC },
                     "features": {
                         "type": "string",
                         "description":
                             "Comma-separated list of features to activate. \
                              Omit to use default features."
+                    },
+                    "all_features": {
+                        "type": "boolean",
+                        "description":
+                            "If true, activate all features of all selected packages \
+                             (passes --all-features). Default: false."
+                    },
+                    "no_default_features": {
+                        "type": "boolean",
+                        "description":
+                            "If true, do not activate the `default` feature \
+                             (passes --no-default-features). Default: false."
                     },
                     "lib": {
                         "type": "boolean",
@@ -733,12 +1141,14 @@ pub fn list() -> Value {
                         "type": "integer",
                         "minimum": 0,
                         "description":
-                            "Wall-clock budget in seconds for this test run. When the budget \
-                             elapses, cargo and the entire subprocess tree (rustc, test binaries, \
-                             build scripts) are terminated. If omitted, the server-configured \
-                             default applies (30 seconds when launched by the VS Code extension; \
-                             no timeout otherwise). Pass 0 to disable the timeout for this run \
-                             regardless of the server default."
+                            "Wall-clock budget in seconds for test execution. The clock starts \
+                             when compilation and linking finish (cargo's build-finished record), \
+                             so the build phase is never timed — only the running tests. When the \
+                             budget elapses, cargo and the entire subprocess tree (test binaries, \
+                             etc.) are terminated. If omitted, the server-configured default \
+                             applies (30 seconds when launched by the VS Code extension; no timeout \
+                             otherwise). Pass 0 to disable the timeout for this run regardless of \
+                             the server default."
                     }
                 },
                 "required": []
@@ -760,6 +1170,7 @@ pub fn list() -> Value {
                         "type": "string",
                         "description": WORKING_DIR_DESC
                     },
+                    "toolchain": { "type": "string", "description": TOOLCHAIN_DESC },
                     "package": {
                         "type": "string",
                         "description":
@@ -772,11 +1183,44 @@ pub fn list() -> Value {
                             "If true, lint all targets (lib, bins, tests, benches, examples). \
                              Default: false."
                     },
+                    "workspace": { "type": "boolean", "description": WORKSPACE_DESC },
+                    "exclude": { "type": "string", "description": EXCLUDE_DESC },
+                    "lib": { "type": "boolean", "description": LIB_DESC },
+                    "bins": { "type": "boolean", "description": BINS_DESC },
+                    "bin": { "type": "string", "description": BIN_DESC },
+                    "examples": { "type": "boolean", "description": EXAMPLES_DESC },
+                    "example": { "type": "string", "description": EXAMPLE_DESC },
+                    "tests": { "type": "boolean", "description": TESTS_DESC },
+                    "test": { "type": "string", "description": TEST_TARGET_DESC },
+                    "benches": { "type": "boolean", "description": BENCHES_DESC },
+                    "bench": { "type": "string", "description": BENCH_DESC },
+                    "profile": { "type": "string", "description": PROFILE_DESC },
+                    "jobs": { "type": "integer", "minimum": 1, "description": JOBS_DESC },
+                    "keep_going": { "type": "boolean", "description": KEEP_GOING_DESC },
+                    "target": { "type": "string", "description": TARGET_DESC },
+                    "target_dir": { "type": "string", "description": TARGET_DIR_DESC },
+                    "timings": { "type": "boolean", "description": TIMINGS_DESC },
+                    "ignore_rust_version": { "type": "boolean", "description": IGNORE_RUST_VERSION_DESC },
+                    "manifest_path": { "type": "string", "description": MANIFEST_PATH_DESC },
+                    "offline": { "type": "boolean", "description": OFFLINE_DESC },
+                    "frozen": { "type": "boolean", "description": FROZEN_DESC },
                     "features": {
                         "type": "string",
                         "description":
                             "Comma-separated list of features to activate. \
                              Omit to use default features."
+                    },
+                    "all_features": {
+                        "type": "boolean",
+                        "description":
+                            "If true, activate all features of all selected packages \
+                             (passes --all-features). Default: false."
+                    },
+                    "no_default_features": {
+                        "type": "boolean",
+                        "description":
+                            "If true, do not activate the `default` feature \
+                             (passes --no-default-features). Default: false."
                     },
                     "locked": {
                         "type": "boolean",
@@ -815,6 +1259,7 @@ pub fn list() -> Value {
                         "type": "string",
                         "description": WORKING_DIR_DESC
                     },
+                    "toolchain": { "type": "string", "description": TOOLCHAIN_DESC },
                     "package": {
                         "type": "string",
                         "description":
@@ -841,6 +1286,7 @@ pub fn list() -> Value {
                         "type": "string",
                         "description": WORKING_DIR_DESC
                     },
+                    "toolchain": { "type": "string", "description": TOOLCHAIN_DESC },
                     "package": {
                         "type": "string",
                         "description":
@@ -868,6 +1314,7 @@ pub fn list() -> Value {
                         "type": "string",
                         "description": WORKING_DIR_DESC
                     },
+                    "toolchain": { "type": "string", "description": TOOLCHAIN_DESC },
                     "package": {
                         "type": "string",
                         "description":
@@ -892,11 +1339,30 @@ pub fn list() -> Value {
                             "If true, only show packages that appear more than once \
                              in the dependency graph (duplicate versions). Default: false."
                     },
+                    "workspace": { "type": "boolean", "description": WORKSPACE_DESC },
+                    "exclude": { "type": "string", "description": EXCLUDE_DESC },
+                    "target": { "type": "string", "description": TREE_TARGET_DESC },
+                    "manifest_path": { "type": "string", "description": MANIFEST_PATH_DESC },
+                    "locked": { "type": "boolean", "description": LOCKED_DESC },
+                    "offline": { "type": "boolean", "description": OFFLINE_DESC },
+                    "frozen": { "type": "boolean", "description": FROZEN_DESC },
                     "features": {
                         "type": "string",
                         "description":
                             "Comma-separated list of features to activate. \
                              Omit to use default features."
+                    },
+                    "all_features": {
+                        "type": "boolean",
+                        "description":
+                            "If true, activate all features of all selected packages \
+                             (passes --all-features). Default: false."
+                    },
+                    "no_default_features": {
+                        "type": "boolean",
+                        "description":
+                            "If true, do not activate the `default` feature \
+                             (passes --no-default-features). Default: false."
                     }
                 },
                 "required": []
@@ -917,6 +1383,7 @@ pub fn list() -> Value {
                         "type": "string",
                         "description": WORKING_DIR_DESC
                     },
+                    "toolchain": { "type": "string", "description": TOOLCHAIN_DESC },
                     "package": {
                         "type": "string",
                         "description":
@@ -934,6 +1401,41 @@ pub fn list() -> Value {
                         "description":
                             "If true, include documentation for private items. \
                              Default: false."
+                    },
+                    "workspace": { "type": "boolean", "description": WORKSPACE_DESC },
+                    "exclude": { "type": "string", "description": EXCLUDE_DESC },
+                    "lib": { "type": "boolean", "description": LIB_DESC },
+                    "bins": { "type": "boolean", "description": BINS_DESC },
+                    "bin": { "type": "string", "description": BIN_DESC },
+                    "examples": { "type": "boolean", "description": EXAMPLES_DESC },
+                    "example": { "type": "string", "description": EXAMPLE_DESC },
+                    "profile": { "type": "string", "description": PROFILE_DESC },
+                    "jobs": { "type": "integer", "minimum": 1, "description": JOBS_DESC },
+                    "keep_going": { "type": "boolean", "description": KEEP_GOING_DESC },
+                    "target": { "type": "string", "description": TARGET_DESC },
+                    "target_dir": { "type": "string", "description": TARGET_DIR_DESC },
+                    "timings": { "type": "boolean", "description": TIMINGS_DESC },
+                    "ignore_rust_version": { "type": "boolean", "description": IGNORE_RUST_VERSION_DESC },
+                    "manifest_path": { "type": "string", "description": MANIFEST_PATH_DESC },
+                    "offline": { "type": "boolean", "description": OFFLINE_DESC },
+                    "frozen": { "type": "boolean", "description": FROZEN_DESC },
+                    "features": {
+                        "type": "string",
+                        "description":
+                            "Comma-separated list of features to activate. \
+                             Omit to use default features."
+                    },
+                    "all_features": {
+                        "type": "boolean",
+                        "description":
+                            "If true, activate all features of all selected packages \
+                             (passes --all-features). Default: false."
+                    },
+                    "no_default_features": {
+                        "type": "boolean",
+                        "description":
+                            "If true, do not activate the `default` feature \
+                             (passes --no-default-features). Default: false."
                     },
                     "locked": {
                         "type": "boolean",
@@ -1370,27 +1872,18 @@ fn call_check(
     on_progress: Option<&mut dyn FnMut(&str)>,
 ) -> Result<ToolResult, Box<dyn std::error::Error>> {
     let wd = opt_str(args, "working_dir");
+    let tc = toolchain_arg(args);
     let mut argv: Vec<&str> = vec!["check", "--message-format=json"];
-    let pkg = opt_str(args, "package").map(String::from);
-    let features = opt_str(args, "features").map(String::from);
-    if let Some(ref p) = pkg {
-        argv.push("--package");
-        argv.push(p);
+    let o = CommonOpts::from_args(args);
+    push_package_selection(&mut argv, args, &o);
+    push_target_selection(&mut argv, args, &o);
+    push_feature_flags(&mut argv, args, &o);
+    push_compilation_options(&mut argv, args, &o, true);
+    push_manifest_options(&mut argv, args, &o, true);
+    if let Some(ref t) = tc {
+        argv.insert(0, t);
     }
-    if opt_bool(args, "release") {
-        argv.push("--release");
-    }
-    if opt_bool(args, "all_targets") {
-        argv.push("--all-targets");
-    }
-    if let Some(ref f) = features {
-        argv.push("--features");
-        argv.push(f);
-    }
-    if opt_bool(args, "locked") {
-        argv.push("--locked");
-    }
-    let out = run_cargo_maybe_streaming(&argv, wd, opt_timeout(args)?, on_progress)?;
+    let out = run_cargo_maybe_streaming(&argv, wd, opt_timeout(args)?, None, on_progress)?;
     let output = format_json_output(&out, &argv, wd);
     let suggestions = suggest::extract_suggestions(&out.stdout);
     Ok(ToolResult::WithSuggestions {
@@ -1404,27 +1897,18 @@ fn call_build(
     on_progress: Option<&mut dyn FnMut(&str)>,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let wd = opt_str(args, "working_dir");
+    let tc = toolchain_arg(args);
     let mut argv: Vec<&str> = vec!["build", "--message-format=json"];
-    let pkg = opt_str(args, "package").map(String::from);
-    let features = opt_str(args, "features").map(String::from);
-    if let Some(ref p) = pkg {
-        argv.push("--package");
-        argv.push(p);
+    let o = CommonOpts::from_args(args);
+    push_package_selection(&mut argv, args, &o);
+    push_target_selection(&mut argv, args, &o);
+    push_feature_flags(&mut argv, args, &o);
+    push_compilation_options(&mut argv, args, &o, true);
+    push_manifest_options(&mut argv, args, &o, true);
+    if let Some(ref t) = tc {
+        argv.insert(0, t);
     }
-    if opt_bool(args, "release") {
-        argv.push("--release");
-    }
-    if opt_bool(args, "all_targets") {
-        argv.push("--all-targets");
-    }
-    if let Some(ref f) = features {
-        argv.push("--features");
-        argv.push(f);
-    }
-    if opt_bool(args, "locked") {
-        argv.push("--locked");
-    }
-    let out = run_cargo_maybe_streaming(&argv, wd, opt_timeout(args)?, on_progress)?;
+    let out = run_cargo_maybe_streaming(&argv, wd, opt_timeout(args)?, None, on_progress)?;
     Ok(format_json_output(&out, &argv, wd))
 }
 
@@ -1433,35 +1917,27 @@ fn call_test(
     on_progress: Option<&mut dyn FnMut(&str)>,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let wd = opt_str(args, "working_dir");
+    let tc = toolchain_arg(args);
     let mut argv: Vec<&str> = vec!["test", "--message-format=json"];
-    let pkg = opt_str(args, "package").map(String::from);
-    let features = opt_str(args, "features").map(String::from);
-    let test_target = opt_str(args, "test").map(String::from);
+    let o = CommonOpts::from_args(args);
     let test_name = opt_str(args, "test_name").map(String::from);
-    if let Some(ref p) = pkg {
-        argv.push("--package");
-        argv.push(p);
+    push_package_selection(&mut argv, args, &o);
+    // `cargo test` supports the full target-selection set (including --test,
+    // handled by push_target_selection) plus --doc for doctests.
+    push_target_selection(&mut argv, args, &o);
+    if opt_bool(args, "doc") {
+        argv.push("--doc");
     }
-    if opt_bool(args, "release") {
-        argv.push("--release");
+    if opt_bool(args, "no_run") {
+        argv.push("--no-run");
     }
     if opt_bool(args, "no_fail_fast") {
         argv.push("--no-fail-fast");
     }
-    if opt_bool(args, "lib") {
-        argv.push("--lib");
-    }
-    if let Some(ref t) = test_target {
-        argv.push("--test");
-        argv.push(t);
-    }
-    if let Some(ref f) = features {
-        argv.push("--features");
-        argv.push(f);
-    }
-    if opt_bool(args, "locked") {
-        argv.push("--locked");
-    }
+    push_feature_flags(&mut argv, args, &o);
+    // `cargo test` accepts every compilation flag except --keep-going.
+    push_compilation_options(&mut argv, args, &o, false);
+    push_manifest_options(&mut argv, args, &o, true);
     // Test name filter goes after `--` to the test harness.
     if test_name.is_some() || opt_bool(args, "exact") {
         argv.push("--");
@@ -1472,6 +1948,9 @@ fn call_test(
             argv.push("--exact");
         }
     }
+    if let Some(ref t) = tc {
+        argv.insert(0, t);
+    }
     // Caller-supplied timeout wins; fall back to the server-configured default
     // (cargo-mcp.test.timeoutSecs VS Code setting, default 30s).
     // opt_timeout_explicit distinguishes three cases:
@@ -1479,10 +1958,19 @@ fn call_test(
     //   Some(None)   → explicit 0: disable timeout for this run
     //   Some(Some(d))→ explicit positive: use caller's budget
     let timeout = match opt_timeout_explicit(args)? {
-        None => default_test_timeout(),           // use server default
-        Some(explicit) => explicit,               // caller wins (including None=disable)
+        None => default_test_timeout(), // use server default
+        Some(explicit) => explicit,     // caller wins (including None=disable)
     };
-    let out = run_cargo_maybe_streaming(&argv, wd, timeout, on_progress)?;
+    // Arm the timeout only once compilation/linking finishes (cargo emits the
+    // `build-finished` record), so the budget bounds test *execution* and not
+    // the build phase.
+    let out = run_cargo_maybe_streaming(
+        &argv,
+        wd,
+        timeout,
+        Some(&is_build_finished_line),
+        on_progress,
+    )?;
     // Test output is a mix: JSON from compilation, text from the test harness.
     // Use format_test_output so that non-JSON lines (libtest harness text,
     // captured println! replays) are preserved as x-cargo-mcp-test-output
@@ -1495,24 +1983,18 @@ fn call_clippy(
     on_progress: Option<&mut dyn FnMut(&str)>,
 ) -> Result<ToolResult, Box<dyn std::error::Error>> {
     let wd = opt_str(args, "working_dir");
+    let tc = toolchain_arg(args);
     let mut argv: Vec<&str> = vec!["clippy", "--message-format=json"];
-    let pkg = opt_str(args, "package").map(String::from);
-    let features = opt_str(args, "features").map(String::from);
-    if let Some(ref p) = pkg {
-        argv.push("--package");
-        argv.push(p);
+    let o = CommonOpts::from_args(args);
+    push_package_selection(&mut argv, args, &o);
+    push_target_selection(&mut argv, args, &o);
+    push_feature_flags(&mut argv, args, &o);
+    push_compilation_options(&mut argv, args, &o, true);
+    push_manifest_options(&mut argv, args, &o, true);
+    if let Some(ref t) = tc {
+        argv.insert(0, t);
     }
-    if opt_bool(args, "all_targets") {
-        argv.push("--all-targets");
-    }
-    if let Some(ref f) = features {
-        argv.push("--features");
-        argv.push(f);
-    }
-    if opt_bool(args, "locked") {
-        argv.push("--locked");
-    }
-    let out = run_cargo_maybe_streaming(&argv, wd, opt_timeout(args)?, on_progress)?;
+    let out = run_cargo_maybe_streaming(&argv, wd, opt_timeout(args)?, None, on_progress)?;
     let output = format_json_output(&out, &argv, wd);
     let suggestions = suggest::extract_suggestions(&out.stdout);
     Ok(ToolResult::WithSuggestions {
@@ -1523,11 +2005,15 @@ fn call_clippy(
 
 fn call_fmt_check(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
     let wd = opt_str(args, "working_dir");
+    let tc = toolchain_arg(args);
     let mut argv: Vec<&str> = vec!["fmt", "--check"];
     let pkg = opt_str(args, "package").map(String::from);
     if let Some(ref p) = pkg {
         argv.push("--package");
         argv.push(p);
+    }
+    if let Some(ref t) = tc {
+        argv.insert(0, t);
     }
     let out = invoke::run_cargo(&argv, wd)?;
     Ok(format_text_output(&out, &argv, wd))
@@ -1535,11 +2021,15 @@ fn call_fmt_check(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
 
 fn call_fmt(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
     let wd = opt_str(args, "working_dir");
+    let tc = toolchain_arg(args);
     let mut argv: Vec<&str> = vec!["fmt"];
     let pkg = opt_str(args, "package").map(String::from);
     if let Some(ref p) = pkg {
         argv.push("--package");
         argv.push(p);
+    }
+    if let Some(ref t) = tc {
+        argv.insert(0, t);
     }
     let out = invoke::run_cargo(&argv, wd)?;
     Ok(format_text_output(&out, &argv, wd))
@@ -1547,15 +2037,12 @@ fn call_fmt(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
 
 fn call_tree(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
     let wd = opt_str(args, "working_dir");
+    let tc = toolchain_arg(args);
     let mut argv: Vec<&str> = vec!["tree"];
-    let pkg = opt_str(args, "package").map(String::from);
-    let features = opt_str(args, "features").map(String::from);
+    let o = CommonOpts::from_args(args);
     let invert = opt_str(args, "invert").map(String::from);
     let depth_val: String;
-    if let Some(ref p) = pkg {
-        argv.push("--package");
-        argv.push(p);
-    }
+    push_package_selection(&mut argv, args, &o);
     if let Some(ref i) = invert {
         argv.push("--invert");
         argv.push(i);
@@ -1568,9 +2055,16 @@ fn call_tree(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
         argv.push("--depth");
         argv.push(&depth_val);
     }
-    if let Some(ref f) = features {
-        argv.push("--features");
-        argv.push(f);
+    push_feature_flags(&mut argv, args, &o);
+    // `cargo tree` supports only --target from the compilation group.
+    if let Some(ref t) = o.target {
+        argv.push("--target");
+        argv.push(t);
+    }
+    // `cargo tree` has no --ignore-rust-version.
+    push_manifest_options(&mut argv, args, &o, false);
+    if let Some(ref t) = tc {
+        argv.insert(0, t);
     }
     let out = invoke::run_cargo(&argv, wd)?;
     Ok(format_text_output(&out, &argv, wd))
@@ -1581,22 +2075,25 @@ fn call_doc(
     on_progress: Option<&mut dyn FnMut(&str)>,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let wd = opt_str(args, "working_dir");
+    let tc = toolchain_arg(args);
     let mut argv: Vec<&str> = vec!["doc", "--message-format=json"];
-    let pkg = opt_str(args, "package").map(String::from);
-    if let Some(ref p) = pkg {
-        argv.push("--package");
-        argv.push(p);
-    }
+    let o = CommonOpts::from_args(args);
+    push_package_selection(&mut argv, args, &o);
+    // `cargo doc` supports only a subset of target selection.
+    push_doc_target_selection(&mut argv, args, &o);
     if opt_bool(args, "no_deps") {
         argv.push("--no-deps");
     }
     if opt_bool(args, "document_private_items") {
         argv.push("--document-private-items");
     }
-    if opt_bool(args, "locked") {
-        argv.push("--locked");
+    push_feature_flags(&mut argv, args, &o);
+    push_compilation_options(&mut argv, args, &o, true);
+    push_manifest_options(&mut argv, args, &o, true);
+    if let Some(ref t) = tc {
+        argv.insert(0, t);
     }
-    let out = run_cargo_maybe_streaming(&argv, wd, None, on_progress)?;
+    let out = run_cargo_maybe_streaming(&argv, wd, None, None, on_progress)?;
     Ok(format_json_output(&out, &argv, wd))
 }
 
@@ -1997,5 +2494,212 @@ mod tests {
         assert_eq!(t, Some(std::time::Duration::from_secs(60)));
 
         set_default_test_timeout(None); // restore
+    }
+
+    #[test]
+    fn is_build_finished_line_matches_cargo_record() {
+        // The exact compact JSON cargo emits with --message-format=json.
+        assert!(is_build_finished_line(
+            r#"{"reason":"build-finished","success":true}"#
+        ));
+        assert!(is_build_finished_line(
+            r#"{"reason":"build-finished","success":false}"#
+        ));
+    }
+
+    #[test]
+    fn is_build_finished_line_rejects_other_records() {
+        assert!(!is_build_finished_line(
+            r#"{"reason":"compiler-message","message":{}}"#
+        ));
+        assert!(!is_build_finished_line(r#"{"reason":"compiler-artifact"}"#));
+        assert!(!is_build_finished_line("running 3 tests"));
+        assert!(!is_build_finished_line(""));
+    }
+
+    #[test]
+    fn push_feature_flags_emits_selected_flags() {
+        // --features takes the comma-separated value; the booleans are bare.
+        let args = serde_json::json!({
+            "features": "foo,bar",
+            "all_features": true,
+            "no_default_features": true,
+        });
+        let o = CommonOpts::from_args(&args);
+        let mut argv: Vec<&str> = vec!["build"];
+        push_feature_flags(&mut argv, &args, &o);
+        assert_eq!(
+            argv,
+            vec![
+                "build",
+                "--features",
+                "foo,bar",
+                "--all-features",
+                "--no-default-features",
+            ]
+        );
+    }
+
+    #[test]
+    fn push_feature_flags_omits_absent_flags() {
+        let args = serde_json::json!({});
+        let o = CommonOpts::from_args(&args);
+        let mut argv: Vec<&str> = vec!["check"];
+        push_feature_flags(&mut argv, &args, &o);
+        assert_eq!(argv, vec!["check"]);
+    }
+
+    #[test]
+    fn toolchain_arg_prefixes_plus() {
+        let args = serde_json::json!({ "toolchain": "nightly" });
+        assert_eq!(toolchain_arg(&args).as_deref(), Some("+nightly"));
+    }
+
+    #[test]
+    fn toolchain_arg_strips_existing_plus() {
+        // A caller that already wrote `+nightly` must not become `++nightly`.
+        let args = serde_json::json!({ "toolchain": "+ms-prod" });
+        assert_eq!(toolchain_arg(&args).as_deref(), Some("+ms-prod"));
+    }
+
+    #[test]
+    fn toolchain_arg_absent_or_blank_is_none() {
+        assert_eq!(toolchain_arg(&serde_json::json!({})), None);
+        assert_eq!(toolchain_arg(&serde_json::json!({ "toolchain": "" })), None);
+        assert_eq!(
+            toolchain_arg(&serde_json::json!({ "toolchain": "   " })),
+            None
+        );
+    }
+
+    #[test]
+    fn toolchain_token_goes_first_in_argv() {
+        // Mirror how call_* functions prepend the override at index 0 so cargo
+        // sees `+<toolchain>` immediately after the binary name.
+        let tc = toolchain_arg(&serde_json::json!({ "toolchain": "ms-prod" }));
+        let mut argv: Vec<&str> = vec!["test", "--message-format=json"];
+        if let Some(ref t) = tc {
+            argv.insert(0, t);
+        }
+        assert_eq!(argv, vec!["+ms-prod", "test", "--message-format=json"]);
+    }
+
+    #[test]
+    fn push_target_selection_emits_all_flags() {
+        let args = serde_json::json!({
+            "lib": true,
+            "bins": true,
+            "bin": "mybin",
+            "examples": true,
+            "example": "myex",
+            "tests": true,
+            "test": "mytest",
+            "benches": true,
+            "bench": "mybench",
+            "all_targets": true,
+        });
+        let o = CommonOpts::from_args(&args);
+        let mut argv: Vec<&str> = vec!["check"];
+        push_target_selection(&mut argv, &args, &o);
+        assert_eq!(
+            argv,
+            vec![
+                "check",
+                "--lib",
+                "--bins",
+                "--bin",
+                "mybin",
+                "--examples",
+                "--example",
+                "myex",
+                "--tests",
+                "--test",
+                "mytest",
+                "--benches",
+                "--bench",
+                "mybench",
+                "--all-targets",
+            ]
+        );
+    }
+
+    #[test]
+    fn push_compilation_options_gates_keep_going() {
+        // keep_going requested but the subcommand does not support it (false):
+        // the flag must be suppressed.
+        let args = serde_json::json!({
+            "release": true,
+            "profile": "dist",
+            "jobs": 4,
+            "keep_going": true,
+            "target": "x86_64-unknown-linux-gnu",
+            "target_dir": "out",
+            "timings": true,
+        });
+        let o = CommonOpts::from_args(&args);
+        let mut without = vec!["test"];
+        push_compilation_options(&mut without, &args, &o, false);
+        assert!(!without.contains(&"--keep-going"));
+        // `profile` takes precedence over `release` when both are provided.
+        assert!(!without.contains(&"--release"));
+        assert!(without.contains(&"--profile"));
+        assert!(without.contains(&"dist"));
+        assert_eq!(without.iter().filter(|a| **a == "--jobs").count(), 1);
+
+        let mut with = vec!["build"];
+        push_compilation_options(&mut with, &args, &o, true);
+        assert!(with.contains(&"--keep-going"));
+    }
+
+    #[test]
+    fn push_compilation_options_release_without_profile() {
+        let args = serde_json::json!({ "release": true });
+        let o = CommonOpts::from_args(&args);
+        let mut argv = vec!["build"];
+        push_compilation_options(&mut argv, &args, &o, true);
+        assert!(argv.contains(&"--release"));
+        assert!(!argv.contains(&"--profile"));
+    }
+
+    #[test]
+    fn push_package_selection_exclude_requires_workspace() {
+        // Without `workspace`, `--exclude` must be suppressed even if provided.
+        let args = serde_json::json!({ "exclude": "skipme" });
+        let o = CommonOpts::from_args(&args);
+        let mut argv = vec!["build"];
+        push_package_selection(&mut argv, &args, &o);
+        assert!(!argv.contains(&"--exclude"));
+        assert!(!argv.contains(&"skipme"));
+
+        // With `workspace=true`, `--exclude` is forwarded as before.
+        let args = serde_json::json!({ "workspace": true, "exclude": "skipme" });
+        let o = CommonOpts::from_args(&args);
+        let mut argv = vec!["build"];
+        push_package_selection(&mut argv, &args, &o);
+        assert!(argv.contains(&"--workspace"));
+        assert!(argv.contains(&"--exclude"));
+        assert!(argv.contains(&"skipme"));
+    }
+
+    #[test]
+    fn push_manifest_options_gates_ignore_rust_version() {
+        let args = serde_json::json!({
+            "manifest_path": "Cargo.toml",
+            "ignore_rust_version": true,
+            "locked": true,
+            "offline": true,
+            "frozen": true,
+        });
+        let o = CommonOpts::from_args(&args);
+        let mut without = vec!["tree"];
+        push_manifest_options(&mut without, &args, &o, false);
+        assert!(!without.contains(&"--ignore-rust-version"));
+        assert!(without.contains(&"--locked"));
+        assert!(without.contains(&"--offline"));
+        assert!(without.contains(&"--frozen"));
+
+        let mut with = vec!["check"];
+        push_manifest_options(&mut with, &args, &o, true);
+        assert!(with.contains(&"--ignore-rust-version"));
     }
 }

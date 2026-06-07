@@ -108,11 +108,17 @@ const IDEMPOTENT_SUBCOMMANDS: &[&str] = &[
     "check", "build", "test", "clippy", "fmt", "doc", "tree", "clean", "metadata",
 ];
 
-/// Returns `true` iff `args[0]` (the cargo subcommand) is in
-/// [`IDEMPOTENT_SUBCOMMANDS`].
+/// Returns `true` iff the cargo subcommand is in [`IDEMPOTENT_SUBCOMMANDS`].
+///
+/// A leading `+<toolchain>` override (e.g. `+nightly`) may precede the
+/// subcommand (`cargo +nightly test ...`); it is skipped when locating the
+/// subcommand so toolchain-pinned invocations remain retry-eligible.
 fn is_retry_safe(args: &[&str]) -> bool {
-    args.first()
-        .is_some_and(|sub| IDEMPOTENT_SUBCOMMANDS.contains(sub))
+    let sub = match args.first() {
+        Some(first) if first.starts_with('+') => args.get(1),
+        other => other,
+    };
+    sub.is_some_and(|sub| IDEMPOTENT_SUBCOMMANDS.contains(sub))
 }
 
 /// Is the given combined cargo stderr/stdout indicative of a transient
@@ -753,8 +759,16 @@ pub fn run_cargo_streaming(
     working_dir: Option<&str>,
     on_stdout_line: &mut dyn FnMut(&str),
 ) -> Result<CargoOutput, Box<dyn std::error::Error>> {
-    run_cargo_streaming_with_timeout(args, working_dir, None, on_stdout_line)
+    run_cargo_streaming_with_timeout(args, working_dir, None, None, on_stdout_line)
 }
+
+/// Predicate that, when it returns `true` for a streamed stdout line, **arms**
+/// the wall-clock deadline at that instant instead of at process spawn.
+///
+/// Used by `cargo_test` so the timeout bounds only test *execution*: the
+/// deadline starts when cargo emits the `build-finished` record (compilation
+/// and linking are complete), not while the project is still building.
+pub type ArmDeadline<'a> = &'a dyn Fn(&str) -> bool;
 
 /// Run `cargo <args>` with a wall-clock budget, streaming stdout.
 ///
@@ -769,10 +783,18 @@ pub fn run_cargo_streaming(
 /// the **entire process tree** (cargo, rustc, spawned test binaries, …) is
 /// killed via [`ManagedChild::kill_tree`] and [`CancelledError`] or
 /// [`TimeoutError`] is returned respectively.
+///
+/// When `arm_deadline` is `Some`, the wall-clock budget does **not** start at
+/// spawn; instead it begins the moment a streamed stdout line satisfies the
+/// predicate (e.g. cargo's `build-finished` record). This lets `cargo_test`
+/// time only test execution and never the compile/link phase. In that mode
+/// retries are not bounded by the budget (a slow build can take as long as it
+/// needs); each attempt arms its own deadline once execution begins.
 pub fn run_cargo_streaming_with_timeout(
     args: &[&str],
     working_dir: Option<&str>,
     timeout: Option<Duration>,
+    arm_deadline: Option<ArmDeadline<'_>>,
     on_stdout_line: &mut dyn FnMut(&str),
 ) -> Result<CargoOutput, Box<dyn std::error::Error>> {
     // Retry only for cargo subcommands that are inherently idempotent. This
@@ -786,18 +808,32 @@ pub fn run_cargo_streaming_with_timeout(
     };
     let delay = Duration::from_millis(RETRY_DELAY_MS.load(Ordering::Relaxed));
 
-    // Compute a single overall deadline so retries + backoff cannot exceed
-    // the caller's wall-clock budget. Each attempt gets only the remaining
-    // slice; sleeps between attempts are also bounded by it.
+    // In deferred-arming mode the budget only covers test execution inside a
+    // single attempt, so there is no overall wall-clock cap across retries +
+    // backoff. In the normal mode, compute a single overall deadline so
+    // retries + backoff cannot exceed the caller's budget; each attempt gets
+    // only the remaining slice and sleeps between attempts are bounded by it.
+    let arming = arm_deadline.is_some();
     let overall_start = Instant::now();
-    let overall_deadline = timeout.and_then(|t| overall_start.checked_add(t));
+    let overall_deadline = if arming {
+        None
+    } else {
+        timeout.and_then(|t| overall_start.checked_add(t))
+    };
     let remaining = |now: Instant| -> Option<Duration> {
         overall_deadline.map(|d| d.saturating_duration_since(now))
     };
 
     let mut last: Option<CargoOutput> = None;
     for attempt in 1..=max_attempts {
-        let attempt_budget = remaining(Instant::now());
+        // In arming mode each attempt gets the full budget (armed lazily on
+        // the marker); otherwise it gets the remaining slice of the overall
+        // deadline.
+        let attempt_budget = if arming {
+            timeout
+        } else {
+            remaining(Instant::now())
+        };
         if let Some(r) = attempt_budget
             && r.is_zero()
         {
@@ -805,16 +841,30 @@ pub fn run_cargo_streaming_with_timeout(
                 elapsed: overall_start.elapsed(),
             }));
         }
-        let mut out = run_cargo_streaming_once(args, working_dir, attempt_budget, on_stdout_line)
-            .map_err(|e| -> Box<dyn std::error::Error> {
-            // Normalize any timeout from the inner attempt to the
+        let mut out = run_cargo_streaming_once(
+            args,
+            working_dir,
+            attempt_budget,
+            arm_deadline,
+            on_stdout_line,
+        )
+        .map_err(|e| -> Box<dyn std::error::Error> {
+            // In arming mode preserve the inner, execution-relative elapsed
+            // (the build phase is excluded). Otherwise normalize any timeout
+            // from the inner attempt to the
             // overall wall-clock elapsed across all attempts and backoff
             // sleeps, so callers see a consistent value regardless of
             // which branch detected the deadline.
             if e.is::<TimeoutError>() {
-                Box::new(TimeoutError {
-                    elapsed: overall_start.elapsed(),
-                })
+                if arming {
+                    // Keep the execution-relative elapsed from the inner
+                    // attempt; the build phase is intentionally excluded.
+                    e
+                } else {
+                    Box::new(TimeoutError {
+                        elapsed: overall_start.elapsed(),
+                    })
+                }
             } else {
                 e
             }
@@ -889,6 +939,7 @@ fn run_cargo_streaming_once(
     args: &[&str],
     working_dir: Option<&str>,
     timeout: Option<Duration>,
+    arm_deadline: Option<ArmDeadline<'_>>,
     on_stdout_line: &mut dyn FnMut(&str),
 ) -> Result<CargoOutput, Box<dyn std::error::Error>> {
     let (cargo_path, source) = resolve_cargo_binary();
@@ -944,7 +995,18 @@ fn run_cargo_streaming_once(
     let start = Instant::now();
     // checked_add: a caller-supplied timeout near Duration::MAX would panic
     // on `start + t`. Treat overflow as "no deadline" rather than crashing.
-    let deadline = timeout.and_then(|t| start.checked_add(t));
+    //
+    // Normal mode: arm the deadline at spawn. Deferred-arming mode
+    // (`arm_deadline` is `Some`): leave it unset and arm it the first time a
+    // streamed stdout line satisfies the predicate (e.g. cargo's
+    // `build-finished` record), so only test execution is timed. `armed_at`
+    // records that instant so the timeout's reported `elapsed` is relative to
+    // execution start, not process spawn.
+    let mut deadline = match arm_deadline {
+        Some(_) => None,
+        None => timeout.and_then(|t| start.checked_add(t)),
+    };
+    let mut armed_at: Option<Instant> = None;
     let mut stdout_buf = String::new();
     let mut outcome = WaitOutcome::Exited;
     let tick = Duration::from_millis(50);
@@ -956,11 +1018,21 @@ fn run_cargo_streaming_once(
         if let Some(d) = deadline
             && Instant::now() >= d
         {
-            outcome = WaitOutcome::TimedOut(start.elapsed());
+            let elapsed = armed_at.unwrap_or(start).elapsed();
+            outcome = WaitOutcome::TimedOut(elapsed);
             break;
         }
         match rx.recv_timeout(tick) {
             Ok(Some(l)) => {
+                // Arm the deadline on the marker line (deferred-arming mode).
+                if deadline.is_none()
+                    && let (Some(t), Some(pred)) = (timeout, arm_deadline)
+                    && pred(&l)
+                {
+                    let now = Instant::now();
+                    armed_at = Some(now);
+                    deadline = now.checked_add(t);
+                }
                 on_stdout_line(&l);
                 stdout_buf.push_str(&l);
                 stdout_buf.push('\n');
@@ -1027,16 +1099,22 @@ pub fn run_cargo(
     args: &[&str],
     working_dir: Option<&str>,
 ) -> Result<CargoOutput, Box<dyn std::error::Error>> {
-    run_cargo_with_timeout(args, working_dir, None)
+    run_cargo_with_timeout(args, working_dir, None, None)
 }
 
 /// Run `cargo <args>` with a wall-clock budget; no streaming callback.
+///
+/// `arm_deadline` has the same meaning as in
+/// [`run_cargo_streaming_with_timeout`]: when `Some`, the budget starts only
+/// once a stdout line satisfies the predicate (used to time test execution
+/// without the build phase).
 pub fn run_cargo_with_timeout(
     args: &[&str],
     working_dir: Option<&str>,
     timeout: Option<Duration>,
+    arm_deadline: Option<ArmDeadline<'_>>,
 ) -> Result<CargoOutput, Box<dyn std::error::Error>> {
-    run_cargo_streaming_with_timeout(args, working_dir, timeout, &mut |_| {})
+    run_cargo_streaming_with_timeout(args, working_dir, timeout, arm_deadline, &mut |_| {})
 }
 
 /// Run `cargo <args>`, piping stdout **directly** into `dest_file` at the OS
@@ -1563,6 +1641,17 @@ mod tests {
     #[test]
     fn is_retry_safe_rejects_empty_args() {
         assert!(!is_retry_safe(&[]));
+    }
+
+    #[test]
+    fn is_retry_safe_skips_leading_toolchain_override() {
+        // A `+toolchain` token precedes the subcommand; retry-safety must be
+        // judged on the subcommand, not the override.
+        assert!(is_retry_safe(&["+nightly", "test"]));
+        assert!(is_retry_safe(&["+ms-prod", "check", "--all-targets"]));
+        assert!(!is_retry_safe(&["+nightly", "publish"]));
+        // A lone toolchain token with no subcommand is not retry-safe.
+        assert!(!is_retry_safe(&["+nightly"]));
     }
 
     #[test]

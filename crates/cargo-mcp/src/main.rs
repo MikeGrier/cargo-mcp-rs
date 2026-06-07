@@ -9,6 +9,11 @@
 //! stderr. This keeps the MCP server as a thin dispatch layer — all build
 //! logic lives in Cargo itself.
 
+// The tool-definition table in `tools.rs` is built with a single large
+// `serde_json::json!` literal; the default recursion limit (128) is not enough
+// to expand it once every subcommand advertises its full option set.
+#![recursion_limit = "512"]
+
 mod busy_files;
 mod elicit;
 mod invoke;
@@ -512,7 +517,7 @@ fn handle_tool_call(
             .get("target")
             .and_then(|v| v.as_str())
             .map(str::to_owned);
-        let mut tracker = BuildTracker::new(verb, target);
+        let mut tracker = BuildTracker::new(verb, target, profile_tag(&args));
         let mut cb = |line: &str| {
             let msg = tracker.process_line(line);
             if !msg.is_empty() {
@@ -669,22 +674,28 @@ fn handle_tool_call(
 ///   running lower bound on the total number of crates in the build graph.
 /// - `verb` / `target` — included in the terminal `build-finished` /
 ///   `build-failed` message so the chat-history summary line is unambiguous
-///   (e.g. `cargo check (x86_64-pc-windows-msvc) finished` instead of just
+///   (e.g. `Cargo check (x86_64-pc-windows-msvc) finished` instead of just
 ///   `Build finished`).
+/// - `profile_tag` — a short bracketed marker for the effective compilation
+///   profile (`[D]` debug/dev, `[R]` release, `[name]` for any other named
+///   profile), so the progress line shows at a glance whether this is a
+///   debug or optimized build.
 struct BuildTracker {
     compile_count: u32,
     total_count: u32,
     verb: String,
     target: Option<String>,
+    profile_tag: String,
 }
 
 impl BuildTracker {
-    fn new(verb: String, target: Option<String>) -> Self {
+    fn new(verb: String, target: Option<String>, profile_tag: String) -> Self {
         Self {
             compile_count: 0,
             total_count: 0,
             verb,
             target,
+            profile_tag,
         }
     }
 
@@ -729,10 +740,11 @@ impl BuildTracker {
 
                 let counter = format!("({}/{})", self.compile_count, self.total_count);
                 let verb = &self.verb;
+                let profile = &self.profile_tag;
                 if let Some(reg) = registry_name {
-                    format!("{verb}: {name} v{version} {counter} [{reg}]")
+                    format!("Cargo {verb}: {name} v{version} {counter} {profile} [{reg}]")
                 } else {
-                    format!("{verb}: {name} v{version} {counter}")
+                    format!("Cargo {verb}: {name} v{version} {counter} {profile}")
                 }
             }
             Some("compiler-message") => {
@@ -750,7 +762,7 @@ impl BuildTracker {
                     return String::new();
                 }
                 let truncated: String = msg.chars().take(120).collect();
-                format!("{}: [{level}] {truncated}", self.verb)
+                format!("Cargo {}: [{level}] {truncated}", self.verb)
             }
             Some("build-finished") => {
                 let ok = v.get("success").and_then(|s| s.as_bool()).unwrap_or(false);
@@ -759,7 +771,10 @@ impl BuildTracker {
                     None => String::new(),
                 };
                 let outcome = if ok { "finished" } else { "failed" };
-                format!("cargo {}{} {}", self.verb, target_suffix, outcome)
+                format!(
+                    "Cargo {} {}{} {}",
+                    self.verb, self.profile_tag, target_suffix, outcome
+                )
             }
             _ => String::new(),
         }
@@ -808,6 +823,42 @@ fn registry_label(pkg_id: &str) -> Option<String> {
         Some("crates.io".to_owned())
     } else {
         Some(last_segment.to_owned())
+    }
+}
+
+/// Derive a short bracketed profile marker for the progress line from the
+/// tool's `arguments`.
+///
+/// - explicit `profile: "dev"` (or no profile and no `release`) → `[D]`
+/// - explicit `profile: "release"` or `release: true`           → `[R]`
+/// - `profile: "test"`                                          → `[T]`
+/// - `profile: "bench"`                                         → `[B]`
+/// - `profile: "doc"`                                           → `[doc]`
+/// - any other named profile (e.g. `my-profile`)               → `{name}`
+///
+/// Braces distinguish a custom profile name from the abbreviated markers for
+/// the well-known built-in profiles.
+///
+/// An explicit `profile` argument always wins over `release`, matching
+/// cargo's own precedence.
+fn profile_tag(args: &Value) -> String {
+    let explicit = args.get("profile").and_then(|v| v.as_str());
+    let release = args
+        .get("release")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let name = match explicit {
+        Some(p) => p,
+        None if release => "release",
+        None => "dev",
+    };
+    match name {
+        "dev" | "debug" => "[D]".to_owned(),
+        "release" => "[R]".to_owned(),
+        "test" => "[T]".to_owned(),
+        "bench" => "[B]".to_owned(),
+        "doc" => "[doc]".to_owned(),
+        other => format!("{{{other}}}"),
     }
 }
 
@@ -898,4 +949,73 @@ fn log_warn(out: &mut impl io::Write, message: impl Into<String>) {
             "data": message.into(),
         }),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn profile_tag_defaults_to_debug() {
+        assert_eq!(profile_tag(&serde_json::json!({})), "[D]");
+    }
+
+    #[test]
+    fn profile_tag_release_flag_is_r() {
+        assert_eq!(profile_tag(&serde_json::json!({ "release": true })), "[R]");
+    }
+
+    #[test]
+    fn profile_tag_explicit_profile_wins_over_release() {
+        let args = serde_json::json!({ "release": true, "profile": "dev" });
+        assert_eq!(profile_tag(&args), "[D]");
+    }
+
+    #[test]
+    fn profile_tag_named_profile_shown_verbatim() {
+        let args = serde_json::json!({ "profile": "my-profile" });
+        assert_eq!(profile_tag(&args), "{my-profile}");
+    }
+
+    #[test]
+    fn profile_tag_known_named_profiles_abbreviated() {
+        assert_eq!(
+            profile_tag(&serde_json::json!({ "profile": "test" })),
+            "[T]"
+        );
+        assert_eq!(
+            profile_tag(&serde_json::json!({ "profile": "bench" })),
+            "[B]"
+        );
+        assert_eq!(
+            profile_tag(&serde_json::json!({ "profile": "doc" })),
+            "[doc]"
+        );
+    }
+
+    #[test]
+    fn process_line_compile_line_has_cargo_prefix_and_profile() {
+        let mut t = BuildTracker::new("check".to_owned(), None, "[D]".to_owned());
+        let line = r#"{"reason":"compiler-artifact","fresh":false,"package_id":"registry+https://github.com/rust-lang/crates.io-index#serde@1.0.228","target":{"name":"serde"}}"#;
+        let msg = t.process_line(line);
+        assert_eq!(msg, "Cargo check: serde v1.0.228 (1/1) [D] [crates.io]");
+    }
+
+    #[test]
+    fn process_line_finished_has_cargo_prefix_and_profile() {
+        let mut t = BuildTracker::new("build".to_owned(), None, "[R]".to_owned());
+        let msg = t.process_line(r#"{"reason":"build-finished","success":true}"#);
+        assert_eq!(msg, "Cargo build [R] finished");
+    }
+
+    #[test]
+    fn process_line_finished_includes_target_triple() {
+        let mut t = BuildTracker::new(
+            "check".to_owned(),
+            Some("x86_64-pc-windows-msvc".to_owned()),
+            "[D]".to_owned(),
+        );
+        let msg = t.process_line(r#"{"reason":"build-finished","success":false}"#);
+        assert_eq!(msg, "Cargo check [D] (x86_64-pc-windows-msvc) failed");
+    }
 }

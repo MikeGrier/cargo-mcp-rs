@@ -12,6 +12,16 @@ tools listed below instead of running `cargo` commands in a PowerShell or bash
 terminal. This applies even inside a larger workflow — do not switch to the
 terminal for cargo just because a previous step used the terminal.
 
+Two specific things that are NOT reasons to fall back to the terminal:
+
+- **Filtering output** (e.g. piping `cargo test` into `Select-String`/`grep`
+  or `Select-Object -First N`). The MCP tools return the full structured
+  output — call the tool, then filter the returned text yourself. Do not shell
+  out just to grep.
+- **A toolchain override** (e.g. `cargo +nightly test`, `cargo +ms-prod build`).
+  Pass the `toolchain` parameter instead — see below.
+
+
 | MCP tool | Replaces |
 |---|---|
 | `cargo_metadata` | `cargo metadata` |
@@ -46,12 +56,24 @@ terminal for cargo just because a previous step used the terminal.
 - **`cargo_publish`** — always run with `dry_run: true` first to validate;
   only publish for real when the dry-run succeeds.
 
+### Toolchain override (`+toolchain`)
+
+To run a command with a specific rustup toolchain — the equivalent of
+`cargo +nightly ...` or `cargo +ms-prod ...` — pass the `toolchain` parameter
+(e.g. `"toolchain": "nightly"` or `"toolchain": "ms-prod"`). The server
+prepends the `+<toolchain>` token for you. Supported on `cargo_check`,
+`cargo_build`, `cargo_test`, `cargo_clippy`, `cargo_doc`, `cargo_tree`,
+`cargo_fmt`, and `cargo_fmt_check`. Never shell out to the terminal just to
+apply a `+toolchain` override.
+
 ### cargo_test — timeout
 
 When launched by the VS Code extension, `cargo_test` applies a server-side
 default timeout from the `cargo-mcp.test.timeoutSecs` setting (**30 seconds**
 by default). Without the extension (or with `cargo-mcp.test.timeoutSecs` set
-to `0`), the server has no default timeout.
+to `0`), the server has no default timeout. The budget covers only test
+**execution** — the clock starts when compilation and linking finish (cargo's
+`build-finished` record), so a slow build never trips the timeout.
 - Omit `timeout_secs` to let the server default apply.
 - Pass `timeout_secs: N` to use a specific budget for this run.
 - Pass `timeout_secs: 0` to disable the timeout for this run, regardless of

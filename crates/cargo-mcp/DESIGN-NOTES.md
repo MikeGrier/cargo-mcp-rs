@@ -313,3 +313,78 @@ their registry configuration. This is the same heuristic used by `cargo tree`.
 serde v1.0.228 (3/15) [crates.io]
 my-crate v0.1.0 (4/15)
 ```
+
+## Progress-line prefix and profile tag
+
+### Context
+
+The progress text shown by VS Code is the `message` field of an MCP
+`notifications/progress` message — a **plain string**. VS Code renders it as
+status text and does *not* interpret markdown, so bold/code/links/colour are
+unavailable; the only levers are the literal text and the numeric counter.
+
+### Decisions
+
+- **`Cargo ` prefix.** Lines now read `Cargo check: …` / `Cargo build [R]
+  finished` rather than the bare `check:` / `cargo …`. The leading word is an
+  unfortunate use of width but, without it, the collapsed history line loses
+  too much context about which tool produced it.
+- **Profile tag.** Every per-crate and `build-finished` line carries a short
+  bracketed marker for the effective compilation profile:
+  - `[D]` — debug/dev (the default when neither `release` nor `profile` is set)
+  - `[R]` — release (`release: true` or `profile: "release"`)
+  - `[T]` — test (`profile: "test"`)
+  - `[B]` — bench (`profile: "bench"`)
+  - `[doc]` — doc (`profile: "doc"`)
+  - `{name}` — any other custom profile, shown verbatim in braces to set it
+    apart from the abbreviated built-in markers
+  An explicit `profile` argument wins over `release`, matching cargo's own
+  precedence. Implemented in `profile_tag()` and threaded through
+  `BuildTracker`.
+
+### Format
+
+```
+Cargo check: serde v1.0.228 (3/15) [D] [crates.io]
+Cargo build [R] (x86_64-pc-windows-msvc) finished
+```
+
+## Toolchain override (`+toolchain`)
+
+### Why
+
+A user shared an example where Copilot abandoned the cargo-mcp tools and ran
+`cargo +ms-prod test -p firebird … | Select-String … | Select-Object -First 20`
+in the terminal. Two gaps drove the fallback:
+
+1. **Capability gap** — no tool parameter expressed `cargo +<toolchain> …`, so
+   a custom toolchain (`ms-prod`) was simply not reachable through the tools.
+2. **Habit gap** — the instructions never said that *filtering* output
+   (`Select-String`/`grep`/`Select-Object`) is not a reason to shell out; the
+   tools already return the full structured stream to filter in-agent.
+
+This is the recurring "agent reached for the terminal because the tool surface
+couldn't express the request" class: close it by making the capability
+first-class *and* writing down the habit, not just fixing the one command.
+
+### Decisions
+
+- **Parameter, not signature thread.** A standalone `toolchain_arg()` helper in
+  `tools.rs` normalises the `toolchain` string (trims, strips a redundant
+  leading `+`, drops blanks) into `Some("+<name>")`. Each supported `call_*`
+  reads it once and does `argv.insert(0, t)` so the token lands at index 0 —
+  immediately after the binary name, where rustup expects a one-shot
+  toolchain selection. No `invoke` signatures change.
+- **Retry-safety skips the token.** `is_retry_safe` now judges the subcommand
+  after an optional leading `+toolchain`, so a toolchain-pinned idempotent
+  command (`+nightly test`) stays retry-eligible while `+nightly publish`
+  does not.
+- **Scope.** Wired into the eight build-relevant tools (`check`, `build`,
+  `test`, `clippy`, `doc`, `tree`, `fmt`, `fmt_check`). Deliberately omitted
+  from `metadata`/`clean`/`update`/`fix`/`add`/`remove`/`publish` as low-value;
+  easy to extend later.
+- **Consistency with RUSTC pinning.** `invoke` pins `RUSTC` to the resolved
+  proxy path, which honours the `RUSTUP_TOOLCHAIN` that `+toolchain` sets, so
+  the override stays consistent across cargo and rustc.
+
+
