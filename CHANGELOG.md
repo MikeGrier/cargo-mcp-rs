@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.6.0](https://github.com/MikeGrier/cargo-mcp-rs/compare/v0.5.7...v0.6.0) (2026-06-07)
+
+
+### Features
+
+* plumb standard cargo options through build-graph tools ([a1a2d56](https://github.com/MikeGrier/cargo-mcp-rs/commit/a1a2d56d38a0245371a3b6a82cbab483993e3709))
+* prefix progress lines with "Cargo" and add a profile tag ([56b9886](https://github.com/MikeGrier/cargo-mcp-rs/commit/56b988649ef0d0d01f5df1ed4c237e77dc34fffe))
+* **tools:** add `toolchain` override parameter to cargo tools ([84ec09c](https://github.com/MikeGrier/cargo-mcp-rs/commit/84ec09ce80077223f804139ae9a1688639caaac8))
+
+
+### Bug Fixes
+
+* abbreviate test/bench/doc profile tags in progress lines ([a41e441](https://github.com/MikeGrier/cargo-mcp-rs/commit/a41e441959192546694174c2e5ad6201e2caec26))
+* apply cargo_test timeout to test execution only, not build/link ([8d5d1c6](https://github.com/MikeGrier/cargo-mcp-rs/commit/8d5d1c6982435c2a6490a157cb34194393df383a))
+* gate --exclude on workspace and prefer --profile over --release ([9553d9d](https://github.com/MikeGrier/cargo-mcp-rs/commit/9553d9dab9284280371bedc4894501350c7202b4))
+
 ## [0.5.7](https://github.com/MikeGrier/cargo-mcp-rs/compare/v0.5.6...v0.5.7) (2026-06-04)
 
 
