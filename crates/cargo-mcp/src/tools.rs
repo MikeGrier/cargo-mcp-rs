@@ -310,12 +310,17 @@ fn push_package_selection<'a>(argv: &mut Vec<&'a str>, args: &Value, o: &'a Comm
         argv.push("--package");
         argv.push(p);
     }
-    if opt_bool(args, "workspace") {
+    let workspace = opt_bool(args, "workspace");
+    if workspace {
         argv.push("--workspace");
     }
-    if let Some(e) = &o.exclude {
-        argv.push("--exclude");
-        argv.push(e);
+    // `--exclude` is only meaningful together with `--workspace`; cargo rejects
+    // it otherwise, so suppress it when `workspace` is not set.
+    if workspace {
+        if let Some(e) = &o.exclude {
+            argv.push("--exclude");
+            argv.push(e);
+        }
     }
 }
 
@@ -409,12 +414,14 @@ fn push_compilation_options<'a>(
     o: &'a CommonOpts,
     keep_going: bool,
 ) {
-    if opt_bool(args, "release") {
-        argv.push("--release");
-    }
+    // `profile` is mutually exclusive with `release` and takes precedence when
+    // both are provided, matching the schema docs (PROFILE_DESC) and avoiding
+    // a cargo argument error.
     if let Some(p) = &o.profile {
         argv.push("--profile");
         argv.push(p);
+    } else if opt_bool(args, "release") {
+        argv.push("--release");
     }
     if let Some(j) = &o.jobs {
         argv.push("--jobs");
@@ -2536,12 +2543,45 @@ mod tests {
         let mut without = vec!["test"];
         push_compilation_options(&mut without, &args, &o, false);
         assert!(!without.contains(&"--keep-going"));
-        assert!(without.contains(&"--release"));
+        // `profile` takes precedence over `release` when both are provided.
+        assert!(!without.contains(&"--release"));
+        assert!(without.contains(&"--profile"));
+        assert!(without.contains(&"dist"));
         assert_eq!(without.iter().filter(|a| **a == "--jobs").count(), 1);
 
         let mut with = vec!["build"];
         push_compilation_options(&mut with, &args, &o, true);
         assert!(with.contains(&"--keep-going"));
+    }
+
+    #[test]
+    fn push_compilation_options_release_without_profile() {
+        let args = serde_json::json!({ "release": true });
+        let o = CommonOpts::from_args(&args);
+        let mut argv = vec!["build"];
+        push_compilation_options(&mut argv, &args, &o, true);
+        assert!(argv.contains(&"--release"));
+        assert!(!argv.contains(&"--profile"));
+    }
+
+    #[test]
+    fn push_package_selection_exclude_requires_workspace() {
+        // Without `workspace`, `--exclude` must be suppressed even if provided.
+        let args = serde_json::json!({ "exclude": "skipme" });
+        let o = CommonOpts::from_args(&args);
+        let mut argv = vec!["build"];
+        push_package_selection(&mut argv, &args, &o);
+        assert!(!argv.contains(&"--exclude"));
+        assert!(!argv.contains(&"skipme"));
+
+        // With `workspace=true`, `--exclude` is forwarded as before.
+        let args = serde_json::json!({ "workspace": true, "exclude": "skipme" });
+        let o = CommonOpts::from_args(&args);
+        let mut argv = vec!["build"];
+        push_package_selection(&mut argv, &args, &o);
+        assert!(argv.contains(&"--workspace"));
+        assert!(argv.contains(&"--exclude"));
+        assert!(argv.contains(&"skipme"));
     }
 
     #[test]
