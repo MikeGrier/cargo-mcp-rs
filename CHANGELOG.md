@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.6.1](https://github.com/MikeGrier/cargo-mcp-rs/compare/v0.6.0...v0.6.1) (2026-06-07)
+
+
+### Bug Fixes
+
+* **cargo-mcp:** add per-call env and output_path options ([c4eb3b9](https://github.com/MikeGrier/cargo-mcp-rs/commit/c4eb3b9c810d17f6e8f87882943ef34d11c755c0))
+* **cargo-mcp:** add per-call env and output_path options ([44a0909](https://github.com/MikeGrier/cargo-mcp-rs/commit/44a090962ee45675a9106344059b9d7a427dd035))
+* **cargo-mcp:** resolve output_path against working_dir; tighten validation; reword env logging docs ([83eb713](https://github.com/MikeGrier/cargo-mcp-rs/commit/83eb71364c15a4d122097895ce6477727718cd44))
+
 ## [0.6.0](https://github.com/MikeGrier/cargo-mcp-rs/compare/v0.5.7...v0.6.0) (2026-06-07)
 
 
