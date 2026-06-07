@@ -313,3 +313,35 @@ their registry configuration. This is the same heuristic used by `cargo tree`.
 serde v1.0.228 (3/15) [crates.io]
 my-crate v0.1.0 (4/15)
 ```
+
+## Progress-line prefix and profile tag
+
+### Context
+
+The progress text shown by VS Code is the `message` field of an MCP
+`notifications/progress` message — a **plain string**. VS Code renders it as
+status text and does *not* interpret markdown, so bold/code/links/colour are
+unavailable; the only levers are the literal text and the numeric counter.
+
+### Decisions
+
+- **`Cargo ` prefix.** Lines now read `Cargo check: …` / `Cargo build [R]
+  finished` rather than the bare `check:` / `cargo …`. The leading word is an
+  unfortunate use of width but, without it, the collapsed history line loses
+  too much context about which tool produced it.
+- **Profile tag.** Every per-crate and `build-finished` line carries a short
+  bracketed marker for the effective compilation profile:
+  - `[D]` — debug/dev (the default when neither `release` nor `profile` is set)
+  - `[R]` — release (`release: true` or `profile: "release"`)
+  - `[name]` — any other named profile, shown verbatim (e.g. `[bench]`)
+  An explicit `profile` argument wins over `release`, matching cargo's own
+  precedence. Implemented in `profile_tag()` and threaded through
+  `BuildTracker`.
+
+### Format
+
+```
+Cargo check: serde v1.0.228 (3/15) [D] [crates.io]
+Cargo build [R] (x86_64-pc-windows-msvc) finished
+```
+

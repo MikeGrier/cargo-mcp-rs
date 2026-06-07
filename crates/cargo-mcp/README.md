@@ -176,9 +176,11 @@ output shape for `cargo_test` is therefore:
 ```
 
 While the build runs, streaming progress notifications are also emitted;
-the final notification reads `cargo <verb> finished` (or `failed`), with
-the optional target triplet appended when one is supplied. This is what
-appears as the collapsed summary line in the VS Code chat history.
+the final notification reads `Cargo <verb> [D] finished` (or `failed`),
+where the `[D]`/`[R]` tag marks a debug/dev or release build (any other
+named profile is shown in full, e.g. `[bench]`), and the optional target
+triplet is appended when one is supplied. This is what appears as the
+collapsed summary line in the VS Code chat history.
 
 For **text-mode tools** (`fmt`, `tree`, `clean`, `update`, `fix`, `add`,
 `remove`, `publish`) only the first line (the invocation header) is
