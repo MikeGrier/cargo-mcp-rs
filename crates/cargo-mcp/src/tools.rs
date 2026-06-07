@@ -340,11 +340,9 @@ fn push_package_selection<'a>(argv: &mut Vec<&'a str>, args: &Value, o: &'a Comm
     }
     // `--exclude` is only meaningful together with `--workspace`; cargo rejects
     // it otherwise, so suppress it when `workspace` is not set.
-    if workspace {
-        if let Some(e) = &o.exclude {
-            argv.push("--exclude");
-            argv.push(e);
-        }
+    if workspace && let Some(e) = &o.exclude {
+        argv.push("--exclude");
+        argv.push(e);
     }
 }
 
