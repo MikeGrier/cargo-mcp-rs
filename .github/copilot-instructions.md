@@ -96,8 +96,9 @@ When NOT to use `env`:
 
 - Permanent / project-wide config — put it in `Cargo.toml`,
   `.cargo/config.toml`, or `rust-toolchain.toml` instead.
-- Secrets. The block is logged with the invocation record; treat it as
-  visible to anyone reading the server log.
+- Secrets. The block is passed verbatim to the cargo child process (and so
+  is visible via OS-level process inspection), and may be captured by
+  future logging additions — treat it as not confidential.
 
 ### Redirecting full output to a file (`output_path`)
 

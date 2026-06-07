@@ -299,7 +299,9 @@ Use it for one-shot debug knobs (`RUSTFLAGS`, `RUST_LOG`, `RUST_BACKTRACE`,
 `RUSTC_BOOTSTRAP`, compiler-internal dumps) that only this single call
 needs. Do **not** use it for permanent / project-wide configuration (put
 that in `Cargo.toml`, `.cargo/config.toml`, or `rust-toolchain.toml`) or
-for secrets — the env block is logged with the invocation record.
+for secrets — the env block is passed verbatim to the cargo child process
+(visible via OS-level process inspection) and may be captured by future
+logging additions, so treat it as not confidential.
 
 **Timeouts (`timeout_secs`)**
 

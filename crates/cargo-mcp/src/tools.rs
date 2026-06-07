@@ -161,8 +161,9 @@ When to use `env`:\n\n\
 When NOT to use `env`:\n\n\
 - Permanent / project-wide config \u{2014} put it in `Cargo.toml`,\n\
   `.cargo/config.toml`, or `rust-toolchain.toml` instead.\n\
-- Secrets. The block is logged with the invocation record; treat it as\n\
-  visible to anyone reading the server log.\n\n\
+- Secrets. The block is passed verbatim to the cargo child process (and so\n\
+  is visible via OS-level process inspection), and may be captured by\n\
+  future logging additions \u{2014} treat it as not confidential.\n\n\
 ### Redirecting full output to a file (`output_path`)\n\n\
 `cargo_check`, `cargo_build`, `cargo_test`, `cargo_clippy`, and `cargo_doc`\n\
 accept an optional `output_path`: a relative path (under the working\n\
@@ -940,15 +941,34 @@ enum SummaryKind {
 /// tells the caller where the full transcript was written.
 pub(crate) const OUTPUT_FILE_REASON: &str = "x-cargo-mcp-output-file";
 
+/// Resolve a caller-supplied `output_path` against the tool's `working_dir`,
+/// matching the resolution rules cargo itself uses for relative paths.
+///
+/// When `wd` is `None`, resolution falls back to the cargo-mcp server
+/// process's CWD (i.e. the path is returned unchanged), which is also the
+/// effective working directory cargo would inherit.
+fn resolve_output_path(path: &str, wd: Option<&str>) -> std::path::PathBuf {
+    let p = std::path::Path::new(path);
+    match wd {
+        Some(w) => std::path::Path::new(w).join(p),
+        None => p.to_path_buf(),
+    }
+}
+
 /// Validate `path` for use as a workspace-relative output destination.
 ///
 /// Rules (identical to `cargo_metadata`'s `output_file`):
 /// - must be relative (absolute paths rejected, including UNC / drive-letter)
 /// - must not contain `..` components (no parent-directory escapes)
-/// - the parent directory, if any, must already exist (we never auto-create)
+/// - the parent directory, resolved against `wd`, must already exist and be
+///   a directory (we never auto-create, and a regular file in that position
+///   is rejected here so the later `fs::write` doesn't fail after a build)
 ///
 /// Called BEFORE spawning cargo so a bad path never wastes a build.
-fn validate_relative_output_path(path: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn validate_relative_output_path(
+    path: &str,
+    wd: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let pb = std::path::Path::new(path);
     if pb.is_absolute() {
         return Err("output_path must be a relative path; absolute paths are not permitted".into());
@@ -959,12 +979,13 @@ fn validate_relative_output_path(path: &str) -> Result<(), Box<dyn std::error::E
     {
         return Err("output_path must not contain '..' path traversal components".into());
     }
-    if let Some(parent) = pb.parent()
+    let resolved = resolve_output_path(path, wd);
+    if let Some(parent) = resolved.parent()
         && !parent.as_os_str().is_empty()
-        && !parent.exists()
+        && !parent.is_dir()
     {
         return Err(format!(
-            "output_path parent directory does not exist: {}",
+            "output_path parent directory does not exist or is not a directory: {}",
             parent.display()
         )
         .into());
@@ -972,8 +993,9 @@ fn validate_relative_output_path(path: &str) -> Result<(), Box<dyn std::error::E
     Ok(())
 }
 
-/// If `path` is `Some`, write `body` to it and return a compact NDJSON
-/// summary. If `None`, return `body` unchanged.
+/// If `path` is `Some`, write `body` to it (resolved against `wd`, the
+/// tool's `working_dir`) and return a compact NDJSON summary. If `None`,
+/// return `body` unchanged.
 ///
 /// The path must have already been accepted by
 /// [`validate_relative_output_path`] earlier in the call (before spawning
@@ -982,15 +1004,24 @@ fn validate_relative_output_path(path: &str) -> Result<(), Box<dyn std::error::E
 fn write_output_path_and_summarize(
     body: String,
     path: Option<&str>,
+    wd: Option<&str>,
     kind: SummaryKind,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let Some(path) = path else {
         return Ok(body);
     };
-    std::fs::write(path, &body)?;
-    let bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let resolved = resolve_output_path(path, wd);
+    std::fs::write(&resolved, &body)?;
+    let bytes = std::fs::metadata(&resolved).map(|m| m.len()).unwrap_or(0);
     let lines = body.lines().count();
-    Ok(summarize_ndjson(&body, path, bytes, lines, kind))
+    let resolved_str = resolved.display().to_string();
+    Ok(summarize_ndjson(
+        &body,
+        &resolved_str,
+        bytes,
+        lines,
+        kind,
+    ))
 }
 
 /// Build the summary NDJSON returned to the caller when `output_path` is set.
@@ -2265,7 +2296,7 @@ fn call_check(
     let wd = opt_str(args, "working_dir");
     let output_path = opt_str(args, "output_path");
     if let Some(p) = output_path {
-        validate_relative_output_path(p)?;
+        validate_relative_output_path(p, wd)?;
     }
     let tc = toolchain_arg(args);
     let mut argv: Vec<&str> = vec!["check", "--message-format=json"];
@@ -2281,7 +2312,7 @@ fn call_check(
     let out = run_cargo_maybe_streaming(&argv, wd, opt_timeout(args)?, None, on_progress)?;
     let body = format_json_output(&out, &argv, wd);
     let suggestions = suggest::extract_suggestions(&out.stdout);
-    let output = write_output_path_and_summarize(body, output_path, SummaryKind::Build)?;
+    let output = write_output_path_and_summarize(body, output_path, wd, SummaryKind::Build)?;
     Ok(ToolResult::WithSuggestions {
         output,
         suggestions,
@@ -2295,7 +2326,7 @@ fn call_build(
     let wd = opt_str(args, "working_dir");
     let output_path = opt_str(args, "output_path");
     if let Some(p) = output_path {
-        validate_relative_output_path(p)?;
+        validate_relative_output_path(p, wd)?;
     }
     let tc = toolchain_arg(args);
     let mut argv: Vec<&str> = vec!["build", "--message-format=json"];
@@ -2310,7 +2341,7 @@ fn call_build(
     }
     let out = run_cargo_maybe_streaming(&argv, wd, opt_timeout(args)?, None, on_progress)?;
     let body = format_json_output(&out, &argv, wd);
-    write_output_path_and_summarize(body, output_path, SummaryKind::Build)
+    write_output_path_and_summarize(body, output_path, wd, SummaryKind::Build)
 }
 
 fn call_test(
@@ -2320,7 +2351,7 @@ fn call_test(
     let wd = opt_str(args, "working_dir");
     let output_path = opt_str(args, "output_path");
     if let Some(p) = output_path {
-        validate_relative_output_path(p)?;
+        validate_relative_output_path(p, wd)?;
     }
     let tc = toolchain_arg(args);
     let mut argv: Vec<&str> = vec!["test", "--message-format=json"];
@@ -2381,7 +2412,7 @@ fn call_test(
     // captured println! replays) are preserved as x-cargo-mcp-test-output
     // records, and stderr (eprintln! from test code) is always included.
     let body = format_test_output(&out, &argv, wd);
-    write_output_path_and_summarize(body, output_path, SummaryKind::Test)
+    write_output_path_and_summarize(body, output_path, wd, SummaryKind::Test)
 }
 
 fn call_clippy(
@@ -2391,7 +2422,7 @@ fn call_clippy(
     let wd = opt_str(args, "working_dir");
     let output_path = opt_str(args, "output_path");
     if let Some(p) = output_path {
-        validate_relative_output_path(p)?;
+        validate_relative_output_path(p, wd)?;
     }
     let tc = toolchain_arg(args);
     let mut argv: Vec<&str> = vec!["clippy", "--message-format=json"];
@@ -2407,7 +2438,7 @@ fn call_clippy(
     let out = run_cargo_maybe_streaming(&argv, wd, opt_timeout(args)?, None, on_progress)?;
     let body = format_json_output(&out, &argv, wd);
     let suggestions = suggest::extract_suggestions(&out.stdout);
-    let output = write_output_path_and_summarize(body, output_path, SummaryKind::Build)?;
+    let output = write_output_path_and_summarize(body, output_path, wd, SummaryKind::Build)?;
     Ok(ToolResult::WithSuggestions {
         output,
         suggestions,
@@ -2488,7 +2519,7 @@ fn call_doc(
     let wd = opt_str(args, "working_dir");
     let output_path = opt_str(args, "output_path");
     if let Some(p) = output_path {
-        validate_relative_output_path(p)?;
+        validate_relative_output_path(p, wd)?;
     }
     let tc = toolchain_arg(args);
     let mut argv: Vec<&str> = vec!["doc", "--message-format=json"];
@@ -2510,7 +2541,7 @@ fn call_doc(
     }
     let out = run_cargo_maybe_streaming(&argv, wd, None, None, on_progress)?;
     let body = format_json_output(&out, &argv, wd);
-    write_output_path_and_summarize(body, output_path, SummaryKind::Build)
+    write_output_path_and_summarize(body, output_path, wd, SummaryKind::Build)
 }
 
 fn call_clean(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
@@ -3193,7 +3224,7 @@ mod tests {
 
     #[test]
     fn validate_relative_output_path_accepts_simple_filename() {
-        assert!(validate_relative_output_path("build.ndjson").is_ok());
+        assert!(validate_relative_output_path("build.ndjson", None).is_ok());
     }
 
     #[test]
@@ -3203,13 +3234,15 @@ mod tests {
         } else {
             "/tmp/out.ndjson"
         };
-        let err = validate_relative_output_path(abs).unwrap_err().to_string();
+        let err = validate_relative_output_path(abs, None)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("relative"), "unexpected error: {err}");
     }
 
     #[test]
     fn validate_relative_output_path_rejects_parent_dir_components() {
-        let err = validate_relative_output_path("../escape.ndjson")
+        let err = validate_relative_output_path("../escape.ndjson", None)
             .unwrap_err()
             .to_string();
         assert!(err.contains("'..'"), "unexpected error: {err}");
@@ -3217,10 +3250,46 @@ mod tests {
 
     #[test]
     fn validate_relative_output_path_rejects_missing_parent_dir() {
-        let err = validate_relative_output_path("does_not_exist_dir_xyz/out.ndjson")
+        let err = validate_relative_output_path("does_not_exist_dir_xyz/out.ndjson", None)
             .unwrap_err()
             .to_string();
         assert!(err.contains("parent directory"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn validate_relative_output_path_rejects_parent_that_is_a_file() {
+        let base = std::env::temp_dir().join(format!(
+            "cargo-mcp-validate-parent-file-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let file_parent = base.join("not_a_dir");
+        std::fs::write(&file_parent, b"").unwrap();
+        let err = validate_relative_output_path(
+            "not_a_dir/out.ndjson",
+            Some(base.to_str().unwrap()),
+        )
+        .unwrap_err()
+        .to_string();
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(err.contains("parent directory"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn validate_relative_output_path_resolves_parent_against_working_dir() {
+        let base = std::env::temp_dir().join(format!(
+            "cargo-mcp-validate-resolve-wd-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let sub = base.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        // `sub/out.ndjson` does not exist relative to the process CWD, but
+        // it does relative to the supplied working_dir, so it must validate.
+        let res = validate_relative_output_path("sub/out.ndjson", Some(base.to_str().unwrap()));
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(res.is_ok(), "unexpected error: {:?}", res.err());
     }
 
     // ── output_path: summary shape ──────────────────────────────────────────
