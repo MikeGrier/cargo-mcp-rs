@@ -37,6 +37,13 @@
 //!   `rust-toolchain.toml` even though `cargo` itself is the rustup proxy.
 //!   Honoured only if the caller has not already set `RUSTC`.
 //!
+//! Tool callers can layer additional `set`/`unset` operations on top via
+//! [`set_extra_env`]; the per-tool `env` parameter funnels through that
+//! mechanism so a tool call can request e.g. `RUSTFLAGS=…` or
+//! `FIREBIRD_DUMP_MIR=1` for that one invocation without restarting the
+//! server. Extra env is applied **after** the built-in defaults above, so a
+//! caller-supplied value wins.
+//!
 //! ## Logging
 //!
 //! Each invocation writes a one-line `cargo-mcp: invoking <path> ...` record
@@ -45,6 +52,8 @@
 //! enabling any extra tracing.
 
 use std::cell::RefCell;
+use std::collections::BTreeMap;
+use std::ffi::{OsStr, OsString};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -236,15 +245,38 @@ pub fn resolve_rustc_binary() -> (PathBuf, ResolutionSource) {
 /// - Otherwise (`RustupProxy` or `RustupProxyNoSibling`), set `RUSTC` to
 ///   the resolved path. For the rustup proxy this defers toolchain
 ///   selection to the proxy, which honours `rust-toolchain.toml`.
-fn apply_rustc_env(cmd: &mut Command) {
-    if std::env::var_os("RUSTC").is_some_and(|v| !v.is_empty()) {
+fn apply_rustc_env_to_map(env: &mut BTreeMap<OsString, OsString>) {
+    if env.get(OsStr::new("RUSTC")).is_some_and(|v| !v.is_empty()) {
         return;
     }
     let (rustc_path, source) = resolve_rustc_binary();
     if matches!(source, ResolutionSource::PathLookup) {
         return;
     }
-    cmd.env("RUSTC", &rustc_path);
+    env.insert(OsString::from("RUSTC"), rustc_path.into_os_string());
+}
+
+/// Build the **complete** environment block to hand to the cargo subprocess
+/// at spawn time.
+///
+/// On Windows this becomes the explicit `lpEnvironment` argument to
+/// `CreateProcess`; on Unix it is the `envp` passed to `execvpe`. Callers
+/// install the block with `cmd.env_clear().envs(build_subprocess_env())` so
+/// the child sees exactly what we computed — no implicit merge between
+/// per-`Command` overrides and the parent's inherited block at spawn time.
+///
+/// Layering, in order (later entries win):
+/// 1. The parent process's current environment ([`std::env::vars_os`]).
+/// 2. cargo-mcp's built-in defaults (`CARGO_TERM_COLOR=never`, `NO_COLOR=1`).
+/// 3. The `RUSTC` pin from [`apply_rustc_env_to_map`].
+/// 4. Per-call overrides from [`set_extra_env`] (set or unset).
+fn build_subprocess_env() -> BTreeMap<OsString, OsString> {
+    let mut env: BTreeMap<OsString, OsString> = std::env::vars_os().collect();
+    env.insert(OsString::from("CARGO_TERM_COLOR"), OsString::from("never"));
+    env.insert(OsString::from("NO_COLOR"), OsString::from("1"));
+    apply_rustc_env_to_map(&mut env);
+    apply_extra_env_to_map(&mut env);
+    env
 }
 
 fn resolve_binary(name: &str, env_var: &str) -> (PathBuf, ResolutionSource) {
@@ -448,6 +480,52 @@ fn is_cancelled() -> bool {
             .map(|t| t.load(Ordering::Acquire))
             .unwrap_or(false)
     })
+}
+
+// ── extra environment ─────────────────────────────────────────────────────────
+
+/// A list of `(name, value)` env operations to apply to every cargo
+/// subprocess spawned on this thread. `None` removes the variable from the
+/// child's environment; `Some(value)` sets it.
+pub type ExtraEnv = Vec<(String, Option<String>)>;
+
+thread_local! {
+    /// Extra env operations for the cargo operation currently running on
+    /// this thread. Installed by [`set_extra_env`] and consumed by
+    /// [`apply_extra_env_to_map`] inside [`build_subprocess_env`].
+    static EXTRA_ENV: RefCell<ExtraEnv> = const { RefCell::new(Vec::new()) };
+}
+
+/// Install (or clear) the extra env operations for the current thread.
+///
+/// Pass the parsed `env` map before spawning a cargo subprocess and an
+/// empty `Vec` after it returns. The subprocess runners merge these
+/// operations into the explicit env block built by
+/// [`build_subprocess_env`] **after** the built-in defaults
+/// (`CARGO_TERM_COLOR`, `NO_COLOR`, `RUSTC`), so a caller-supplied
+/// value wins over the default.
+pub fn set_extra_env(env: ExtraEnv) {
+    EXTRA_ENV.with(|e| *e.borrow_mut() = env);
+}
+
+/// Merge the current thread's extra env operations into `env`.
+///
+/// Called by [`build_subprocess_env`] last so caller-supplied values
+/// override every prior layer (inherited env, built-in defaults, RUSTC
+/// pin). `None` values map to a remove from the map.
+fn apply_extra_env_to_map(env: &mut BTreeMap<OsString, OsString>) {
+    EXTRA_ENV.with(|e| {
+        for (k, v) in e.borrow().iter() {
+            match v {
+                Some(val) => {
+                    env.insert(OsString::from(k), OsString::from(val));
+                }
+                None => {
+                    env.remove(OsStr::new(k));
+                }
+            }
+        }
+    });
 }
 
 // ── output types ──────────────────────────────────────────────────────────────
@@ -949,9 +1027,8 @@ fn run_cargo_streaming_once(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .env("CARGO_TERM_COLOR", "never")
-        .env("NO_COLOR", "1");
-    apply_rustc_env(&mut cmd);
+        .env_clear()
+        .envs(build_subprocess_env());
 
     if let Some(dir) = working_dir {
         cmd.current_dir(dir);
@@ -1145,9 +1222,8 @@ pub fn run_cargo_to_file(
         .stdin(Stdio::null())
         .stdout(Stdio::from(dest_file)) // OS-level pipe → file, no heap buffer
         .stderr(Stdio::piped())
-        .env("CARGO_TERM_COLOR", "never")
-        .env("NO_COLOR", "1");
-    apply_rustc_env(&mut cmd);
+        .env_clear()
+        .envs(build_subprocess_env());
 
     if let Some(dir) = working_dir {
         cmd.current_dir(dir);
@@ -1452,16 +1528,12 @@ mod tests {
         assert_eq!(source, ResolutionSource::RustupProxy);
     }
 
-    /// Read the `RUSTC` env override that `apply_rustc_env` set on `cmd`.
-    /// Returns `None` if the helper chose not to set one.
-    fn rustc_override(cmd: &Command) -> Option<PathBuf> {
-        cmd.get_envs().find_map(|(k, v)| {
-            if k == OsStr::new("RUSTC") {
-                v.map(PathBuf::from)
-            } else {
-                None
-            }
-        })
+    /// Build the same env block a spawn site would, then read the `RUSTC`
+    /// override that `apply_rustc_env_to_map` placed in it. Returns `None`
+    /// if no override is present — distinguished from inherited values via
+    /// the snapshot-then-mutate pattern in the call sites below.
+    fn rustc_in_env(env: &BTreeMap<OsString, OsString>) -> Option<PathBuf> {
+        env.get(OsStr::new("RUSTC")).map(PathBuf::from)
     }
 
     #[test]
@@ -1475,9 +1547,11 @@ mod tests {
         guard.unset("RUSTC");
         guard.set("CARGO_HOME", &cargo_home);
 
-        let mut cmd = Command::new("does-not-matter");
-        apply_rustc_env(&mut cmd);
-        assert_eq!(rustc_override(&cmd), Some(rustc_path));
+        // Start from an empty map so we test the helper's pin behaviour in
+        // isolation rather than the snapshot of the test process's env.
+        let mut env: BTreeMap<OsString, OsString> = BTreeMap::new();
+        apply_rustc_env_to_map(&mut env);
+        assert_eq!(rustc_in_env(&env), Some(rustc_path));
     }
 
     #[test]
@@ -1493,10 +1567,17 @@ mod tests {
         write_fake_bin(&bin_dir, "rustup");
         guard.set("CARGO_HOME", &cargo_home);
 
-        let mut cmd = Command::new("does-not-matter");
-        apply_rustc_env(&mut cmd);
-        assert!(
-            rustc_override(&cmd).is_none(),
+        // Seed the map with the user's RUSTC the way build_subprocess_env
+        // would (via std::env::vars_os).
+        let mut env: BTreeMap<OsString, OsString> = BTreeMap::new();
+        env.insert(
+            OsString::from("RUSTC"),
+            OsString::from("/explicit/user/rustc"),
+        );
+        apply_rustc_env_to_map(&mut env);
+        assert_eq!(
+            rustc_in_env(&env),
+            Some(PathBuf::from("/explicit/user/rustc")),
             "must not override user-set RUSTC"
         );
     }
@@ -1510,11 +1591,64 @@ mod tests {
         guard.set("CARGO_HOME", &empty_home);
         // No bin/rustc under this home → resolver returns PathLookup.
 
-        let mut cmd = Command::new("does-not-matter");
-        apply_rustc_env(&mut cmd);
+        let mut env: BTreeMap<OsString, OsString> = BTreeMap::new();
+        apply_rustc_env_to_map(&mut env);
         assert!(
-            rustc_override(&cmd).is_none(),
+            rustc_in_env(&env).is_none(),
             "PathLookup must not pin a concrete RUSTC path"
+        );
+    }
+
+    #[test]
+    fn build_subprocess_env_includes_defaults_and_extra_env() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let guard = EnvGuard::snapshot(&[
+            "RUSTC",
+            "CARGO_HOME",
+            "HOME",
+            "USERPROFILE",
+            "CARGO_TERM_COLOR",
+            "NO_COLOR",
+            "RUSTFLAGS",
+        ]);
+        // Park the resolver in PathLookup so we don't pin RUSTC and complicate
+        // the assertion — we only care about the defaults + extra-env wiring.
+        let empty_home = unique_tempdir("build_env");
+        guard.unset("RUSTC");
+        guard.set("CARGO_HOME", &empty_home);
+        guard.unset("CARGO_TERM_COLOR");
+        guard.unset("NO_COLOR");
+        guard.set("RUSTFLAGS", "-C overflow-checks=on");
+
+        // Layered scenario: set a new var, override an inherited one, and
+        // remove a built-in default. The block we hand to CreateProcess must
+        // reflect the final state of all three operations.
+        set_extra_env(vec![
+            ("FIREBIRD_DUMP_MIR".into(), Some("1".into())),
+            ("RUSTFLAGS".into(), Some("-C debuginfo=2".into())),
+            ("NO_COLOR".into(), None),
+        ]);
+        let env = build_subprocess_env();
+        set_extra_env(Vec::new());
+
+        assert_eq!(
+            env.get(OsStr::new("CARGO_TERM_COLOR")).cloned(),
+            Some(OsString::from("never")),
+            "built-in default missing"
+        );
+        assert_eq!(
+            env.get(OsStr::new("FIREBIRD_DUMP_MIR")).cloned(),
+            Some(OsString::from("1")),
+            "extra env (new variable) missing"
+        );
+        assert_eq!(
+            env.get(OsStr::new("RUSTFLAGS")).cloned(),
+            Some(OsString::from("-C debuginfo=2")),
+            "extra env must override inherited value"
+        );
+        assert!(
+            !env.contains_key(OsStr::new("NO_COLOR")),
+            "extra env null must remove the built-in default"
         );
     }
 
