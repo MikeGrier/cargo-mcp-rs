@@ -834,7 +834,10 @@ fn registry_label(pkg_id: &str) -> Option<String> {
 /// - `profile: "test"`                                          → `[T]`
 /// - `profile: "bench"`                                         → `[B]`
 /// - `profile: "doc"`                                           → `[doc]`
-/// - any other named profile (e.g. `my-profile`)               → `[name]`
+/// - any other named profile (e.g. `my-profile`)               → `{name}`
+///
+/// Braces distinguish a custom profile name from the abbreviated markers for
+/// the well-known built-in profiles.
 ///
 /// An explicit `profile` argument always wins over `release`, matching
 /// cargo's own precedence.
@@ -854,7 +857,8 @@ fn profile_tag(args: &Value) -> String {
         "release" => "[R]".to_owned(),
         "test" => "[T]".to_owned(),
         "bench" => "[B]".to_owned(),
-        other => format!("[{other}]"),
+        "doc" => "[doc]".to_owned(),
+        other => format!("{{{other}}}"),
     }
 }
 
@@ -970,7 +974,7 @@ mod tests {
     #[test]
     fn profile_tag_named_profile_shown_verbatim() {
         let args = serde_json::json!({ "profile": "my-profile" });
-        assert_eq!(profile_tag(&args), "[my-profile]");
+        assert_eq!(profile_tag(&args), "{my-profile}");
     }
 
     #[test]

@@ -336,7 +336,8 @@ unavailable; the only levers are the literal text and the numeric counter.
   - `[T]` — test (`profile: "test"`)
   - `[B]` — bench (`profile: "bench"`)
   - `[doc]` — doc (`profile: "doc"`)
-  - `[name]` — any other named profile, shown verbatim
+  - `{name}` — any other custom profile, shown verbatim in braces to set it
+    apart from the abbreviated built-in markers
   An explicit `profile` argument wins over `release`, matching cargo's own
   precedence. Implemented in `profile_tag()` and threaded through
   `BuildTracker`.
