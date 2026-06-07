@@ -132,6 +132,71 @@ record), so a slow build never trips the timeout.\n\
 - Pass `timeout_secs: N` to use a specific budget for this run.\n\
 - Pass `timeout_secs: 0` to disable the timeout for this run, regardless of\n\
   the server default.\n\n\
+When to override `timeout_secs`:\n\n\
+- **Raise it** (or pass `0` to disable) for runs you *know* are slow \u{2014}\n\
+  long-running integration suites, a single targeted test that internally\n\
+  sleeps or polls, a benchmark-style test. Better to disable the timeout\n\
+  for one call than to chase a spurious `TimeoutError`.\n\
+- **Lower it** when you're sanity-checking a fix and want fast feedback\n\
+  if the change regressed something into an infinite loop.\n\
+- Otherwise leave it at the server default \u{2014} the budget only covers\n\
+  execution, so a slow *build* never trips it.\n\n\
+### Environment variables (`env`)\n\n\
+Every `cargo_*` tool that spawns cargo accepts an optional `env` object that\n\
+sets or unsets environment variables on the cargo subprocess for that one\n\
+call. Keys are env var names; values are either a string (set the variable)\n\
+or `null` (remove it from the child's environment). The map is layered on\n\
+top of cargo-mcp's built-in defaults (`CARGO_TERM_COLOR`, `NO_COLOR`,\n\
+`RUSTC`), so a caller-supplied value wins.\n\n\
+Use this instead of shelling out to a terminal just to apply an env var:\n\n\
+```json\n\
+{ \"env\": { \"RUSTFLAGS\": \"-C debuginfo=2\", \"FIREBIRD_DUMP_MIR\": \"1\" } }\n\
+```\n\n\
+When to use `env`:\n\n\
+- One-shot debug knobs (`RUSTFLAGS`, `RUST_LOG`, `RUST_BACKTRACE`,\n\
+  `RUSTC_BOOTSTRAP`, compiler-internal dumps) that only this single tool\n\
+  call needs.\n\
+- Reproducing an issue under a specific env without restarting the MCP\n\
+  server or polluting the host shell.\n\n\
+When NOT to use `env`:\n\n\
+- Permanent / project-wide config \u{2014} put it in `Cargo.toml`,\n\
+  `.cargo/config.toml`, or `rust-toolchain.toml` instead.\n\
+- Secrets. The block is passed verbatim to the cargo child process (and so\n\
+  is visible via OS-level process inspection), and may be captured by\n\
+  future logging additions \u{2014} treat it as not confidential.\n\n\
+### Redirecting full output to a file (`output_path`)\n\n\
+`cargo_check`, `cargo_build`, `cargo_test`, `cargo_clippy`, and `cargo_doc`\n\
+accept an optional `output_path`: a relative path (under the working\n\
+directory; no `..` components; parent must already exist) that receives the\n\
+**complete** NDJSON output. When set, the tool result is a compact SUMMARY\n\
+instead of the full transcript:\n\n\
+| Always kept in summary | Dropped from summary (still in file) |\n\
+|---|---|\n\
+| `x-cargo-mcp-invocation` (header) | `compiler-artifact`, `build-script-executed` |\n\
+| `x-cargo-mcp-output-file` pointer (`path`, `bytes`, `lines`) | `compiler-message` with `level: warning` |\n\
+| `compiler-message` with `level: error` (incl. ICE) | passing-test lines (`test foo ... ok`) |\n\
+| `build-finished` | captured `println!` replay bodies |\n\
+| `x-cargo-mcp-stderr` (when present) | |\n\
+| status trailer (`{\"status\":...}`) | |\n\
+| **`cargo_test` only:** libtest summary/failure markers \u{2014} `running N tests`, ` ... FAILED`, `failures:`, `---- name stdout ----`, `panicked at`, `note: run with`, `test result:` | |\n\n\
+**Use `output_path` when:**\n\n\
+- The full output would be large enough to bloat your context (long\n\
+  `cargo_test` runs, big workspaces, `cargo_build` with many crates).\n\
+- You'd otherwise pipe to a temp file (`> build.log`,\n\
+  `Out-File test-out.txt`) just to keep the response small. Pass\n\
+  `\"output_path\": \"target/cargo-mcp/<run>.ndjson\"` instead.\n\n\
+**Don't use `output_path` when:**\n\n\
+- You want the diagnostics inline so you can act on them immediately\n\
+  (small `cargo_check` / `cargo_clippy` after a focused edit).\n\
+- The tool isn't one of the five listed above; `cargo_metadata` has its\n\
+  own `output_file` parameter with the same intent.\n\n\
+**Workflow:** read the summary first. If it shows a non-zero `exit_code`\n\
+or failure markers, open the file at `output_path` for the full\n\
+transcript (which contains every dropped warning, captured stdout,\n\
+artifact line, etc.).\n\n\
+```json\n\
+{ \"output_path\": \"target/cargo-mcp/test-run.ndjson\" }\n\
+```\n\n\
 ### Reading cargo_test output\n\n\
 `cargo_test` returns a strict NDJSON stream. Parse it line-by-line; every\n\
 non-blank line is a JSON object. The `reason` field identifies the record type:\n\n\
@@ -237,6 +302,28 @@ const TOOLCHAIN_DESC: &str = "Rustup toolchain to run this command with, passed 
      toolchain name such as \"nightly\", \"stable\", \"1.78\", or a custom \
      toolchain like \"ms-prod\". Requires rustup. Omit to use the toolchain \
      selected by rust-toolchain.toml or the environment.";
+
+// Extra environment variables (valid for every subcommand that spawns cargo).
+const ENV_DESC: &str = "Optional environment variables to set on the cargo subprocess for \
+     this one invocation. Keys are env var names (no `=`, non-empty); values are either a \
+     string (set the variable) or null (remove it from the child's environment). Layered on \
+     top of cargo-mcp's defaults (CARGO_TERM_COLOR, NO_COLOR, RUSTC), so a caller-supplied \
+     value wins. Use this for one-shot debug knobs such as RUSTFLAGS, RUST_LOG, \
+     RUSTC_BOOTSTRAP, or compiler-internal dumps like FIREBIRD_DUMP_MIR \u{2014} do not shell \
+     out to a terminal just to apply an env var.";
+
+// Optional file redirect for high-volume JSON-mode tools.
+const OUTPUT_PATH_DESC: &str = "Optional relative path (under the working directory) to write \
+     the full NDJSON output to. Absolute paths and '..' components are rejected. When \
+     provided, the complete tool output is written to this file and the tool returns a SUMMARY \
+     containing the invocation header, an x-cargo-mcp-output-file pointer record (path, bytes, \
+     lines), all compiler error records, the build-finished record, any captured stderr, the \
+     final status trailer, and \u{2014} for cargo_test \u{2014} libtest summary/failure marker \
+     lines. Warnings, passing-test lines, dep-artifact records, and captured println! replays \
+     are dropped from the summary but preserved verbatim in the file. Use this for high-volume \
+     runs (cargo_test with many tests, cargo_build / cargo_check / cargo_clippy / cargo_doc on \
+     large workspaces) to keep the tool result small while preserving the full transcript on \
+     disk for follow-up inspection.";
 
 /// The result of a tool call, which may carry actionable suggestions.
 pub enum ToolResult {
@@ -546,6 +633,53 @@ fn opt_timeout_explicit(
     Ok(Some(Some(std::time::Duration::from_secs(secs))))
 }
 
+/// Extract the optional `env` map from JSON args.
+///
+/// Shape: a JSON object whose values are either a string (set the var) or
+/// `null` (remove the var from the child's environment). Any other shape —
+/// numbers, booleans, arrays, nested objects — is rejected so bad client
+/// input surfaces immediately instead of being silently coerced.
+///
+/// Keys must be non-empty and may not contain `=` (which would let a single
+/// "name" smuggle a second variable past the spawn API) or NUL bytes (which
+/// would be truncated by every Unix exec path). Returns an empty `Vec` when
+/// the field is absent or explicitly `null`.
+fn opt_env(args: &Value) -> Result<invoke::ExtraEnv, Box<dyn std::error::Error>> {
+    let Some(v) = args.get("env") else {
+        return Ok(Vec::new());
+    };
+    if v.is_null() {
+        return Ok(Vec::new());
+    }
+    let Some(obj) = v.as_object() else {
+        return Err(format!("env must be an object mapping name to string|null, got {v}").into());
+    };
+    let mut out: invoke::ExtraEnv = Vec::with_capacity(obj.len());
+    for (k, val) in obj {
+        if k.is_empty() {
+            return Err("env keys must be non-empty".into());
+        }
+        if k.contains('=') {
+            return Err(format!("env key {k:?} must not contain '='").into());
+        }
+        if k.contains('\0') {
+            return Err(format!("env key {k:?} must not contain NUL").into());
+        }
+        let entry = if val.is_null() {
+            None
+        } else if let Some(s) = val.as_str() {
+            if s.contains('\0') {
+                return Err(format!("env value for {k:?} must not contain NUL").into());
+            }
+            Some(s.to_owned())
+        } else {
+            return Err(format!("env[{k:?}] must be a string or null, got {val}").into());
+        };
+        out.push((k.clone(), entry));
+    }
+    Ok(out)
+}
+
 /// Filter `--message-format=json` NDJSON output to keep only actionable lines.
 ///
 /// Retains only `compiler-message` lines (errors and warnings) and the
@@ -789,6 +923,189 @@ fn run_cargo_maybe_streaming(
     }
 }
 
+// ── output_path: write full NDJSON to disk, return summary ────────────────────
+
+/// Which summarisation rules to apply when an `output_path` was supplied.
+#[derive(Clone, Copy)]
+enum SummaryKind {
+    /// Build-style tools (`check`, `build`, `clippy`, `doc`): keep the
+    /// invocation header, compiler errors, `build-finished`, stderr, and
+    /// the status trailer.
+    Build,
+    /// `cargo_test`: everything in [`SummaryKind::Build`] plus libtest
+    /// summary lines and failure markers from the test harness.
+    Test,
+}
+
+/// Discriminator for the NDJSON pointer record inserted into a summary that
+/// tells the caller where the full transcript was written.
+pub(crate) const OUTPUT_FILE_REASON: &str = "x-cargo-mcp-output-file";
+
+/// Resolve a caller-supplied `output_path` against the tool's `working_dir`,
+/// matching the resolution rules cargo itself uses for relative paths.
+///
+/// When `wd` is `None`, resolution falls back to the cargo-mcp server
+/// process's CWD (i.e. the path is returned unchanged), which is also the
+/// effective working directory cargo would inherit.
+fn resolve_output_path(path: &str, wd: Option<&str>) -> std::path::PathBuf {
+    let p = std::path::Path::new(path);
+    match wd {
+        Some(w) => std::path::Path::new(w).join(p),
+        None => p.to_path_buf(),
+    }
+}
+
+/// Validate `path` for use as a workspace-relative output destination.
+///
+/// Rules (identical to `cargo_metadata`'s `output_file`):
+/// - must be relative (absolute paths rejected, including UNC / drive-letter)
+/// - must not contain `..` components (no parent-directory escapes)
+/// - the parent directory, resolved against `wd`, must already exist and be
+///   a directory (we never auto-create, and a regular file in that position
+///   is rejected here so the later `fs::write` doesn't fail after a build)
+///
+/// Called BEFORE spawning cargo so a bad path never wastes a build.
+fn validate_relative_output_path(
+    path: &str,
+    wd: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let pb = std::path::Path::new(path);
+    if pb.is_absolute() {
+        return Err("output_path must be a relative path; absolute paths are not permitted".into());
+    }
+    if pb
+        .components()
+        .any(|c| c == std::path::Component::ParentDir)
+    {
+        return Err("output_path must not contain '..' path traversal components".into());
+    }
+    let resolved = resolve_output_path(path, wd);
+    if let Some(parent) = resolved.parent()
+        && !parent.as_os_str().is_empty()
+        && !parent.is_dir()
+    {
+        return Err(format!(
+            "output_path parent directory does not exist or is not a directory: {}",
+            parent.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// If `path` is `Some`, write `body` to it (resolved against `wd`, the
+/// tool's `working_dir`) and return a compact NDJSON summary. If `None`,
+/// return `body` unchanged.
+///
+/// The path must have already been accepted by
+/// [`validate_relative_output_path`] earlier in the call (before spawning
+/// cargo); the file write itself can still fail (permission denied, disk
+/// full) and that error is propagated to the caller.
+fn write_output_path_and_summarize(
+    body: String,
+    path: Option<&str>,
+    wd: Option<&str>,
+    kind: SummaryKind,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let Some(path) = path else {
+        return Ok(body);
+    };
+    let resolved = resolve_output_path(path, wd);
+    std::fs::write(&resolved, &body)?;
+    let bytes = std::fs::metadata(&resolved).map(|m| m.len()).unwrap_or(0);
+    let lines = body.lines().count();
+    let resolved_str = resolved.display().to_string();
+    Ok(summarize_ndjson(
+        &body,
+        &resolved_str,
+        bytes,
+        lines,
+        kind,
+    ))
+}
+
+/// Build the summary NDJSON returned to the caller when `output_path` is set.
+///
+/// Output shape (every line is a JSON object, same line-by-line contract as
+/// the full body):
+/// 1. The original `x-cargo-mcp-invocation` header (always the first line).
+/// 2. An `x-cargo-mcp-output-file` pointer record with `path`, `bytes`,
+///    `lines` so the agent can find and read the full transcript.
+/// 3. Filtered records per [`keep_in_summary`].
+fn summarize_ndjson(body: &str, path: &str, bytes: u64, lines: usize, kind: SummaryKind) -> String {
+    let mut out = String::new();
+    let mut iter = body.lines();
+    if let Some(first) = iter.next() {
+        out.push_str(first);
+        out.push('\n');
+    }
+    let pointer = serde_json::to_string(&serde_json::json!({
+        "reason": OUTPUT_FILE_REASON,
+        "path": path,
+        "bytes": bytes,
+        "lines": lines,
+    }))
+    .unwrap_or_else(|_| "{}".into());
+    out.push_str(&pointer);
+    out.push('\n');
+    for line in iter {
+        if keep_in_summary(line, kind) {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Decide whether one NDJSON record from the full body should be replayed
+/// into the summary returned to the caller.
+///
+/// Always kept: the status trailer, `build-finished`, `x-cargo-mcp-stderr`.
+/// Conditionally kept: `compiler-message` only when `message.level == "error"`;
+/// `x-cargo-mcp-test-output` only when [`is_test_summary_line`] matches (and
+/// only in [`SummaryKind::Test`] mode).
+/// Everything else (notably `compiler-artifact`, `build-script-executed`,
+/// passing-test lines, and captured `println!` replays) is dropped.
+fn keep_in_summary(line: &str, kind: SummaryKind) -> bool {
+    let Ok(v) = serde_json::from_str::<Value>(line) else {
+        return false;
+    };
+    if v.get("status").is_some() {
+        return true;
+    }
+    let reason = v.get("reason").and_then(|r| r.as_str()).unwrap_or("");
+    match reason {
+        "build-finished" | STDERR_REASON => true,
+        "compiler-message" => v
+            .get("message")
+            .and_then(|m| m.get("level"))
+            .and_then(|l| l.as_str())
+            .is_some_and(|l| l == "error" || l == "error: internal compiler error"),
+        TEST_OUTPUT_REASON if matches!(kind, SummaryKind::Test) => {
+            let text = v.get("text").and_then(|t| t.as_str()).unwrap_or("");
+            is_test_summary_line(text)
+        }
+        _ => false,
+    }
+}
+
+/// True for libtest harness lines that belong in the test summary: per-binary
+/// run counts, FAILED markers, the per-failure section headers, panic
+/// messages, the backtrace note, the `failures:` section header, and the
+/// final `test result:` line. The bulk of test output (passing-test `... ok`
+/// lines, captured `println!` replays) is dropped from the summary but kept
+/// verbatim in the on-disk file.
+fn is_test_summary_line(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    trimmed.starts_with("test result:")
+        || trimmed.starts_with("failures:")
+        || trimmed.starts_with("running ")
+        || trimmed.contains(" FAILED")
+        || trimmed.starts_with("---- ")
+        || trimmed.contains("panicked at")
+        || trimmed.starts_with("note: run with")
+}
+
 /// True for cargo's `build-finished` JSON record. With `--message-format=json`
 /// this line is emitted exactly when compilation and linking are complete and
 /// (for `cargo test`) immediately before the test binaries start executing, so
@@ -817,6 +1134,11 @@ pub fn list() -> Value {
                     "working_dir": {
                         "type": "string",
                         "description": WORKING_DIR_DESC_METADATA
+                    },
+                    "env": {
+                        "type": "object",
+                        "additionalProperties": { "type": ["string", "null"] },
+                        "description": ENV_DESC
                     },
                     "no_deps": {
                         "type": "boolean",
@@ -855,6 +1177,15 @@ pub fn list() -> Value {
                         "description": WORKING_DIR_DESC
                     },
                     "toolchain": { "type": "string", "description": TOOLCHAIN_DESC },
+                    "env": {
+                        "type": "object",
+                        "additionalProperties": { "type": ["string", "null"] },
+                        "description": ENV_DESC
+                    },
+                    "output_path": {
+                        "type": "string",
+                        "description": OUTPUT_PATH_DESC
+                    },
                     "package": {
                         "type": "string",
                         "description":
@@ -949,6 +1280,15 @@ pub fn list() -> Value {
                         "description": WORKING_DIR_DESC
                     },
                     "toolchain": { "type": "string", "description": TOOLCHAIN_DESC },
+                    "env": {
+                        "type": "object",
+                        "additionalProperties": { "type": ["string", "null"] },
+                        "description": ENV_DESC
+                    },
+                    "output_path": {
+                        "type": "string",
+                        "description": OUTPUT_PATH_DESC
+                    },
                     "package": {
                         "type": "string",
                         "description":
@@ -1050,6 +1390,15 @@ pub fn list() -> Value {
                         "description": WORKING_DIR_DESC
                     },
                     "toolchain": { "type": "string", "description": TOOLCHAIN_DESC },
+                    "env": {
+                        "type": "object",
+                        "additionalProperties": { "type": ["string", "null"] },
+                        "description": ENV_DESC
+                    },
+                    "output_path": {
+                        "type": "string",
+                        "description": OUTPUT_PATH_DESC
+                    },
                     "package": {
                         "type": "string",
                         "description":
@@ -1171,6 +1520,15 @@ pub fn list() -> Value {
                         "description": WORKING_DIR_DESC
                     },
                     "toolchain": { "type": "string", "description": TOOLCHAIN_DESC },
+                    "env": {
+                        "type": "object",
+                        "additionalProperties": { "type": ["string", "null"] },
+                        "description": ENV_DESC
+                    },
+                    "output_path": {
+                        "type": "string",
+                        "description": OUTPUT_PATH_DESC
+                    },
                     "package": {
                         "type": "string",
                         "description":
@@ -1260,6 +1618,11 @@ pub fn list() -> Value {
                         "description": WORKING_DIR_DESC
                     },
                     "toolchain": { "type": "string", "description": TOOLCHAIN_DESC },
+                    "env": {
+                        "type": "object",
+                        "additionalProperties": { "type": ["string", "null"] },
+                        "description": ENV_DESC
+                    },
                     "package": {
                         "type": "string",
                         "description":
@@ -1287,6 +1650,11 @@ pub fn list() -> Value {
                         "description": WORKING_DIR_DESC
                     },
                     "toolchain": { "type": "string", "description": TOOLCHAIN_DESC },
+                    "env": {
+                        "type": "object",
+                        "additionalProperties": { "type": ["string", "null"] },
+                        "description": ENV_DESC
+                    },
                     "package": {
                         "type": "string",
                         "description":
@@ -1315,6 +1683,11 @@ pub fn list() -> Value {
                         "description": WORKING_DIR_DESC
                     },
                     "toolchain": { "type": "string", "description": TOOLCHAIN_DESC },
+                    "env": {
+                        "type": "object",
+                        "additionalProperties": { "type": ["string", "null"] },
+                        "description": ENV_DESC
+                    },
                     "package": {
                         "type": "string",
                         "description":
@@ -1384,6 +1757,15 @@ pub fn list() -> Value {
                         "description": WORKING_DIR_DESC
                     },
                     "toolchain": { "type": "string", "description": TOOLCHAIN_DESC },
+                    "env": {
+                        "type": "object",
+                        "additionalProperties": { "type": ["string", "null"] },
+                        "description": ENV_DESC
+                    },
+                    "output_path": {
+                        "type": "string",
+                        "description": OUTPUT_PATH_DESC
+                    },
                     "package": {
                         "type": "string",
                         "description":
@@ -1463,6 +1845,11 @@ pub fn list() -> Value {
                         "type": "string",
                         "description": WORKING_DIR_DESC
                     },
+                    "env": {
+                        "type": "object",
+                        "additionalProperties": { "type": ["string", "null"] },
+                        "description": ENV_DESC
+                    },
                     "package": {
                         "type": "string",
                         "description":
@@ -1495,6 +1882,11 @@ pub fn list() -> Value {
                         "type": "string",
                         "description": WORKING_DIR_DESC
                     },
+                    "env": {
+                        "type": "object",
+                        "additionalProperties": { "type": ["string", "null"] },
+                        "description": ENV_DESC
+                    },
                     "package": {
                         "type": "string",
                         "description":
@@ -1526,6 +1918,11 @@ pub fn list() -> Value {
                     "working_dir": {
                         "type": "string",
                         "description": WORKING_DIR_DESC
+                    },
+                    "env": {
+                        "type": "object",
+                        "additionalProperties": { "type": ["string", "null"] },
+                        "description": ENV_DESC
                     },
                     "package": {
                         "type": "string",
@@ -1569,6 +1966,11 @@ pub fn list() -> Value {
                     "working_dir": {
                         "type": "string",
                         "description": WORKING_DIR_DESC
+                    },
+                    "env": {
+                        "type": "object",
+                        "additionalProperties": { "type": ["string", "null"] },
+                        "description": ENV_DESC
                     },
                     "dependency": {
                         "type": "string",
@@ -1615,6 +2017,11 @@ pub fn list() -> Value {
                         "type": "string",
                         "description": WORKING_DIR_DESC
                     },
+                    "env": {
+                        "type": "object",
+                        "additionalProperties": { "type": ["string", "null"] },
+                        "description": ENV_DESC
+                    },
                     "dependency": {
                         "type": "string",
                         "description":
@@ -1655,6 +2062,11 @@ pub fn list() -> Value {
                     "working_dir": {
                         "type": "string",
                         "description": WORKING_DIR_DESC
+                    },
+                    "env": {
+                        "type": "object",
+                        "additionalProperties": { "type": ["string", "null"] },
+                        "description": ENV_DESC
                     },
                     "package": {
                         "type": "string",
@@ -1761,7 +2173,17 @@ pub fn call(
     // Install the cancel token for the duration of the tool call so that the
     // invoke functions can kill the child process if the client cancels.
     invoke::set_cancel_token(cancel);
-    let result = call_inner(name, args, on_progress);
+    // Parse the per-call env map before any subprocess spawn so a malformed
+    // request fails cleanly without ever installing partial state.
+    let result = match opt_env(args) {
+        Ok(extra_env) => {
+            invoke::set_extra_env(extra_env);
+            let r = call_inner(name, args, on_progress);
+            invoke::set_extra_env(Vec::new());
+            r
+        }
+        Err(e) => Err(e),
+    };
     invoke::set_cancel_token(None);
     result
 }
@@ -1872,6 +2294,10 @@ fn call_check(
     on_progress: Option<&mut dyn FnMut(&str)>,
 ) -> Result<ToolResult, Box<dyn std::error::Error>> {
     let wd = opt_str(args, "working_dir");
+    let output_path = opt_str(args, "output_path");
+    if let Some(p) = output_path {
+        validate_relative_output_path(p, wd)?;
+    }
     let tc = toolchain_arg(args);
     let mut argv: Vec<&str> = vec!["check", "--message-format=json"];
     let o = CommonOpts::from_args(args);
@@ -1884,8 +2310,9 @@ fn call_check(
         argv.insert(0, t);
     }
     let out = run_cargo_maybe_streaming(&argv, wd, opt_timeout(args)?, None, on_progress)?;
-    let output = format_json_output(&out, &argv, wd);
+    let body = format_json_output(&out, &argv, wd);
     let suggestions = suggest::extract_suggestions(&out.stdout);
+    let output = write_output_path_and_summarize(body, output_path, wd, SummaryKind::Build)?;
     Ok(ToolResult::WithSuggestions {
         output,
         suggestions,
@@ -1897,6 +2324,10 @@ fn call_build(
     on_progress: Option<&mut dyn FnMut(&str)>,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let wd = opt_str(args, "working_dir");
+    let output_path = opt_str(args, "output_path");
+    if let Some(p) = output_path {
+        validate_relative_output_path(p, wd)?;
+    }
     let tc = toolchain_arg(args);
     let mut argv: Vec<&str> = vec!["build", "--message-format=json"];
     let o = CommonOpts::from_args(args);
@@ -1909,7 +2340,8 @@ fn call_build(
         argv.insert(0, t);
     }
     let out = run_cargo_maybe_streaming(&argv, wd, opt_timeout(args)?, None, on_progress)?;
-    Ok(format_json_output(&out, &argv, wd))
+    let body = format_json_output(&out, &argv, wd);
+    write_output_path_and_summarize(body, output_path, wd, SummaryKind::Build)
 }
 
 fn call_test(
@@ -1917,6 +2349,10 @@ fn call_test(
     on_progress: Option<&mut dyn FnMut(&str)>,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let wd = opt_str(args, "working_dir");
+    let output_path = opt_str(args, "output_path");
+    if let Some(p) = output_path {
+        validate_relative_output_path(p, wd)?;
+    }
     let tc = toolchain_arg(args);
     let mut argv: Vec<&str> = vec!["test", "--message-format=json"];
     let o = CommonOpts::from_args(args);
@@ -1975,7 +2411,8 @@ fn call_test(
     // Use format_test_output so that non-JSON lines (libtest harness text,
     // captured println! replays) are preserved as x-cargo-mcp-test-output
     // records, and stderr (eprintln! from test code) is always included.
-    Ok(format_test_output(&out, &argv, wd))
+    let body = format_test_output(&out, &argv, wd);
+    write_output_path_and_summarize(body, output_path, wd, SummaryKind::Test)
 }
 
 fn call_clippy(
@@ -1983,6 +2420,10 @@ fn call_clippy(
     on_progress: Option<&mut dyn FnMut(&str)>,
 ) -> Result<ToolResult, Box<dyn std::error::Error>> {
     let wd = opt_str(args, "working_dir");
+    let output_path = opt_str(args, "output_path");
+    if let Some(p) = output_path {
+        validate_relative_output_path(p, wd)?;
+    }
     let tc = toolchain_arg(args);
     let mut argv: Vec<&str> = vec!["clippy", "--message-format=json"];
     let o = CommonOpts::from_args(args);
@@ -1995,8 +2436,9 @@ fn call_clippy(
         argv.insert(0, t);
     }
     let out = run_cargo_maybe_streaming(&argv, wd, opt_timeout(args)?, None, on_progress)?;
-    let output = format_json_output(&out, &argv, wd);
+    let body = format_json_output(&out, &argv, wd);
     let suggestions = suggest::extract_suggestions(&out.stdout);
+    let output = write_output_path_and_summarize(body, output_path, wd, SummaryKind::Build)?;
     Ok(ToolResult::WithSuggestions {
         output,
         suggestions,
@@ -2075,6 +2517,10 @@ fn call_doc(
     on_progress: Option<&mut dyn FnMut(&str)>,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let wd = opt_str(args, "working_dir");
+    let output_path = opt_str(args, "output_path");
+    if let Some(p) = output_path {
+        validate_relative_output_path(p, wd)?;
+    }
     let tc = toolchain_arg(args);
     let mut argv: Vec<&str> = vec!["doc", "--message-format=json"];
     let o = CommonOpts::from_args(args);
@@ -2094,7 +2540,8 @@ fn call_doc(
         argv.insert(0, t);
     }
     let out = run_cargo_maybe_streaming(&argv, wd, None, None, on_progress)?;
-    Ok(format_json_output(&out, &argv, wd))
+    let body = format_json_output(&out, &argv, wd);
+    write_output_path_and_summarize(body, output_path, wd, SummaryKind::Build)
 }
 
 fn call_clean(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
@@ -2701,5 +3148,336 @@ mod tests {
         let mut with = vec!["check"];
         push_manifest_options(&mut with, &args, &o, true);
         assert!(with.contains(&"--ignore-rust-version"));
+    }
+
+    // ── opt_env tests ────────────────────────────────────────────────────────
+
+    #[test]
+    fn opt_env_absent_returns_empty() {
+        let args = serde_json::json!({});
+        let env = opt_env(&args).unwrap();
+        assert!(env.is_empty());
+    }
+
+    #[test]
+    fn opt_env_null_returns_empty() {
+        let args = serde_json::json!({ "env": null });
+        let env = opt_env(&args).unwrap();
+        assert!(env.is_empty());
+    }
+
+    #[test]
+    fn opt_env_parses_string_and_null_values() {
+        let args = serde_json::json!({
+            "env": {
+                "RUSTFLAGS": "-C debuginfo=2",
+                "FIREBIRD_DUMP_MIR": "1",
+                "CARGO_TERM_COLOR": null,
+            }
+        });
+        let env = opt_env(&args).unwrap();
+        let map: std::collections::BTreeMap<_, _> = env.into_iter().collect();
+        assert_eq!(
+            map.get("RUSTFLAGS").cloned(),
+            Some(Some("-C debuginfo=2".to_owned()))
+        );
+        assert_eq!(
+            map.get("FIREBIRD_DUMP_MIR").cloned(),
+            Some(Some("1".to_owned()))
+        );
+        assert_eq!(map.get("CARGO_TERM_COLOR").cloned(), Some(None));
+    }
+
+    #[test]
+    fn opt_env_rejects_non_object() {
+        let args = serde_json::json!({ "env": "RUSTFLAGS=-C debuginfo=2" });
+        assert!(opt_env(&args).is_err());
+    }
+
+    #[test]
+    fn opt_env_rejects_non_string_value() {
+        let args = serde_json::json!({ "env": { "RUST_LOG": 1 } });
+        assert!(opt_env(&args).is_err());
+    }
+
+    #[test]
+    fn opt_env_rejects_empty_key() {
+        let args = serde_json::json!({ "env": { "": "x" } });
+        assert!(opt_env(&args).is_err());
+    }
+
+    #[test]
+    fn opt_env_rejects_key_with_equals() {
+        let args = serde_json::json!({ "env": { "A=B": "x" } });
+        assert!(opt_env(&args).is_err());
+    }
+
+    #[test]
+    fn opt_env_rejects_nul_in_key_or_value() {
+        let bad_key = serde_json::json!({ "env": { "A\u{0000}B": "x" } });
+        assert!(opt_env(&bad_key).is_err());
+        let bad_val = serde_json::json!({ "env": { "K": "x\u{0000}y" } });
+        assert!(opt_env(&bad_val).is_err());
+    }
+
+    // ── output_path: path validation ─────────────────────────────────────────
+
+    #[test]
+    fn validate_relative_output_path_accepts_simple_filename() {
+        assert!(validate_relative_output_path("build.ndjson", None).is_ok());
+    }
+
+    #[test]
+    fn validate_relative_output_path_rejects_absolute_path() {
+        let abs = if cfg!(windows) {
+            "C:\\tmp\\out.ndjson"
+        } else {
+            "/tmp/out.ndjson"
+        };
+        let err = validate_relative_output_path(abs, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("relative"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn validate_relative_output_path_rejects_parent_dir_components() {
+        let err = validate_relative_output_path("../escape.ndjson", None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("'..'"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn validate_relative_output_path_rejects_missing_parent_dir() {
+        let err = validate_relative_output_path("does_not_exist_dir_xyz/out.ndjson", None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("parent directory"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn validate_relative_output_path_rejects_parent_that_is_a_file() {
+        let base = std::env::temp_dir().join(format!(
+            "cargo-mcp-validate-parent-file-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let file_parent = base.join("not_a_dir");
+        std::fs::write(&file_parent, b"").unwrap();
+        let err = validate_relative_output_path(
+            "not_a_dir/out.ndjson",
+            Some(base.to_str().unwrap()),
+        )
+        .unwrap_err()
+        .to_string();
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(err.contains("parent directory"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn validate_relative_output_path_resolves_parent_against_working_dir() {
+        let base = std::env::temp_dir().join(format!(
+            "cargo-mcp-validate-resolve-wd-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let sub = base.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        // `sub/out.ndjson` does not exist relative to the process CWD, but
+        // it does relative to the supplied working_dir, so it must validate.
+        let res = validate_relative_output_path("sub/out.ndjson", Some(base.to_str().unwrap()));
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(res.is_ok(), "unexpected error: {:?}", res.err());
+    }
+
+    // ── output_path: summary shape ──────────────────────────────────────────
+
+    /// Helper: build a representative full body that `format_json_output` /
+    /// `format_test_output` would produce for a real failing build, so the
+    /// summary helpers can be exercised end-to-end on a single string.
+    fn fake_build_body() -> String {
+        [
+            r#"{"reason":"x-cargo-mcp-invocation","argv":["build","--message-format=json"],"cwd":"/ws"}"#,
+            r#"{"reason":"compiler-artifact","package_id":"serde 1.0.0"}"#,
+            r#"{"reason":"compiler-message","message":{"level":"warning","rendered":"warn"}}"#,
+            r#"{"reason":"compiler-message","message":{"level":"error","rendered":"error[E0001]"}}"#,
+            r#"{"reason":"build-finished","success":false}"#,
+            r#"{"status":"error","exit_code":101}"#,
+            r#"{"reason":"x-cargo-mcp-stderr","text":"error: aborting due to previous error"}"#,
+        ]
+        .join("\n")
+            + "\n"
+    }
+
+    fn fake_test_body() -> String {
+        [
+            r#"{"reason":"x-cargo-mcp-invocation","argv":["test","--message-format=json"],"cwd":"/ws"}"#,
+            r#"{"reason":"compiler-artifact","package_id":"foo 0.1.0"}"#,
+            r#"{"reason":"build-finished","success":true}"#,
+            r#"{"reason":"x-cargo-mcp-test-output","text":"running 3 tests"}"#,
+            r#"{"reason":"x-cargo-mcp-test-output","text":"test passes ... ok"}"#,
+            r#"{"reason":"x-cargo-mcp-test-output","text":"test broken ... FAILED"}"#,
+            r#"{"reason":"x-cargo-mcp-test-output","text":"failures:"}"#,
+            r#"{"reason":"x-cargo-mcp-test-output","text":"---- broken stdout ----"}"#,
+            r#"{"reason":"x-cargo-mcp-test-output","text":"thread 'broken' panicked at src/lib.rs:5:5:"}"#,
+            r#"{"reason":"x-cargo-mcp-test-output","text":"assertion failed"}"#,
+            r#"{"reason":"x-cargo-mcp-test-output","text":"note: run with `RUST_BACKTRACE=1` ..."}"#,
+            r#"{"reason":"x-cargo-mcp-test-output","text":"test result: FAILED. 2 passed; 1 failed; ..."}"#,
+            r#"{"status":"error","exit_code":101}"#,
+            r#"{"reason":"x-cargo-mcp-stderr","text":"test stderr line"}"#,
+        ]
+        .join("\n")
+            + "\n"
+    }
+
+    #[test]
+    fn summarize_ndjson_keeps_header_pointer_status_and_errors() {
+        let body = fake_build_body();
+        let summary = summarize_ndjson(&body, "out.ndjson", 1234, 7, SummaryKind::Build);
+        assert_pure_ndjson(&summary);
+        // First line is always the invocation header verbatim.
+        let first = summary.lines().next().unwrap();
+        assert!(
+            first.contains(r#""reason":"x-cargo-mcp-invocation""#),
+            "first line not invocation header: {first}"
+        );
+        // Second line is the pointer record.
+        let second = summary.lines().nth(1).unwrap();
+        assert!(
+            second.contains(OUTPUT_FILE_REASON) && second.contains("out.ndjson"),
+            "second line not pointer record: {second}"
+        );
+        assert!(second.contains(r#""bytes":1234"#));
+        assert!(second.contains(r#""lines":7"#));
+        // Compiler error survives.
+        assert!(
+            summary.contains(r#""level":"error""#),
+            "missing compiler error:\n{summary}"
+        );
+        // build-finished survives.
+        assert!(
+            summary.contains(r#""reason":"build-finished""#),
+            "missing build-finished:\n{summary}"
+        );
+        // stderr record survives.
+        assert!(
+            summary.contains(STDERR_REASON),
+            "missing stderr record:\n{summary}"
+        );
+        // status trailer survives.
+        assert!(
+            summary.contains(r#""status":"error""#),
+            "missing status trailer:\n{summary}"
+        );
+    }
+
+    #[test]
+    fn summarize_ndjson_drops_warnings_and_compiler_artifacts() {
+        let body = fake_build_body();
+        let summary = summarize_ndjson(&body, "out.ndjson", 0, 0, SummaryKind::Build);
+        assert!(
+            !summary.contains("compiler-artifact"),
+            "compiler-artifact should be dropped:\n{summary}"
+        );
+        assert!(
+            !summary.contains(r#""level":"warning""#),
+            "warning should be dropped:\n{summary}"
+        );
+    }
+
+    #[test]
+    fn summarize_ndjson_build_kind_drops_test_output_lines() {
+        let body = fake_test_body();
+        let summary = summarize_ndjson(&body, "out.ndjson", 0, 0, SummaryKind::Build);
+        assert!(
+            !summary.contains(TEST_OUTPUT_REASON),
+            "test-output records should be dropped in Build kind:\n{summary}"
+        );
+    }
+
+    #[test]
+    fn summarize_ndjson_test_kind_keeps_failure_markers_drops_passing() {
+        let body = fake_test_body();
+        let summary = summarize_ndjson(&body, "out.ndjson", 0, 0, SummaryKind::Test);
+        assert_pure_ndjson(&summary);
+        // Kept summary lines.
+        for needle in [
+            "running 3 tests",
+            "test broken ... FAILED",
+            "failures:",
+            "---- broken stdout ----",
+            "panicked at",
+            "note: run with",
+            "test result: FAILED",
+        ] {
+            assert!(
+                summary.contains(needle),
+                "summary missing {needle:?}:\n{summary}"
+            );
+        }
+        // Dropped: passing test line.
+        assert!(
+            !summary.contains("test passes ... ok"),
+            "passing-test line should be dropped:\n{summary}"
+        );
+        // Dropped: captured-output body line ("assertion failed" without any
+        // marker pattern).
+        assert!(
+            !summary.contains("assertion failed"),
+            "raw captured body line should be dropped:\n{summary}"
+        );
+    }
+
+    #[test]
+    fn keep_in_summary_keeps_status_and_known_reasons() {
+        assert!(keep_in_summary(
+            r#"{"status":"success"}"#,
+            SummaryKind::Build
+        ));
+        assert!(keep_in_summary(
+            r#"{"reason":"build-finished","success":true}"#,
+            SummaryKind::Build
+        ));
+        assert!(keep_in_summary(
+            r#"{"reason":"x-cargo-mcp-stderr","text":"x"}"#,
+            SummaryKind::Build
+        ));
+    }
+
+    #[test]
+    fn keep_in_summary_drops_warnings_and_artifacts() {
+        assert!(!keep_in_summary(
+            r#"{"reason":"compiler-message","message":{"level":"warning"}}"#,
+            SummaryKind::Build
+        ));
+        assert!(!keep_in_summary(
+            r#"{"reason":"compiler-artifact"}"#,
+            SummaryKind::Build
+        ));
+    }
+
+    #[test]
+    fn is_test_summary_line_matches_expected_patterns() {
+        for kept in [
+            "test result: ok. 5 passed",
+            "failures:",
+            "running 12 tests",
+            "test foo ... FAILED",
+            "---- foo stdout ----",
+            "thread 'foo' panicked at src/lib.rs:1:1:",
+            "note: run with `RUST_BACKTRACE=1`",
+        ] {
+            assert!(is_test_summary_line(kept), "should keep: {kept:?}");
+        }
+        for dropped in [
+            "test foo ... ok",
+            "    expected `4`,\n       got `5`",
+            "",
+            "some random captured output",
+        ] {
+            assert!(!is_test_summary_line(dropped), "should drop: {dropped:?}");
+        }
     }
 }

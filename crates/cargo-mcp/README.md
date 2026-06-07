@@ -281,6 +281,74 @@ schema advertises exactly the options it accepts.
 | `offline` | boolean | Run without accessing the network (`--offline`) |
 | `frozen` | boolean | Equivalent to `--locked` plus `--offline` (`--frozen`) |
 
+**Environment variables (`env`)**
+
+Every tool that spawns cargo accepts an optional `env` object that sets or
+unsets environment variables on the cargo subprocess for that one call.
+Keys are env var names; values are either a string (set the variable) or
+`null` (remove it from the child's environment). The map is layered on top
+of cargo-mcp's built-in defaults (`CARGO_TERM_COLOR`, `NO_COLOR`, `RUSTC`),
+so a caller-supplied value wins, and the resulting block is what cargo-mcp
+hands to the OS as the child's environment (`env_clear()` + `envs(...)`).
+
+```jsonc
+{ "env": { "RUSTFLAGS": "-C debuginfo=2", "FIREBIRD_DUMP_MIR": "1" } }
+```
+
+Use it for one-shot debug knobs (`RUSTFLAGS`, `RUST_LOG`, `RUST_BACKTRACE`,
+`RUSTC_BOOTSTRAP`, compiler-internal dumps) that only this single call
+needs. Do **not** use it for permanent / project-wide configuration (put
+that in `Cargo.toml`, `.cargo/config.toml`, or `rust-toolchain.toml`) or
+for secrets — the env block is passed verbatim to the cargo child process
+(visible via OS-level process inspection) and may be captured by future
+logging additions, so treat it as not confidential.
+
+**Timeouts (`timeout_secs`)**
+
+`cargo_test` accepts an optional `timeout_secs` (and other long-running
+tools accept it as well). The budget covers only test **execution** — the
+clock starts when compilation and linking finish (cargo's `build-finished`
+record), so a slow build never trips the timeout.
+
+- Omit `timeout_secs` to apply the server default
+  (`cargo-mcp.test.timeoutSecs`, 30s when launched via the VS Code
+  extension; no default otherwise).
+- Pass `timeout_secs: N` to use a specific budget for this run.
+- Pass `timeout_secs: 0` to disable the timeout for this run.
+
+Raise it (or pass `0`) for runs you know are slow (long integration
+suites, benchmark-style tests, tests that poll). Lower it when sanity-
+checking a fix to fail fast on an infinite loop.
+
+**Redirecting full output to a file (`output_path`)**
+
+`cargo_check`, `cargo_build`, `cargo_test`, `cargo_clippy`, and
+`cargo_doc` accept an optional `output_path`: a relative path (under the
+working directory; no `..` components; parent must already exist) that
+receives the **complete** NDJSON output. When set, the tool result is a
+compact summary instead of the full transcript.
+
+| Always kept in the returned summary | Dropped from the summary (still in the file) |
+|---|---|
+| `x-cargo-mcp-invocation` (header) | `compiler-artifact`, `build-script-executed` |
+| `x-cargo-mcp-output-file` pointer (`path`, `bytes`, `lines`) | `compiler-message` with `level: warning` |
+| `compiler-message` with `level: error` (incl. ICE) | passing-test lines (`test foo ... ok`) |
+| `build-finished` | captured `println!` replay bodies |
+| `x-cargo-mcp-stderr` (when present) | |
+| status trailer (`{"status":...}`) | |
+| **`cargo_test` only:** libtest summary/failure markers — `running N tests`, ` ... FAILED`, `failures:`, `---- name stdout ----`, `panicked at`, `note: run with`, `test result:` | |
+
+Use it whenever you would otherwise pipe to a temp file (`> build.log`,
+`Out-File test-out.txt`) just to keep the response small. Don't use it
+for small interactive checks where you want to act on the diagnostics
+inline; `cargo_metadata` has its own `output_file` parameter with the
+same intent. Workflow: read the summary first; only open the file when
+the summary indicates failures worth drilling into.
+
+```jsonc
+{ "output_path": "target/cargo-mcp/test-run.ndjson" }
+```
+
 ### `cargo_metadata`
 
 ```jsonc
@@ -301,7 +369,10 @@ schema advertises exactly the options it accepts.
   "exact": true,                      // optional: exact match instead of substring
   "lib": true,                        // optional: only library (unit) tests
   "test": "integration_tests",        // optional: specific integration test target name
-  "no_fail_fast": true                // optional: run all tests even if some fail
+  "no_fail_fast": true,               // optional: run all tests even if some fail
+  "timeout_secs": 0,                  // optional: 0 disables the timeout for this run
+  "env": { "RUST_BACKTRACE": "1" },   // optional: one-shot env for this call only
+  "output_path": "target/cargo-mcp/test.ndjson" // optional: full NDJSON to file; result is a summary
 }
 ```
 
