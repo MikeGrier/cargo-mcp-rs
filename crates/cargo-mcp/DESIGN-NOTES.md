@@ -333,7 +333,10 @@ unavailable; the only levers are the literal text and the numeric counter.
   bracketed marker for the effective compilation profile:
   - `[D]` — debug/dev (the default when neither `release` nor `profile` is set)
   - `[R]` — release (`release: true` or `profile: "release"`)
-  - `[name]` — any other named profile, shown verbatim (e.g. `[bench]`)
+  - `[T]` — test (`profile: "test"`)
+  - `[B]` — bench (`profile: "bench"`)
+  - `[doc]` — doc (`profile: "doc"`)
+  - `[name]` — any other named profile, shown verbatim
   An explicit `profile` argument wins over `release`, matching cargo's own
   precedence. Implemented in `profile_tag()` and threaded through
   `BuildTracker`.

@@ -831,7 +831,10 @@ fn registry_label(pkg_id: &str) -> Option<String> {
 ///
 /// - explicit `profile: "dev"` (or no profile and no `release`) → `[D]`
 /// - explicit `profile: "release"` or `release: true`           → `[R]`
-/// - any other named profile (e.g. `bench`, `my-profile`)       → `[name]`
+/// - `profile: "test"`                                          → `[T]`
+/// - `profile: "bench"`                                         → `[B]`
+/// - `profile: "doc"`                                           → `[doc]`
+/// - any other named profile (e.g. `my-profile`)               → `[name]`
 ///
 /// An explicit `profile` argument always wins over `release`, matching
 /// cargo's own precedence.
@@ -849,6 +852,8 @@ fn profile_tag(args: &Value) -> String {
     match name {
         "dev" | "debug" => "[D]".to_owned(),
         "release" => "[R]".to_owned(),
+        "test" => "[T]".to_owned(),
+        "bench" => "[B]".to_owned(),
         other => format!("[{other}]"),
     }
 }
@@ -964,8 +969,24 @@ mod tests {
 
     #[test]
     fn profile_tag_named_profile_shown_verbatim() {
-        let args = serde_json::json!({ "profile": "bench" });
-        assert_eq!(profile_tag(&args), "[bench]");
+        let args = serde_json::json!({ "profile": "my-profile" });
+        assert_eq!(profile_tag(&args), "[my-profile]");
+    }
+
+    #[test]
+    fn profile_tag_known_named_profiles_abbreviated() {
+        assert_eq!(
+            profile_tag(&serde_json::json!({ "profile": "test" })),
+            "[T]"
+        );
+        assert_eq!(
+            profile_tag(&serde_json::json!({ "profile": "bench" })),
+            "[B]"
+        );
+        assert_eq!(
+            profile_tag(&serde_json::json!({ "profile": "doc" })),
+            "[doc]"
+        );
     }
 
     #[test]
