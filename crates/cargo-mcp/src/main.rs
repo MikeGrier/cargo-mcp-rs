@@ -457,6 +457,21 @@ fn dispatch(method: &str, params: Option<Value>) -> ResponseBody {
 
 // ── tool call handling ─────────────────────────────────────────────────────
 
+/// Wrap a `content` array into a `tools/call` success result, lifting
+/// the tool's `is_error` flag onto MCP's `CallToolResult.isError` field.
+///
+/// Centralised so every Ok response shape (plain text, suggestions with
+/// or without elicitation) reports cargo's exit status through the
+/// dedicated MCP channel instead of relying on the agent to parse the
+/// `{"status":"error","exit_code":N}` trailer embedded in the body.
+fn ok_result_with_is_error(content: Value, is_error: bool) -> Value {
+    let mut result = serde_json::json!({ "content": content });
+    if is_error {
+        result["isError"] = Value::Bool(true);
+    }
+    result
+}
+
 /// Handle a `tools/call` request, with optional elicitation for suggestions.
 ///
 /// When the tool produces actionable suggestions (clippy/check) and the client
@@ -540,15 +555,17 @@ fn handle_tool_call(
     };
 
     match result {
-        Ok(tools::ToolResult::Text(text)) => ResponseBody::Ok {
-            result: serde_json::json!({
-                "content": [{ "type": "text", "text": text }]
-            }),
+        Ok(tools::ToolResult::Text { text, is_error }) => ResponseBody::Ok {
+            result: ok_result_with_is_error(
+                serde_json::json!([{ "type": "text", "text": text }]),
+                is_error,
+            ),
         },
 
         Ok(tools::ToolResult::WithSuggestions {
             output,
             suggestions,
+            is_error,
         }) => {
             // Partition: MachineApplicable auto-reported, others need human approval.
             let (auto_apply, needs_approval): (Vec<_>, Vec<_>) = suggestions
@@ -567,7 +584,10 @@ fn handle_tool_call(
                 buf
             };
 
-            if can_elicit
+            // Build the per-branch `content` array, then wrap once with a
+            // shared `isError` lift so the cargo exit status propagates
+            // through every elicitation outcome.
+            let content: serde_json::Value = if can_elicit
                 && !needs_approval.is_empty()
                 && elicitation_mode != ElicitationMode::AlwaysSkip
             {
@@ -583,32 +603,20 @@ fn handle_tool_call(
                         let selected = elicit::filter_suggestions(&needs_approval, &ids);
                         let review_summary = elicit::format_selected_summary(&selected);
                         let combined = format!("{auto_summary}{review_summary}");
-                        ResponseBody::Ok {
-                            result: serde_json::json!({
-                                "content": [
-                                    { "type": "text", "text": combined },
-                                    { "type": "text", "text": output },
-                                ]
-                            }),
-                        }
+                        serde_json::json!([
+                            { "type": "text", "text": combined },
+                            { "type": "text", "text": output },
+                        ])
                     }
                     _ => {
                         // User declined/cancelled — still report auto-applicable.
                         if auto_summary.is_empty() {
-                            ResponseBody::Ok {
-                                result: serde_json::json!({
-                                    "content": [{ "type": "text", "text": output }]
-                                }),
-                            }
+                            serde_json::json!([{ "type": "text", "text": output }])
                         } else {
-                            ResponseBody::Ok {
-                                result: serde_json::json!({
-                                    "content": [
-                                        { "type": "text", "text": auto_summary },
-                                        { "type": "text", "text": output },
-                                    ]
-                                }),
-                            }
+                            serde_json::json!([
+                                { "type": "text", "text": auto_summary },
+                                { "type": "text", "text": output },
+                            ])
                         }
                     }
                 }
@@ -631,18 +639,14 @@ fn handle_tool_call(
                     ));
                     combined.push_str(&suggest::format_numbered_list(&needs_approval));
                 }
-                ResponseBody::Ok {
-                    result: serde_json::json!({
-                        "content": [{ "type": "text", "text": combined }]
-                    }),
-                }
+                serde_json::json!([{ "type": "text", "text": combined }])
             } else {
                 // No suggestions found.
-                ResponseBody::Ok {
-                    result: serde_json::json!({
-                        "content": [{ "type": "text", "text": output }]
-                    }),
-                }
+                serde_json::json!([{ "type": "text", "text": output }])
+            };
+
+            ResponseBody::Ok {
+                result: ok_result_with_is_error(content, is_error),
             }
         }
 
@@ -1017,5 +1021,30 @@ mod tests {
         );
         let msg = t.process_line(r#"{"reason":"build-finished","success":false}"#);
         assert_eq!(msg, "Cargo check [D] (x86_64-pc-windows-msvc) failed");
+    }
+
+    #[test]
+    fn ok_result_with_is_error_omits_field_on_success() {
+        let content = serde_json::json!([{ "type": "text", "text": "hello" }]);
+        let r = ok_result_with_is_error(content, false);
+        assert!(
+            r.get("isError").is_none(),
+            "isError must be absent on success so the MCP response is a \
+             plain success result; got: {r}"
+        );
+        assert_eq!(r["content"][0]["text"], "hello");
+    }
+
+    #[test]
+    fn ok_result_with_is_error_sets_field_on_failure() {
+        let content = serde_json::json!([{ "type": "text", "text": "boom" }]);
+        let r = ok_result_with_is_error(content, true);
+        assert_eq!(
+            r["isError"],
+            serde_json::Value::Bool(true),
+            "isError must be lifted onto the MCP CallToolResult so agents \
+             see cargo's non-zero exit without parsing the body trailer; \
+             got: {r}"
+        );
     }
 }

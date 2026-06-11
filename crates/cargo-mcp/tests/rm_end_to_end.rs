@@ -250,6 +250,26 @@ fn cargo_clean_against_held_file_in_deps_surfaces_holder_in_stderr() {
         "expected '{path_marker}' (full-path tail + close-paren marker) \
          in combined output; was:\n{combined}"
     );
+
+    // With max_attempts=2 the retry loop should have surfaced an explicit
+    // "gave up after N attempts" record so the agent can tell that cargo-mcp
+    // itself stopped retrying rather than this being a single-shot failure.
+    // The record must appear in both the streamed progress channel and the
+    // captured stderr — agents that don't subscribe to progress notifications
+    // still need to see it.
+    let give_up_marker = "cargo-mcp: gave up after 2 attempts";
+    assert!(
+        streamed.iter().any(|l| l.contains(give_up_marker)),
+        "expected '{give_up_marker}' streamed as a progress line; \
+         streamed lines were:\n{}",
+        streamed.join("\n")
+    );
+    assert!(
+        result.stderr.contains(give_up_marker),
+        "expected '{give_up_marker}' in captured stderr so agents that \
+         skip progress notifications still see it; stderr was:\n{}",
+        result.stderr
+    );
 }
 
 /// Documents a real Restart Manager limitation discovered while

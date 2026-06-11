@@ -966,6 +966,24 @@ pub fn run_cargo_streaming_with_timeout(
             append_holder_report(&mut out.stderr, &holder_report);
         }
         if attempt == max_attempts {
+            // Surface an explicit "gave up" record so the agent (and any
+            // human reading the captured output) sees that cargo-mcp
+            // itself stopped retrying — distinct from a single-shot busy
+            // failure. Goes to both the streamed progress channel and the
+            // captured stderr (the latter so the marker survives even if
+            // the caller never reads progress notifications).
+            let give_up = format!(
+                "cargo-mcp: gave up after {total} attempts on transient \
+                 file-busy error; cargo last exited with code {code}",
+                total = max_attempts,
+                code = out.exit_code,
+            );
+            on_stdout_line(&give_up);
+            if !out.stderr.ends_with('\n') {
+                out.stderr.push('\n');
+            }
+            out.stderr.push_str(&give_up);
+            out.stderr.push('\n');
             return Ok(out);
         }
         // Surface the retry as a synthetic line so the streaming caller can
