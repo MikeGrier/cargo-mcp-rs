@@ -973,8 +973,7 @@ pub fn run_cargo_streaming_with_timeout(
             // captured stderr (the latter so the marker survives even if
             // the caller never reads progress notifications).
             let give_up = format!(
-                "cargo-mcp: gave up after {total} attempts on transient \
-                 file-busy error; cargo last exited with code {code}",
+                "cargo-mcp: gave up after {total} attempts on transient file-busy error; cargo last exited with code {code}",
                 total = max_attempts,
                 code = out.exit_code,
             );
