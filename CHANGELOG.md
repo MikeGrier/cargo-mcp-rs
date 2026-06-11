@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.6.2](https://github.com/MikeGrier/cargo-mcp-rs/compare/v0.6.1...v0.6.2) (2026-06-11)
+
+
+### Bug Fixes
+
+* **invoke:** only emit retry give-up marker when retries were possible ([3820423](https://github.com/MikeGrier/cargo-mcp-rs/commit/3820423bab7f8b7d7dd765ae9934e7e39ac200ea))
+* **invoke:** surface cargo failure via MCP isError; announce retry give-up ([b918410](https://github.com/MikeGrier/cargo-mcp-rs/commit/b9184108b6dddb6b7e4f7b3af10298754f379e19))
+* **invoke:** surface cargo failure via MCP isError; announce retry give-up ([4538826](https://github.com/MikeGrier/cargo-mcp-rs/commit/45388264d1d094953120cc7c1a9c874c118d4f94))
+
 ## [0.6.1](https://github.com/MikeGrier/cargo-mcp-rs/compare/v0.6.0...v0.6.1) (2026-06-07)
 
 
