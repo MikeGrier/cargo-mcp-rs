@@ -979,7 +979,7 @@ pub fn run_cargo_streaming_with_timeout(
                 code = out.exit_code,
             );
             on_stdout_line(&give_up);
-            if !out.stderr.ends_with('\n') {
+            if !out.stderr.is_empty() && !out.stderr.ends_with('\n') {
                 out.stderr.push('\n');
             }
             out.stderr.push_str(&give_up);
