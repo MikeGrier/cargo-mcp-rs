@@ -966,6 +966,26 @@ pub fn run_cargo_streaming_with_timeout(
             append_holder_report(&mut out.stderr, &holder_report);
         }
         if attempt == max_attempts {
+            // Emit an explicit "gave up" record only when we actually had a
+            // retry budget to exhaust (max_attempts > 1). With max_attempts
+            // == 1 — retries disabled, or the subcommand isn't on the
+            // idempotent allowlist — there was no retry loop to give up
+            // on, so calling it "give up" would mislabel a single-shot
+            // busy failure. The cargo exit code already signals the
+            // failure; the holder report above provides the diagnostic.
+            if max_attempts > 1 {
+                let give_up = format!(
+                    "cargo-mcp: gave up after {total} attempts on transient file-busy error; cargo last exited with code {code}",
+                    total = max_attempts,
+                    code = out.exit_code,
+                );
+                on_stdout_line(&give_up);
+                if !out.stderr.is_empty() && !out.stderr.ends_with('\n') {
+                    out.stderr.push('\n');
+                }
+                out.stderr.push_str(&give_up);
+                out.stderr.push('\n');
+            }
             return Ok(out);
         }
         // Surface the retry as a synthetic line so the streaming caller can

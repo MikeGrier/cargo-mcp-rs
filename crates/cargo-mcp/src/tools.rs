@@ -328,14 +328,37 @@ const OUTPUT_PATH_DESC: &str = "Optional relative path (under the working direct
 /// The result of a tool call, which may carry actionable suggestions.
 pub enum ToolResult {
     /// Plain text output (no suggestions to extract).
-    Text(String),
+    Text {
+        /// The full text body returned to the MCP client.
+        text: String,
+        /// `true` when the underlying cargo invocation failed (non-zero
+        /// exit code, including retry-on-busy exhaustion). The dispatcher
+        /// in `main.rs` lifts this onto the MCP `CallToolResult.isError`
+        /// flag so agents can distinguish a cargo failure from a tool that
+        /// merely returned text — without having to parse the
+        /// `{"status":"error","exit_code":N}` trailer embedded in `text`.
+        is_error: bool,
+    },
     /// Output accompanied by actionable compiler/lint suggestions.
     WithSuggestions {
         /// The full output text (NDJSON or formatted).
         output: String,
         /// Extracted suggestions with machine-applicable replacements.
         suggestions: Vec<Suggestion>,
+        /// Same meaning as [`ToolResult::Text::is_error`]: `true` when
+        /// the underlying cargo invocation failed.
+        is_error: bool,
     },
+}
+
+impl ToolResult {
+    /// Constructor for a successful plain-text result (no cargo failure).
+    pub fn text_ok(text: impl Into<String>) -> Self {
+        Self::Text {
+            text: text.into(),
+            is_error: false,
+        }
+    }
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -2194,23 +2217,23 @@ fn call_inner(
     on_progress: Option<&mut dyn FnMut(&str)>,
 ) -> Result<ToolResult, Box<dyn std::error::Error>> {
     match name {
-        "cargo_metadata" => call_metadata(args).map(ToolResult::Text),
+        "cargo_metadata" => call_metadata(args).map(ToolResult::text_ok),
         "cargo_check" => call_check(args, on_progress),
-        "cargo_build" => call_build(args, on_progress).map(ToolResult::Text),
-        "cargo_test" => call_test(args, on_progress).map(ToolResult::Text),
+        "cargo_build" => call_build(args, on_progress),
+        "cargo_test" => call_test(args, on_progress),
         "cargo_clippy" => call_clippy(args, on_progress),
-        "cargo_fmt_check" => call_fmt_check(args).map(ToolResult::Text),
-        "cargo_fmt" => call_fmt(args).map(ToolResult::Text),
-        "cargo_tree" => call_tree(args).map(ToolResult::Text),
-        "cargo_doc" => call_doc(args, on_progress).map(ToolResult::Text),
-        "cargo_clean" => call_clean(args).map(ToolResult::Text),
-        "cargo_update" => call_update(args).map(ToolResult::Text),
-        "cargo_fix" => call_fix(args).map(ToolResult::Text),
-        "cargo_add" => call_add(args).map(ToolResult::Text),
-        "cargo_remove" => call_remove(args).map(ToolResult::Text),
-        "cargo_publish" => call_publish(args).map(ToolResult::Text),
-        "cargo_setup" => call_setup(args).map(ToolResult::Text),
-        "cargo_diagnostic" => call_diagnostic(args).map(ToolResult::Text),
+        "cargo_fmt_check" => call_fmt_check(args),
+        "cargo_fmt" => call_fmt(args),
+        "cargo_tree" => call_tree(args),
+        "cargo_doc" => call_doc(args, on_progress),
+        "cargo_clean" => call_clean(args),
+        "cargo_update" => call_update(args),
+        "cargo_fix" => call_fix(args),
+        "cargo_add" => call_add(args),
+        "cargo_remove" => call_remove(args),
+        "cargo_publish" => call_publish(args),
+        "cargo_setup" => call_setup(args).map(ToolResult::text_ok),
+        "cargo_diagnostic" => call_diagnostic(args).map(ToolResult::text_ok),
         _ => Err(format!("unknown tool: {name}").into()),
     }
 }
@@ -2310,19 +2333,21 @@ fn call_check(
         argv.insert(0, t);
     }
     let out = run_cargo_maybe_streaming(&argv, wd, opt_timeout(args)?, None, on_progress)?;
+    let is_error = out.exit_code != 0;
     let body = format_json_output(&out, &argv, wd);
     let suggestions = suggest::extract_suggestions(&out.stdout);
     let output = write_output_path_and_summarize(body, output_path, wd, SummaryKind::Build)?;
     Ok(ToolResult::WithSuggestions {
         output,
         suggestions,
+        is_error,
     })
 }
 
 fn call_build(
     args: &Value,
     on_progress: Option<&mut dyn FnMut(&str)>,
-) -> Result<String, Box<dyn std::error::Error>> {
+) -> Result<ToolResult, Box<dyn std::error::Error>> {
     let wd = opt_str(args, "working_dir");
     let output_path = opt_str(args, "output_path");
     if let Some(p) = output_path {
@@ -2340,14 +2365,16 @@ fn call_build(
         argv.insert(0, t);
     }
     let out = run_cargo_maybe_streaming(&argv, wd, opt_timeout(args)?, None, on_progress)?;
+    let is_error = out.exit_code != 0;
     let body = format_json_output(&out, &argv, wd);
-    write_output_path_and_summarize(body, output_path, wd, SummaryKind::Build)
+    let text = write_output_path_and_summarize(body, output_path, wd, SummaryKind::Build)?;
+    Ok(ToolResult::Text { text, is_error })
 }
 
 fn call_test(
     args: &Value,
     on_progress: Option<&mut dyn FnMut(&str)>,
-) -> Result<String, Box<dyn std::error::Error>> {
+) -> Result<ToolResult, Box<dyn std::error::Error>> {
     let wd = opt_str(args, "working_dir");
     let output_path = opt_str(args, "output_path");
     if let Some(p) = output_path {
@@ -2411,8 +2438,10 @@ fn call_test(
     // Use format_test_output so that non-JSON lines (libtest harness text,
     // captured println! replays) are preserved as x-cargo-mcp-test-output
     // records, and stderr (eprintln! from test code) is always included.
+    let is_error = out.exit_code != 0;
     let body = format_test_output(&out, &argv, wd);
-    write_output_path_and_summarize(body, output_path, wd, SummaryKind::Test)
+    let text = write_output_path_and_summarize(body, output_path, wd, SummaryKind::Test)?;
+    Ok(ToolResult::Text { text, is_error })
 }
 
 fn call_clippy(
@@ -2436,16 +2465,18 @@ fn call_clippy(
         argv.insert(0, t);
     }
     let out = run_cargo_maybe_streaming(&argv, wd, opt_timeout(args)?, None, on_progress)?;
+    let is_error = out.exit_code != 0;
     let body = format_json_output(&out, &argv, wd);
     let suggestions = suggest::extract_suggestions(&out.stdout);
     let output = write_output_path_and_summarize(body, output_path, wd, SummaryKind::Build)?;
     Ok(ToolResult::WithSuggestions {
         output,
         suggestions,
+        is_error,
     })
 }
 
-fn call_fmt_check(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
+fn call_fmt_check(args: &Value) -> Result<ToolResult, Box<dyn std::error::Error>> {
     let wd = opt_str(args, "working_dir");
     let tc = toolchain_arg(args);
     let mut argv: Vec<&str> = vec!["fmt", "--check"];
@@ -2458,10 +2489,14 @@ fn call_fmt_check(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
         argv.insert(0, t);
     }
     let out = invoke::run_cargo(&argv, wd)?;
-    Ok(format_text_output(&out, &argv, wd))
+    let is_error = out.exit_code != 0;
+    Ok(ToolResult::Text {
+        text: format_text_output(&out, &argv, wd),
+        is_error,
+    })
 }
 
-fn call_fmt(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
+fn call_fmt(args: &Value) -> Result<ToolResult, Box<dyn std::error::Error>> {
     let wd = opt_str(args, "working_dir");
     let tc = toolchain_arg(args);
     let mut argv: Vec<&str> = vec!["fmt"];
@@ -2474,10 +2509,14 @@ fn call_fmt(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
         argv.insert(0, t);
     }
     let out = invoke::run_cargo(&argv, wd)?;
-    Ok(format_text_output(&out, &argv, wd))
+    let is_error = out.exit_code != 0;
+    Ok(ToolResult::Text {
+        text: format_text_output(&out, &argv, wd),
+        is_error,
+    })
 }
 
-fn call_tree(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
+fn call_tree(args: &Value) -> Result<ToolResult, Box<dyn std::error::Error>> {
     let wd = opt_str(args, "working_dir");
     let tc = toolchain_arg(args);
     let mut argv: Vec<&str> = vec!["tree"];
@@ -2509,13 +2548,17 @@ fn call_tree(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
         argv.insert(0, t);
     }
     let out = invoke::run_cargo(&argv, wd)?;
-    Ok(format_text_output(&out, &argv, wd))
+    let is_error = out.exit_code != 0;
+    Ok(ToolResult::Text {
+        text: format_text_output(&out, &argv, wd),
+        is_error,
+    })
 }
 
 fn call_doc(
     args: &Value,
     on_progress: Option<&mut dyn FnMut(&str)>,
-) -> Result<String, Box<dyn std::error::Error>> {
+) -> Result<ToolResult, Box<dyn std::error::Error>> {
     let wd = opt_str(args, "working_dir");
     let output_path = opt_str(args, "output_path");
     if let Some(p) = output_path {
@@ -2540,11 +2583,13 @@ fn call_doc(
         argv.insert(0, t);
     }
     let out = run_cargo_maybe_streaming(&argv, wd, None, None, on_progress)?;
+    let is_error = out.exit_code != 0;
     let body = format_json_output(&out, &argv, wd);
-    write_output_path_and_summarize(body, output_path, wd, SummaryKind::Build)
+    let text = write_output_path_and_summarize(body, output_path, wd, SummaryKind::Build)?;
+    Ok(ToolResult::Text { text, is_error })
 }
 
-fn call_clean(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
+fn call_clean(args: &Value) -> Result<ToolResult, Box<dyn std::error::Error>> {
     let wd = opt_str(args, "working_dir");
     let mut argv: Vec<&str> = vec!["clean"];
     let pkg = opt_str(args, "package").map(String::from);
@@ -2556,10 +2601,14 @@ fn call_clean(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
         argv.push("--release");
     }
     let out = invoke::run_cargo(&argv, wd)?;
-    Ok(format_text_output(&out, &argv, wd))
+    let is_error = out.exit_code != 0;
+    Ok(ToolResult::Text {
+        text: format_text_output(&out, &argv, wd),
+        is_error,
+    })
 }
 
-fn call_update(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
+fn call_update(args: &Value) -> Result<ToolResult, Box<dyn std::error::Error>> {
     let wd = opt_str(args, "working_dir");
     let mut argv: Vec<&str> = vec!["update"];
     let pkg = opt_str(args, "package").map(String::from);
@@ -2576,10 +2625,14 @@ fn call_update(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
         argv.push(v);
     }
     let out = invoke::run_cargo(&argv, wd)?;
-    Ok(format_text_output(&out, &argv, wd))
+    let is_error = out.exit_code != 0;
+    Ok(ToolResult::Text {
+        text: format_text_output(&out, &argv, wd),
+        is_error,
+    })
 }
 
-fn call_fix(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
+fn call_fix(args: &Value) -> Result<ToolResult, Box<dyn std::error::Error>> {
     let wd = opt_str(args, "working_dir");
     let mut argv: Vec<&str> = vec!["fix"];
     let pkg = opt_str(args, "package").map(String::from);
@@ -2597,10 +2650,14 @@ fn call_fix(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
         argv.push("--clippy");
     }
     let out = invoke::run_cargo(&argv, wd)?;
-    Ok(format_text_output(&out, &argv, wd))
+    let is_error = out.exit_code != 0;
+    Ok(ToolResult::Text {
+        text: format_text_output(&out, &argv, wd),
+        is_error,
+    })
 }
 
-fn call_add(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
+fn call_add(args: &Value) -> Result<ToolResult, Box<dyn std::error::Error>> {
     let wd = opt_str(args, "working_dir");
     let dep = args
         .get("dependency")
@@ -2624,10 +2681,14 @@ fn call_add(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
         argv.push(f);
     }
     let out = invoke::run_cargo(&argv, wd)?;
-    Ok(format_text_output(&out, &argv, wd))
+    let is_error = out.exit_code != 0;
+    Ok(ToolResult::Text {
+        text: format_text_output(&out, &argv, wd),
+        is_error,
+    })
 }
 
-fn call_remove(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
+fn call_remove(args: &Value) -> Result<ToolResult, Box<dyn std::error::Error>> {
     let wd = opt_str(args, "working_dir");
     let dep = args
         .get("dependency")
@@ -2646,10 +2707,14 @@ fn call_remove(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
         argv.push(p);
     }
     let out = invoke::run_cargo(&argv, wd)?;
-    Ok(format_text_output(&out, &argv, wd))
+    let is_error = out.exit_code != 0;
+    Ok(ToolResult::Text {
+        text: format_text_output(&out, &argv, wd),
+        is_error,
+    })
 }
 
-fn call_publish(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
+fn call_publish(args: &Value) -> Result<ToolResult, Box<dyn std::error::Error>> {
     let wd = opt_str(args, "working_dir");
     let mut argv: Vec<&str> = vec!["publish"];
     let pkg = opt_str(args, "package").map(String::from);
@@ -2664,7 +2729,11 @@ fn call_publish(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
         argv.push("--allow-dirty");
     }
     let out = invoke::run_cargo(&argv, wd)?;
-    Ok(format_text_output(&out, &argv, wd))
+    let is_error = out.exit_code != 0;
+    Ok(ToolResult::Text {
+        text: format_text_output(&out, &argv, wd),
+        is_error,
+    })
 }
 
 fn call_setup(_args: &Value) -> Result<String, Box<dyn std::error::Error>> {
