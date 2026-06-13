@@ -20,6 +20,7 @@ mod invoke;
 mod line_reader;
 mod rm;
 mod suggest;
+mod test_filter;
 mod tools;
 
 use std::io::{self, Write};

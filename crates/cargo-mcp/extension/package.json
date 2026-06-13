@@ -125,7 +125,7 @@
                     "type": "number",
                     "default": 30,
                     "minimum": 0,
-                    "markdownDescription": "Default wall-clock timeout in seconds applied to every `cargo_test` call that does not supply an explicit `timeout_secs`. The budget covers only test **execution** — the clock starts when compilation and linking finish, so a slow build never trips the timeout. When the budget elapses, cargo and all spawned test binaries are terminated. Set to `0` to disable the default timeout and allow test runs to run indefinitely."
+                    "markdownDescription": "Default wall-clock timeout in seconds applied to every `cargo_test` call that does not supply an explicit `timeout_secs` (or, in `test_filter` mode, an explicit `per_test_timeout_secs`). The budget covers only test **execution** — the clock starts when compilation and linking finish, so a slow build never trips the timeout. When the budget elapses, cargo and all spawned test binaries are terminated. Set to `0` to disable the server-provided default. In `test_filter` mode, `0` (or an absent setting) still leaves a hard-coded **30-second** per-test fallback in place so hung-test protection stays on; the only way to fully disable per-test protection for a call is an explicit `per_test_timeout_secs: 0` in the tool arguments."
                 },
                 "cargo-mcp.extraArgs": {
                     "type": "array",

@@ -281,3 +281,189 @@ fn cancellation_returns_cancelled_error_and_terminates_subprocess() {
         "cancel path took too long to return: {elapsed:?}",
     );
 }
+
+// ── two-deadline watchdog conflict tests ─────────────────────────────────────
+//
+// These tests exercise `run_cargo_streaming_with_watchdog` directly with the
+// rm-sleeper shim. The sleeper prints `STARTED <pid>` once then sleeps for
+// 600 s, so:
+//   * deadlines arm at spawn (no `arm_deadline`),
+//   * a reset predicate can be made to match the `STARTED` line exactly once,
+//   * after that the stream goes silent, so any further deadline behavior
+//     is observable purely from which deadline elapses first.
+//
+// Timing budgets use generous slack (firing budget + ~30 s wall-clock cap)
+// so the assertions remain stable on slow CI runners.
+
+/// Run the sleeper through `run_cargo_streaming_with_watchdog` with the given
+/// deadlines / predicates, returning `(elapsed_returned_by_call,
+/// TimeoutError.elapsed, sleeper_pid)`. Panics if the call did not produce a
+/// `TimeoutError` or if the sleeper never started.
+fn run_sleeper_with_watchdog(
+    overall: Option<Duration>,
+    per_test: Option<Duration>,
+    arm: Option<invoke::ArmDeadline<'_>>,
+    reset: Option<invoke::ArmDeadline<'_>>,
+) -> (Duration, Duration, u32) {
+    let _cargo_g = CARGO_ENV_LOCK.lock().unwrap();
+    let _env_g = invoke::TEST_ENV_LOCK.lock().unwrap();
+    let sleeper = build_sleeper();
+    let _env = CargoEnvGuard::set(&sleeper);
+
+    let mut saw_started = false;
+    let mut sleeper_pid: Option<u32> = None;
+    let started = Instant::now();
+    let result = invoke::run_cargo_streaming_with_watchdog(
+        &["check"],
+        None,
+        overall,
+        None,
+        per_test,
+        arm,
+        reset,
+        &mut |line| {
+            if let Some(rest) = line.strip_prefix("STARTED ") {
+                saw_started = true;
+                sleeper_pid = rest.trim().parse::<u32>().ok();
+            }
+        },
+    );
+    let elapsed = started.elapsed();
+
+    let err = match result {
+        Err(e) => e,
+        Ok(_) => panic!("expected TimeoutError, got Ok"),
+    };
+    let timeout_err = err
+        .downcast_ref::<invoke::TimeoutError>()
+        .unwrap_or_else(|| panic!("expected TimeoutError, got: {err}"));
+    assert!(
+        saw_started,
+        "sleeper never printed STARTED — shim was not actually spawned",
+    );
+    let pid = sleeper_pid.expect("sleeper STARTED line did not contain a parseable PID");
+    assert!(
+        wait_for_process_exit(pid),
+        "sleeper process (pid={pid}) still alive after timeout path returned",
+    );
+    assert!(
+        elapsed < Duration::from_secs(30),
+        "timeout path took too long to return: {elapsed:?}",
+    );
+    (elapsed, timeout_err.elapsed, pid)
+}
+
+/// Overall deadline is shorter than the per-test deadline → overall fires.
+/// If the watchdog incorrectly let per-test reset / dominate, this would
+/// run for ~2 s instead of ~200 ms.
+#[test]
+fn watchdog_overall_shorter_than_per_test_overall_wins() {
+    let (wall, reported, _pid) = run_sleeper_with_watchdog(
+        Some(Duration::from_millis(200)),
+        Some(Duration::from_secs(2)),
+        None,
+        None,
+    );
+    assert!(
+        reported >= Duration::from_millis(200),
+        "reported elapsed ({reported:?}) shorter than overall budget",
+    );
+    assert!(
+        wall < Duration::from_millis(1500),
+        "call took {wall:?}; overall (200ms) should have fired well before per_test (2s)",
+    );
+}
+
+/// Per-test deadline is shorter than the overall deadline → per-test fires.
+/// No reset predicate, so per-test never gets refreshed.
+#[test]
+fn watchdog_per_test_shorter_than_overall_per_test_wins() {
+    let (wall, reported, _pid) = run_sleeper_with_watchdog(
+        Some(Duration::from_secs(2)),
+        Some(Duration::from_millis(200)),
+        None,
+        None,
+    );
+    assert!(
+        reported >= Duration::from_millis(200),
+        "reported elapsed ({reported:?}) shorter than per_test budget",
+    );
+    assert!(
+        wall < Duration::from_millis(1500),
+        "call took {wall:?}; per_test (200ms) should have fired well before overall (2s)",
+    );
+}
+
+/// Equal deadlines arm together → one of them fires within budget.
+/// Both armed at the same instant; either firing is correct as long as the
+/// call returns near the budget (not double the budget, which would mean
+/// per-test silently swallowed the overall trigger or vice versa).
+#[test]
+fn watchdog_equal_deadlines_fire_together() {
+    let (wall, reported, _pid) = run_sleeper_with_watchdog(
+        Some(Duration::from_millis(200)),
+        Some(Duration::from_millis(200)),
+        None,
+        None,
+    );
+    assert!(
+        reported >= Duration::from_millis(200),
+        "reported elapsed ({reported:?}) shorter than configured budget",
+    );
+    assert!(
+        wall < Duration::from_millis(1500),
+        "call took {wall:?}; one of the two equal 200ms deadlines should have fired",
+    );
+}
+
+/// A reset predicate that matches the sleeper's STARTED line bumps per-test
+/// far past overall, but overall still fires on schedule. Proves that
+/// `reset_deadline` refreshes ONLY per-test — the overall cap is immune.
+///
+/// Configuration: overall = 300 ms, per_test = 5 s (much larger than the
+/// total budget so per-test alone could never fire inside overall's window),
+/// reset matches "STARTED" (arrives ~50 ms after spawn and resets per-test
+/// to ~5050 ms). Without the fix, both deadlines would extend together and
+/// the call would run for ~5 s; with the fix it returns near 300 ms.
+#[test]
+fn watchdog_reset_does_not_extend_overall() {
+    let reset_pred: invoke::ArmDeadline<'_> = &|line: &str| line.starts_with("STARTED ");
+    let (wall, reported, _pid) = run_sleeper_with_watchdog(
+        Some(Duration::from_millis(300)),
+        Some(Duration::from_secs(5)),
+        None,
+        Some(reset_pred),
+    );
+    assert!(
+        reported >= Duration::from_millis(300),
+        "reported elapsed ({reported:?}) shorter than overall budget",
+    );
+    assert!(
+        wall < Duration::from_secs(2),
+        "call took {wall:?}; reset must not have extended the overall deadline (overall=300ms, per_test=5s+reset)",
+    );
+}
+
+/// Only the overall deadline is set; per-test is `None`. Watchdog must still
+/// fire on the overall.
+#[test]
+fn watchdog_only_overall_set_fires() {
+    let (_wall, reported, _pid) =
+        run_sleeper_with_watchdog(Some(Duration::from_millis(250)), None, None, None);
+    assert!(
+        reported >= Duration::from_millis(250),
+        "reported elapsed ({reported:?}) shorter than overall budget",
+    );
+}
+
+/// Only the per-test deadline is set; overall is `None`. Watchdog must still
+/// fire on the per-test (no reset predicate, so no refresh).
+#[test]
+fn watchdog_only_per_test_set_fires() {
+    let (_wall, reported, _pid) =
+        run_sleeper_with_watchdog(None, Some(Duration::from_millis(250)), None, None);
+    assert!(
+        reported >= Duration::from_millis(250),
+        "reported elapsed ({reported:?}) shorter than per_test budget",
+    );
+}

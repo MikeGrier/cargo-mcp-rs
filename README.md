@@ -187,7 +187,20 @@ These parameters are available on most tools:
   "exact": true,                      // optional: exact match instead of substring
   "lib": true,                        // optional: only library (unit) tests
   "test": "integration_tests",        // optional: specific integration test target
-  "no_fail_fast": true                // optional: run all tests even if some fail
+  "no_fail_fast": true,               // optional: run all tests even if some fail
+  "timeout_secs": 0,                  // optional: hard OVERALL wall-clock cap; 0 disables
+  "per_test_timeout_secs": 30,        // optional: per-test idle watchdog (filter mode only); 0 disables
+  // optional: regex-based selection. When set, cargo_test enumerates
+  // tests via `--list`, matches names against the regex, and runs ONLY
+  // matching cases via `--exact` — one cargo process per test binary
+  // that has matches (additional launches only when the OS argv length
+  // limit forces chunking). Hung-test protection in filter mode is
+  // provided by `per_test_timeout_secs` (default on at 30s); `timeout_secs`
+  // is a separate hard overall cap (default off in filter mode).
+  "test_filter": {
+    "pattern": "tests::parser::(commas|braces)$", // required: RE2 regex
+    "include_ignored": false                       // optional, default false
+  }
 }
 ```
 

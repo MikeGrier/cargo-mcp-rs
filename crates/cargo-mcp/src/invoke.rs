@@ -923,7 +923,10 @@ pub fn run_cargo_streaming_with_timeout(
             args,
             working_dir,
             attempt_budget,
+            None, // retry-aware path: no shared absolute deadline (each attempt arms its own)
+            None, // retry-aware path uses overall budget only; no per-test reset
             arm_deadline,
+            None,
             on_stdout_line,
         )
         .map_err(|e| -> Box<dyn std::error::Error> {
@@ -1031,13 +1034,111 @@ pub fn run_cargo_streaming_with_timeout(
     }))
 }
 
+/// Run `cargo <args>` with a streaming callback and up to **two independent
+/// watchdogs** — a hard overall cap and a per-test idle cap.
+///
+/// Differs from [`run_cargo_streaming_with_timeout`] in two ways:
+///
+/// 1. **Two deadlines, not one.**
+///    - `overall_timeout`: a single wall-clock cap that arms once (on the
+///      first stdout line satisfying `arm_deadline`, or at spawn if no arm
+///      predicate is given) and **never** resets. This is the
+///      "keep-throughput-going" cap on the whole execution phase.
+///    - `overall_deadline_abs`: an **absolute** wall-clock deadline that,
+///      when `Some`, takes precedence over `overall_timeout` and is used
+///      as-is (no arming behaviour, no `armed_at` offset). This is the
+///      hook the `cargo_test` `test_filter` orchestrator uses to share a
+///      single execution-phase deadline across every per-binary launch:
+///      the orchestrator captures the *first* per-binary `build-finished`
+///      instant and computes `arm_t + overall_timeout` once, then passes
+///      that same absolute deadline into every subsequent launch so per-
+///      launch build/startup time inside L2+ cannot extend the cap.
+///      When both are `Some`, `overall_deadline_abs` wins.
+///    - `per_test_timeout`: armed on the same trigger as the Duration-
+///      based `overall_timeout` and then **reset to `now + per_test_timeout`**
+///      every time a streamed stdout line satisfies `reset_deadline`. This
+///      is the "hung-test" cap used by `cargo_test`'s `test_filter` mode —
+///      each `test ... ok|FAILED|ignored` boundary line refreshes it.
+///
+///    Any of the three may be `None`. If multiple are `Some`, whichever
+///    expires first terminates the child. `TimeoutError::elapsed` is
+///    measured per-clock so the message reflects the budget that fired:
+///    for the per-test watchdog, time since the *last reset*
+///    (recovered as `per_test_deadline - per_test_timeout`), not since
+///    initial arming — otherwise after many resets the value would
+///    look much larger than the configured per-test budget; for the
+///    overall deadline, time since the shared cross-launch anchor
+///    (`overall_deadline_abs - overall_timeout`) when both are
+///    supplied, so it reflects the configured budget rather than this
+///    launch's local clock.
+///
+/// 2. **No retry-on-busy.** A `cargo test` invocation is not safe to silently
+///    re-run partway through execution: a flaky test that happens to print a
+///    busy-file marker into its own stdout could trigger a redundant
+///    execution of the entire (filtered) test set. `test_filter`'s build
+///    phase already ran under the retry-on-busy regime, so by the time we
+///    reach this function we are only executing pre-built binaries.
+#[allow(clippy::too_many_arguments)] // each input is independent; bundling them would obscure intent
+pub fn run_cargo_streaming_with_watchdog(
+    args: &[&str],
+    working_dir: Option<&str>,
+    overall_timeout: Option<Duration>,
+    overall_deadline_abs: Option<Instant>,
+    per_test_timeout: Option<Duration>,
+    arm_deadline: Option<ArmDeadline<'_>>,
+    reset_deadline: Option<ArmDeadline<'_>>,
+    on_stdout_line: &mut dyn FnMut(&str),
+) -> Result<CargoOutput, Box<dyn std::error::Error>> {
+    run_cargo_streaming_once(
+        args,
+        working_dir,
+        overall_timeout,
+        overall_deadline_abs,
+        per_test_timeout,
+        arm_deadline,
+        reset_deadline,
+        on_stdout_line,
+    )
+}
+
 /// Single-attempt body of [`run_cargo_streaming`]; see that function for the
 /// retry policy and contract.
+///
+/// Two independent deadlines may be active simultaneously:
+/// - `overall_timeout` arms on the first stdout line that satisfies
+///   `arm_deadline` (or at spawn if no arm predicate is given) and **never**
+///   resets — it bounds the entire execution phase as a hard wall clock.
+///   `overall_deadline_abs`, when `Some`, takes precedence: the overall
+///   deadline is set from it immediately (at spawn) and is never extended
+///   by per-launch arming. The orchestrator uses this to share a single
+///   deadline across multiple launches.
+/// - `per_test_timeout` arms on the same trigger and additionally resets
+///   back to `now + per_test_timeout` on every subsequent stdout line that
+///   satisfies `reset_deadline` — the per-test watchdog used by the
+///   `cargo_test` `test_filter` feature, where each
+///   `test ... ok|FAILED|ignored` boundary line refreshes the budget.
+///
+/// If both are `Some`, whichever elapses first terminates the child.
+/// `TimeoutError::elapsed` is reported per-clock so the message reflects
+/// the budget that fired: when the per-test watchdog fires, elapsed is
+/// measured from the *last reset* (`per_test_deadline -
+/// per_test_timeout`) so it stays close to the configured per-test
+/// budget rather than ballooning after many resets. When the overall
+/// deadline fires and the caller supplied both `overall_deadline_abs`
+/// and `overall_timeout`, the reported elapsed is derived from
+/// `overall_deadline_abs - overall_timeout` so it reflects the shared
+/// cross-launch anchor (the first per-binary `build-finished` captured
+/// by the `test_filter` orchestrator) rather than this single launch's
+/// local clock.
+#[allow(clippy::too_many_arguments)] // each input is independent; bundling them would obscure intent
 fn run_cargo_streaming_once(
     args: &[&str],
     working_dir: Option<&str>,
-    timeout: Option<Duration>,
+    overall_timeout: Option<Duration>,
+    overall_deadline_abs: Option<Instant>,
+    per_test_timeout: Option<Duration>,
     arm_deadline: Option<ArmDeadline<'_>>,
+    reset_deadline: Option<ArmDeadline<'_>>,
     on_stdout_line: &mut dyn FnMut(&str),
 ) -> Result<CargoOutput, Box<dyn std::error::Error>> {
     let (cargo_path, source) = resolve_cargo_binary();
@@ -1093,15 +1194,30 @@ fn run_cargo_streaming_once(
     // checked_add: a caller-supplied timeout near Duration::MAX would panic
     // on `start + t`. Treat overflow as "no deadline" rather than crashing.
     //
-    // Normal mode: arm the deadline at spawn. Deferred-arming mode
-    // (`arm_deadline` is `Some`): leave it unset and arm it the first time a
-    // streamed stdout line satisfies the predicate (e.g. cargo's
+    // Normal mode: arm both deadlines at spawn. Deferred-arming mode
+    // (`arm_deadline` is `Some`): leave them unset and arm them the first
+    // time a streamed stdout line satisfies the predicate (e.g. cargo's
     // `build-finished` record), so only test execution is timed. `armed_at`
-    // records that instant so the timeout's reported `elapsed` is relative to
-    // execution start, not process spawn.
-    let mut deadline = match arm_deadline {
-        Some(_) => None,
-        None => timeout.and_then(|t| start.checked_add(t)),
+    // records that instant so the timeout's reported `elapsed` is relative
+    // to execution start, not process spawn.
+    let arming_required = arm_deadline.is_some();
+    let mut armed = !arming_required;
+    // overall_deadline_abs takes precedence over the Duration-based arming:
+    // when Some, the overall deadline is set from it at spawn and is never
+    // touched by the per-launch arming branch below. This is how the
+    // `test_filter` orchestrator shares a single execution-phase deadline
+    // across every per-binary launch (captured from L1's first build-
+    // finished and reused for L2+ without restarting on each launch's
+    // local arming).
+    let mut overall_deadline = match overall_deadline_abs {
+        Some(d) => Some(d),
+        None if armed => overall_timeout.and_then(|t| start.checked_add(t)),
+        None => None,
+    };
+    let mut per_test_deadline = if armed {
+        per_test_timeout.and_then(|t| start.checked_add(t))
+    } else {
+        None
     };
     let mut armed_at: Option<Instant> = None;
     let mut stdout_buf = String::new();
@@ -1112,23 +1228,83 @@ fn run_cargo_streaming_once(
             outcome = WaitOutcome::Cancelled;
             break;
         }
-        if let Some(d) = deadline
-            && Instant::now() >= d
-        {
-            let elapsed = armed_at.unwrap_or(start).elapsed();
+        // Whichever deadline elapses first wins; both checked together so
+        // the overall cap can fire even when the per-test watchdog is
+        // being reset on a busy stream.
+        let now = Instant::now();
+        let overall_fired = matches!(overall_deadline, Some(d) if now >= d);
+        let per_test_fired = matches!(per_test_deadline, Some(d) if now >= d);
+        if overall_fired || per_test_fired {
+            // The reported `elapsed` is per-clock so the message matches
+            // the budget that actually fired:
+            //   - per-test (only): time since the last reset, recovered as
+            //     `per_test_timeout - (per_test_deadline - now_at_break)`.
+            //     `armed_at` would over-report after many resets, making
+            //     the message look like the budget was larger than it
+            //     actually was;
+            //   - overall (only) with both `overall_deadline_abs` and
+            //     `overall_timeout` supplied: elapsed since the shared
+            //     cross-launch anchor `overall_deadline_abs -
+            //     overall_timeout` (captured by the `test_filter`
+            //     orchestrator on the first per-binary `build-finished`),
+            //     so the reported value reflects the configured overall
+            //     budget rather than this single launch's local clock;
+            //   - both fired together (rare): fall back to
+            //     `armed_at.elapsed()` — the overall watchdog ran longer
+            //     than the per-test reset window in this case anyway.
+            let elapsed = if per_test_fired
+                && !overall_fired
+                && let (Some(d), Some(t)) = (per_test_deadline, per_test_timeout)
+            {
+                let last_reset = d.checked_sub(t).unwrap_or(start);
+                now.saturating_duration_since(last_reset)
+            } else if overall_fired
+                && !per_test_fired
+                && let (Some(d), Some(t)) = (overall_deadline_abs, overall_timeout)
+            {
+                let anchor = d.checked_sub(t).unwrap_or(start);
+                now.saturating_duration_since(anchor)
+            } else {
+                armed_at.unwrap_or(start).elapsed()
+            };
             outcome = WaitOutcome::TimedOut(elapsed);
             break;
         }
         match rx.recv_timeout(tick) {
             Ok(Some(l)) => {
-                // Arm the deadline on the marker line (deferred-arming mode).
-                if deadline.is_none()
-                    && let (Some(t), Some(pred)) = (timeout, arm_deadline)
+                // Arm both deadlines on the marker line (deferred-arming mode).
+                let mut just_armed = false;
+                if !armed
+                    && let Some(pred) = arm_deadline
                     && pred(&l)
                 {
                     let now = Instant::now();
                     armed_at = Some(now);
-                    deadline = now.checked_add(t);
+                    armed = true;
+                    // Only set overall_deadline from the Duration here if
+                    // the caller did NOT supply an absolute one. When
+                    // overall_deadline_abs is Some it was already pinned
+                    // at spawn and per-launch arming must not extend it.
+                    if overall_deadline_abs.is_none() {
+                        overall_deadline = overall_timeout.and_then(|t| now.checked_add(t));
+                    }
+                    per_test_deadline = per_test_timeout.and_then(|t| now.checked_add(t));
+                    just_armed = true;
+                }
+                // After arming, an optional reset predicate refreshes ONLY the
+                // per-test deadline on each matching line \u2014 the per-test
+                // watchdog used by `cargo_test`'s `test_filter` mode, where
+                // every test completion (`test ... ok|FAILED|ignored`)
+                // should re-arm the clock so a long suite of fast tests
+                // never trips the per-test budget. The overall deadline is
+                // intentionally untouched: it bounds the whole run regardless
+                // of how much per-test progress is being made.
+                if armed
+                    && !just_armed
+                    && let (Some(t), Some(pred)) = (per_test_timeout, reset_deadline)
+                    && pred(&l)
+                {
+                    per_test_deadline = Instant::now().checked_add(t);
                 }
                 on_stdout_line(&l);
                 stdout_buf.push_str(&l);
@@ -1301,6 +1477,102 @@ pub fn run_cargo_to_file(
 
     Ok(CargoOutput {
         stdout: String::new(), // nothing buffered; caller reads from dest_file
+        stderr: stderr_buf,
+        exit_code,
+    })
+}
+
+/// Run an **arbitrary** subprocess (not necessarily cargo) to completion,
+/// capturing its full stdout and stderr, under the same cancel-token and
+/// optional wall-clock-deadline supervision used by the cargo runners.
+///
+/// The caller supplies a fully-prepared [`Command`] (program + args + any
+/// process-specific env). This helper adds `Stdio::null()` on stdin and
+/// `Stdio::piped()` on stdout/stderr, installs the same explicit
+/// environment block as the cargo runners (parent env, then built-in
+/// defaults, then the thread-local `EXTRA_ENV` overrides — see
+/// [`build_subprocess_env`]) so per-call `env` parameters apply to
+/// non-cargo helpers too, applies `working_dir` if given, then spawns via
+/// [`ManagedChild`] so that cancellation and deadline expiry kill the
+/// **entire process tree**. Stdout and stderr are drained on background
+/// threads to prevent pipe-buffer deadlock if the child writes
+/// substantial output on both streams.
+///
+/// Returns the captured output as a [`CargoOutput`] (its three fields —
+/// `stdout`, `stderr`, `exit_code` — are generic enough to describe any
+/// subprocess, so we reuse the type rather than introduce a parallel one).
+///
+/// Returns [`CancelledError`] if the cancel token fires, [`TimeoutError`]
+/// if `timeout` is supplied and elapses. The child is tree-killed in both
+/// cases.
+pub fn run_subprocess_capture(
+    mut cmd: Command,
+    working_dir: Option<&str>,
+    timeout: Option<Duration>,
+) -> Result<CargoOutput, Box<dyn std::error::Error>> {
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // Use the same explicit env block as the cargo-spawning paths so
+    // non-cargo subprocesses (e.g. `<test-binary> --list` enumeration from
+    // `test_filter`) see the per-call `env` overrides installed via
+    // [`set_extra_env`] plus our built-in defaults. Without this, filter
+    // mode would enumerate tests under a different environment than the
+    // build/execution cargo invocations, which can change discovery
+    // behaviour (global init, feature flags via env, etc.) and break the
+    // tool-level contract that `env` applies to the whole operation.
+    cmd.env_clear().envs(build_subprocess_env());
+    if let Some(dir) = working_dir {
+        cmd.current_dir(dir);
+    }
+
+    let mut child = ManagedChild::spawn(&mut cmd)?;
+    let stdout_pipe = child.take_stdout().expect("stdout is piped");
+    let stderr_pipe = child.take_stderr().expect("stderr is piped");
+
+    let stdout_thread = thread::spawn(move || -> String {
+        let mut buf = String::new();
+        let _ = BufReader::new(stdout_pipe).read_to_string(&mut buf);
+        buf
+    });
+    let stderr_thread = thread::spawn(move || -> String {
+        let mut buf = String::new();
+        let _ = BufReader::new(stderr_pipe).read_to_string(&mut buf);
+        buf
+    });
+
+    let start = Instant::now();
+    let deadline = timeout.and_then(|t| start.checked_add(t));
+    let status = loop {
+        match child.try_wait()? {
+            Some(s) => break s,
+            None => {
+                if is_cancelled() {
+                    child.kill_tree();
+                    let _ = stdout_thread.join();
+                    let _ = stderr_thread.join();
+                    return Err(Box::new(CancelledError));
+                }
+                if let Some(d) = deadline
+                    && Instant::now() >= d
+                {
+                    child.kill_tree();
+                    let _ = stdout_thread.join();
+                    let _ = stderr_thread.join();
+                    return Err(Box::new(TimeoutError {
+                        elapsed: start.elapsed(),
+                    }));
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+    };
+
+    let stdout_buf = stdout_thread.join().unwrap_or_default();
+    let stderr_buf = stderr_thread.join().unwrap_or_default();
+    let exit_code = status.code().unwrap_or(-1);
+    Ok(CargoOutput {
+        stdout: stdout_buf,
         stderr: stderr_buf,
         exit_code,
     })

@@ -85,7 +85,7 @@ pub fn set_default_test_timeout(secs: Option<u64>) {
 }
 
 /// Returns the configured default test timeout, or `None` if no default is set.
-fn default_test_timeout() -> Option<std::time::Duration> {
+pub(crate) fn default_test_timeout() -> Option<std::time::Duration> {
     let secs = DEFAULT_TEST_TIMEOUT_SECS.load(Ordering::Relaxed);
     if secs > 0 {
         Some(std::time::Duration::from_secs(secs))
@@ -364,19 +364,19 @@ impl ToolResult {
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 /// Extract an optional string field from JSON args.
-fn opt_str<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
+pub(crate) fn opt_str<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
     args.get(key).and_then(|v| v.as_str())
 }
 
 /// Extract an optional boolean field from JSON args (defaults to false).
-fn opt_bool(args: &Value, key: &str) -> bool {
+pub(crate) fn opt_bool(args: &Value, key: &str) -> bool {
     args.get(key).and_then(|v| v.as_bool()).unwrap_or(false)
 }
 
 /// Extract an optional integer field from JSON args as its string form, for
 /// flags whose value cargo expects as text (e.g. `--jobs 4`). Non-integer
 /// shapes are ignored (treated as absent).
-fn opt_int_str(args: &Value, key: &str) -> Option<String> {
+pub(crate) fn opt_int_str(args: &Value, key: &str) -> Option<String> {
     args.get(key)
         .and_then(|v| v.as_i64())
         .map(|n| n.to_string())
@@ -390,7 +390,7 @@ fn opt_int_str(args: &Value, key: &str) -> Option<String> {
 /// name. Any leading `+` the caller may have included is stripped first so a
 /// value of `"+nightly"` does not become `++nightly`. Returns `None` when the
 /// field is absent or blank.
-fn toolchain_arg(args: &Value) -> Option<String> {
+pub(crate) fn toolchain_arg(args: &Value) -> Option<String> {
     let raw = opt_str(args, "toolchain")?.trim();
     let name = raw.strip_prefix('+').unwrap_or(raw);
     if name.is_empty() {
@@ -403,23 +403,23 @@ fn toolchain_arg(args: &Value) -> Option<String> {
 /// the borrowed `&str`s pushed into `argv` outlive the vector. Boolean flags
 /// are read directly from `args` at push time and do not need to be stored.
 #[derive(Default)]
-struct CommonOpts {
-    package: Option<String>,
-    exclude: Option<String>,
-    bin: Option<String>,
-    example: Option<String>,
-    test: Option<String>,
-    bench: Option<String>,
-    features: Option<String>,
-    profile: Option<String>,
-    jobs: Option<String>,
-    target: Option<String>,
-    target_dir: Option<String>,
-    manifest_path: Option<String>,
+pub(crate) struct CommonOpts {
+    pub(crate) package: Option<String>,
+    pub(crate) exclude: Option<String>,
+    pub(crate) bin: Option<String>,
+    pub(crate) example: Option<String>,
+    pub(crate) test: Option<String>,
+    pub(crate) bench: Option<String>,
+    pub(crate) features: Option<String>,
+    pub(crate) profile: Option<String>,
+    pub(crate) jobs: Option<String>,
+    pub(crate) target: Option<String>,
+    pub(crate) target_dir: Option<String>,
+    pub(crate) manifest_path: Option<String>,
 }
 
 impl CommonOpts {
-    fn from_args(args: &Value) -> Self {
+    pub(crate) fn from_args(args: &Value) -> Self {
         Self {
             package: opt_str(args, "package").map(String::from),
             exclude: opt_str(args, "exclude").map(String::from),
@@ -439,7 +439,7 @@ impl CommonOpts {
 
 /// Append cargo's package-selection flags: `--package <SPEC>`, `--workspace`,
 /// and `--exclude <SPEC>`. Accepted by every build-graph command.
-fn push_package_selection<'a>(argv: &mut Vec<&'a str>, args: &Value, o: &'a CommonOpts) {
+pub(crate) fn push_package_selection<'a>(argv: &mut Vec<&'a str>, args: &Value, o: &'a CommonOpts) {
     if let Some(p) = &o.package {
         argv.push("--package");
         argv.push(p);
@@ -460,7 +460,7 @@ fn push_package_selection<'a>(argv: &mut Vec<&'a str>, args: &Value, o: &'a Comm
 /// `--examples`, `--example`, `--tests`, `--test`, `--benches`, `--bench`,
 /// `--all-targets`). Accepted by check, build, test, and clippy. `cargo doc`
 /// supports only a subset — use [`push_doc_target_selection`] for it.
-fn push_target_selection<'a>(argv: &mut Vec<&'a str>, args: &Value, o: &'a CommonOpts) {
+pub(crate) fn push_target_selection<'a>(argv: &mut Vec<&'a str>, args: &Value, o: &'a CommonOpts) {
     if opt_bool(args, "lib") {
         argv.push("--lib");
     }
@@ -523,7 +523,7 @@ fn push_doc_target_selection<'a>(argv: &mut Vec<&'a str>, args: &Value, o: &'a C
 /// Append cargo's feature-selection flags: `--features <list>`,
 /// `--all-features`, and `--no-default-features`. Accepted by every
 /// build-graph command (check, build, test, clippy, doc, tree).
-fn push_feature_flags<'a>(argv: &mut Vec<&'a str>, args: &Value, o: &'a CommonOpts) {
+pub(crate) fn push_feature_flags<'a>(argv: &mut Vec<&'a str>, args: &Value, o: &'a CommonOpts) {
     if let Some(f) = &o.features {
         argv.push("--features");
         argv.push(f);
@@ -540,7 +540,7 @@ fn push_feature_flags<'a>(argv: &mut Vec<&'a str>, args: &Value, o: &'a CommonOp
 /// `--jobs <N>`, `--target <TRIPLE>`, `--target-dir <DIR>`, `--timings`, and
 /// (when `keep_going` is true, i.e. the subcommand supports it) `--keep-going`.
 /// `cargo test` accepts every flag here except `--keep-going`.
-fn push_compilation_options<'a>(
+pub(crate) fn push_compilation_options<'a>(
     argv: &mut Vec<&'a str>,
     args: &Value,
     o: &'a CommonOpts,
@@ -579,7 +579,7 @@ fn push_compilation_options<'a>(
 /// `--offline`, `--frozen`, and (when `ignore_rust_version` is true, i.e. the
 /// subcommand supports it) `--ignore-rust-version`. `cargo tree` accepts every
 /// flag here except `--ignore-rust-version`.
-fn push_manifest_options<'a>(
+pub(crate) fn push_manifest_options<'a>(
     argv: &mut Vec<&'a str>,
     args: &Value,
     o: &'a CommonOpts,
@@ -635,7 +635,7 @@ fn opt_timeout(args: &Value) -> Result<Option<std::time::Duration>, Box<dyn std:
 /// - `Ok(None)` — key absent or null (caller did not supply a value)
 /// - `Ok(Some(None))` — explicitly `0` (caller wants no timeout for this run)
 /// - `Ok(Some(Some(d)))` — positive value (caller-specified budget)
-fn opt_timeout_explicit(
+pub(crate) fn opt_timeout_explicit(
     args: &Value,
 ) -> Result<Option<Option<std::time::Duration>>, Box<dyn std::error::Error>> {
     let Some(v) = args.get("timeout_secs") else {
@@ -652,6 +652,36 @@ fn opt_timeout_explicit(
     })?;
     if secs == 0 {
         return Ok(Some(None)); // explicit disable
+    }
+    Ok(Some(Some(std::time::Duration::from_secs(secs))))
+}
+
+/// Parallel of [`opt_timeout_explicit`] for the `per_test_timeout_secs`
+/// parameter introduced alongside `cargo_test`'s `test_filter` feature.
+///
+/// Same three-state contract: `None` (absent/null), `Some(None)` (explicit
+/// `0` = disable), `Some(Some(d))` (positive budget). Validated and surfaced
+/// separately from `timeout_secs` so callers can mix-and-match (e.g. a tight
+/// per-test cap with no overall cap, or vice versa).
+pub(crate) fn opt_per_test_timeout_explicit(
+    args: &Value,
+) -> Result<Option<Option<std::time::Duration>>, Box<dyn std::error::Error>> {
+    let Some(v) = args.get("per_test_timeout_secs") else {
+        return Ok(None);
+    };
+    if v.is_null() {
+        return Ok(None);
+    }
+    let Some(n) = v.as_number() else {
+        return Err(
+            format!("per_test_timeout_secs must be a non-negative integer, got {v}").into(),
+        );
+    };
+    let secs = n.as_u64().ok_or_else(|| -> Box<dyn std::error::Error> {
+        format!("per_test_timeout_secs must be a non-negative integer, got {n}").into()
+    })?;
+    if secs == 0 {
+        return Ok(Some(None));
     }
     Ok(Some(Some(std::time::Duration::from_secs(secs))))
 }
@@ -784,7 +814,7 @@ fn filter_test_ndjson(stdout: &str) -> String {
 /// The trailing newline is included so the next NDJSON line starts cleanly.
 /// `cwd` is `"."` when no working directory was supplied (the same default
 /// the underlying child inherits).
-fn invocation_header(argv: &[&str], wd: Option<&str>) -> String {
+pub(crate) fn invocation_header(argv: &[&str], wd: Option<&str>) -> String {
     let payload = serde_json::json!({
         "reason": INVOCATION_REASON,
         "argv": argv,
@@ -878,7 +908,7 @@ fn format_json_output(out: &CargoOutput, argv: &[&str], wd: Option<&str>) -> Str
 /// - `x-cargo-mcp-test-output` — zero or more test harness / captured output
 /// - `{"status":"success"}` or `{"status":"error","exit_code":N}` — trailer
 /// - `x-cargo-mcp-stderr` — optional, when stderr is non-empty
-fn format_test_output(out: &CargoOutput, argv: &[&str], wd: Option<&str>) -> String {
+pub(crate) fn format_test_output(out: &CargoOutput, argv: &[&str], wd: Option<&str>) -> String {
     let header = invocation_header(argv, wd);
     let filtered = filter_test_ndjson(&out.stdout);
     let filtered = filtered.trim_end();
@@ -950,7 +980,7 @@ fn run_cargo_maybe_streaming(
 
 /// Which summarisation rules to apply when an `output_path` was supplied.
 #[derive(Clone, Copy)]
-enum SummaryKind {
+pub(crate) enum SummaryKind {
     /// Build-style tools (`check`, `build`, `clippy`, `doc`): keep the
     /// invocation header, compiler errors, `build-finished`, stderr, and
     /// the status trailer.
@@ -988,7 +1018,7 @@ fn resolve_output_path(path: &str, wd: Option<&str>) -> std::path::PathBuf {
 ///   is rejected here so the later `fs::write` doesn't fail after a build)
 ///
 /// Called BEFORE spawning cargo so a bad path never wastes a build.
-fn validate_relative_output_path(
+pub(crate) fn validate_relative_output_path(
     path: &str,
     wd: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1024,7 +1054,7 @@ fn validate_relative_output_path(
 /// [`validate_relative_output_path`] earlier in the call (before spawning
 /// cargo); the file write itself can still fail (permission denied, disk
 /// full) and that error is propagated to the caller.
-fn write_output_path_and_summarize(
+pub(crate) fn write_output_path_and_summarize(
     body: String,
     path: Option<&str>,
     wd: Option<&str>,
@@ -1038,13 +1068,7 @@ fn write_output_path_and_summarize(
     let bytes = std::fs::metadata(&resolved).map(|m| m.len()).unwrap_or(0);
     let lines = body.lines().count();
     let resolved_str = resolved.display().to_string();
-    Ok(summarize_ndjson(
-        &body,
-        &resolved_str,
-        bytes,
-        lines,
-        kind,
-    ))
+    Ok(summarize_ndjson(&body, &resolved_str, bytes, lines, kind))
 }
 
 /// Build the summary NDJSON returned to the caller when `output_path` is set.
@@ -1083,7 +1107,13 @@ fn summarize_ndjson(body: &str, path: &str, bytes: u64, lines: usize, kind: Summ
 /// Decide whether one NDJSON record from the full body should be replayed
 /// into the summary returned to the caller.
 ///
-/// Always kept: the status trailer, `build-finished`, `x-cargo-mcp-stderr`.
+/// Always kept: the status trailer, `build-finished`, `x-cargo-mcp-stderr`,
+/// and the two `cargo_test` filter-mode trailers
+/// (`x-cargo-mcp-test-filter-discovery` and
+/// `x-cargo-mcp-test-filter-summary`), which carry the per-binary plan /
+/// rollup totals callers rely on to interpret a `test_filter` response and
+/// would otherwise be lost when `output_path` redirects the full transcript
+/// to disk.
 /// Conditionally kept: `compiler-message` only when `message.level == "error"`;
 /// `x-cargo-mcp-test-output` only when [`is_test_summary_line`] matches (and
 /// only in [`SummaryKind::Test`] mode).
@@ -1098,7 +1128,10 @@ fn keep_in_summary(line: &str, kind: SummaryKind) -> bool {
     }
     let reason = v.get("reason").and_then(|r| r.as_str()).unwrap_or("");
     match reason {
-        "build-finished" | STDERR_REASON => true,
+        "build-finished"
+        | STDERR_REASON
+        | "x-cargo-mcp-test-filter-discovery"
+        | "x-cargo-mcp-test-filter-summary" => true,
         "compiler-message" => v
             .get("message")
             .and_then(|m| m.get("level"))
@@ -1133,7 +1166,7 @@ fn is_test_summary_line(text: &str) -> bool {
 /// this line is emitted exactly when compilation and linking are complete and
 /// (for `cargo test`) immediately before the test binaries start executing, so
 /// it marks the boundary used to arm the `cargo_test` execution-only timeout.
-fn is_build_finished_line(line: &str) -> bool {
+pub(crate) fn is_build_finished_line(line: &str) -> bool {
     line.contains(r#""reason":"build-finished""#)
 }
 
@@ -1502,6 +1535,60 @@ pub fn list() -> Value {
                             "If true, the test_name filter must match exactly (not as substring). \
                              Default: false."
                     },
+                    "test_filter": {
+                        "type": "object",
+                        "description":
+                            "Regex-based test-case selection. When set, the tool builds the \
+                             tests with `--no-run`, enumerates every libtest case across all \
+                             compiled test binaries via `--list`, matches their full \
+                             `module::path::test_name` strings against `pattern`, and runs \
+                             ONLY the matching cases \u{2014} one cargo process per binary that \
+                             has at least one match (or two+ when the matched names would \
+                             exceed the OS argv limit), so the launch count is the minimum \
+                             possible. `timeout_secs` still means a hard OVERALL wall-clock \
+                             cap on the entire execution phase across all per-binary launches; \
+                             use the separate `per_test_timeout_secs` parameter for the \
+                             per-test idle watchdog (resets on each libtest test boundary). \
+                             Mutually meaningful with `package`, `manifest_path`, `target`, \
+                             `features`, `release`, and `profile` (all forwarded to both the \
+                             build and execution phases). Mutually IGNORED: `test_name`, \
+                             `exact`, `no_run`, `no_fail_fast`, and `doc` \u{2014} doctests are \
+                             not selectable via this mode in v1.",
+                        "properties": {
+                            "pattern": {
+                                "type": "string",
+                                "description":
+                                    "RE2-style regular expression (the `regex` crate's flavor: \
+                                     linear-time, no backreferences). Matched against the full \
+                                     `module::path::test_name` of every enumerated case \u{2014} \
+                                     the same string libtest itself filters on, so a `cargo \
+                                     test <name>` invocation and this pattern see identical \
+                                     candidate strings. Use anchors (`^`/`$`) for exact \
+                                     matches and `|` for OR. \
+                                     Example: `^(my_mod::a|my_mod::b)$` selects exactly two cases. \
+                                     IMPORTANT: integration-test binaries (under `tests/`) \
+                                     enumerate tests *without* a `module::` prefix (just \
+                                     `test_name`), while unit tests inside the crate itself \
+                                     enumerate as `mod::sub::test_name`. A leading `^` anchor \
+                                     binds to that prefix difference \u{2014} `^foo` matches an \
+                                     integration test named `foo` but NOT a unit test named \
+                                     `tools::tests::foo`. If you want to span both, either \
+                                     drop the anchor (substring match) or include both forms \
+                                     in the alternation (e.g. `^(foo|tools::tests::foo)$`)."
+                            },
+                            "include_ignored": {
+                                "type": "boolean",
+                                "description":
+                                    "If true, `#[ignore]` tests participate in both enumeration \
+                                     and execution (the matching invocation passes \
+                                     `--include-ignored` to libtest so the harness actually \
+                                     runs the matched ignored cases). Default: false \u{2014} \
+                                     ignored tests are excluded from matching so a pattern \
+                                     cannot accidentally pick one up."
+                            }
+                        },
+                        "required": ["pattern"]
+                    },
                     "locked": {
                         "type": "boolean",
                         "description":
@@ -1513,14 +1600,45 @@ pub fn list() -> Value {
                         "type": "integer",
                         "minimum": 0,
                         "description":
-                            "Wall-clock budget in seconds for test execution. The clock starts \
-                             when compilation and linking finish (cargo's build-finished record), \
-                             so the build phase is never timed — only the running tests. When the \
-                             budget elapses, cargo and the entire subprocess tree (test binaries, \
-                             etc.) are terminated. If omitted, the server-configured default \
-                             applies (30 seconds when launched by the VS Code extension; no timeout \
-                             otherwise). Pass 0 to disable the timeout for this run regardless of \
-                             the server default."
+                            "Hard OVERALL wall-clock budget in seconds for the test \
+                             execution phase. The clock starts when compilation and linking \
+                             finish (cargo's build-finished record), so the build phase is \
+                             never timed — only running tests. When the budget elapses, \
+                             cargo and the entire subprocess tree (test binaries, etc.) are \
+                             terminated. Same meaning whether or not `test_filter` is set; \
+                             use this knob to bound the whole run (\"keep throughput going \
+                             on a slow system\"). If omitted, the server-configured default \
+                             applies (30 seconds when launched by the VS Code extension; no \
+                             timeout otherwise) in unfiltered mode. Under `test_filter` \
+                             there is NO server default for the overall cap — omit to let a \
+                             long matched run complete unbounded, or pass an explicit \
+                             positive value to cap it. Pass 0 to disable the timeout for \
+                             this run regardless of the server default. For the per-test \
+                             hung-test watchdog under `test_filter`, use \
+                             `per_test_timeout_secs` instead."
+                    },
+                    "per_test_timeout_secs": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description":
+                            "Per-test idle watchdog in seconds. ONLY meaningful when \
+                             `test_filter` is set; ignored otherwise. The clock arms when \
+                             each per-binary cargo invocation emits its build-finished \
+                             record and resets to `now + per_test_timeout_secs` every time \
+                             the libtest harness emits a test-boundary line (`running N \
+                             tests` or `test <name> ... ok|FAILED|ignored`). A long suite \
+                             of fast tests never trips it; a single hung test does. If the \
+                             watchdog fires for a binary, that binary's cargo process tree \
+                             is killed and the orchestrator moves on to the next matched \
+                             binary (one hung test does not block the rest of the filter \
+                             run from completing). If omitted under `test_filter`, the \
+                             server-configured default applies (30 seconds when launched \
+                             by the VS Code extension); when that default is also absent \
+                             or set to 0, filter mode still applies a hard-coded 30-second \
+                             fallback so hung-test protection is on by default. The only \
+                             way to fully disable per-test protection for a call is to pass \
+                             `per_test_timeout_secs: 0` explicitly in the tool arguments. \
+                             May be combined with `timeout_secs`; whichever fires first wins."
                     }
                 },
                 "required": []
@@ -2375,6 +2493,27 @@ fn call_test(
     args: &Value,
     on_progress: Option<&mut dyn FnMut(&str)>,
 ) -> Result<ToolResult, Box<dyn std::error::Error>> {
+    // When the caller supplies `test_filter`, hand control to the regex-
+    // based selection pipeline (build with --no-run, enumerate per binary
+    // via --list, match, then launch each binary with `--exact <names...>`
+    // under the per-test watchdog). Peek at args first so `on_progress` is
+    // only handed off (and consumed) when the filter path will actually run.
+    if crate::test_filter::is_filter_requested(args) {
+        if let Some(result) = crate::test_filter::run(args, on_progress)? {
+            return Ok(result);
+        }
+        // Defensive fall-through: if the filter pipeline declined the call
+        // (e.g. a future refactor relaxes `is_filter_requested`), run the
+        // unfiltered path rather than panicking.
+        return call_test_unfiltered(args, None);
+    }
+    call_test_unfiltered(args, on_progress)
+}
+
+fn call_test_unfiltered(
+    args: &Value,
+    on_progress: Option<&mut dyn FnMut(&str)>,
+) -> Result<ToolResult, Box<dyn std::error::Error>> {
     let wd = opt_str(args, "working_dir");
     let output_path = opt_str(args, "output_path");
     if let Some(p) = output_path {
@@ -3012,6 +3151,158 @@ mod tests {
         set_default_test_timeout(None); // restore
     }
 
+    // ── opt_per_test_timeout_explicit tests ──────────────────────────────────
+    // Mirror of the opt_timeout_explicit suite. The two helpers share a
+    // contract (three-state Option<Option<Duration>>) but operate on
+    // independent JSON keys, so each path is re-tested to guard against
+    // future drift (e.g. one key getting a coercion rule the other doesn't).
+
+    #[test]
+    fn opt_per_test_timeout_explicit_absent_returns_none() {
+        let args = serde_json::json!({});
+        assert!(matches!(opt_per_test_timeout_explicit(&args), Ok(None)));
+    }
+
+    /// The `timeout_secs` sibling must not leak into per-test parsing — they
+    /// are independent knobs and either may be set without the other.
+    #[test]
+    fn opt_per_test_timeout_explicit_ignores_sibling_timeout_secs() {
+        let args = serde_json::json!({"timeout_secs": 60});
+        assert!(matches!(opt_per_test_timeout_explicit(&args), Ok(None)));
+    }
+
+    #[test]
+    fn opt_per_test_timeout_explicit_null_returns_none() {
+        let args = serde_json::json!({"per_test_timeout_secs": null});
+        assert!(matches!(opt_per_test_timeout_explicit(&args), Ok(None)));
+    }
+
+    #[test]
+    fn opt_per_test_timeout_explicit_zero_returns_some_none() {
+        let args = serde_json::json!({"per_test_timeout_secs": 0});
+        assert!(matches!(
+            opt_per_test_timeout_explicit(&args),
+            Ok(Some(None))
+        ));
+    }
+
+    #[test]
+    fn opt_per_test_timeout_explicit_positive_returns_duration() {
+        let args = serde_json::json!({"per_test_timeout_secs": 45});
+        match opt_per_test_timeout_explicit(&args) {
+            Ok(Some(Some(d))) => assert_eq!(d, std::time::Duration::from_secs(45)),
+            other => panic!("expected Ok(Some(Some(45s))), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn opt_per_test_timeout_explicit_string_returns_err() {
+        let args = serde_json::json!({"per_test_timeout_secs": "thirty"});
+        let err = opt_per_test_timeout_explicit(&args).unwrap_err();
+        assert!(
+            err.to_string().contains("per_test_timeout_secs"),
+            "error should mention the offending key, got {err}"
+        );
+    }
+
+    #[test]
+    fn opt_per_test_timeout_explicit_negative_returns_err() {
+        let args = serde_json::json!({"per_test_timeout_secs": -5});
+        assert!(opt_per_test_timeout_explicit(&args).is_err());
+    }
+
+    #[test]
+    fn opt_per_test_timeout_explicit_fractional_returns_err() {
+        let args = serde_json::json!({"per_test_timeout_secs": 1.5});
+        assert!(opt_per_test_timeout_explicit(&args).is_err());
+    }
+
+    #[test]
+    fn opt_per_test_timeout_explicit_bool_returns_err() {
+        let args = serde_json::json!({"per_test_timeout_secs": true});
+        assert!(opt_per_test_timeout_explicit(&args).is_err());
+    }
+
+    /// Mirror of `call_test_timeout_selection_covers_all_three_states` for
+    /// the per-test knob, modelling the fallback chain used by
+    /// `test_filter::run`: absent → server default → hard-coded fallback.
+    /// The 30 s hard-coded fallback lives in test_filter.rs; this test
+    /// uses the same numeric value to keep the assertion self-contained.
+    #[test]
+    fn per_test_timeout_selection_covers_all_three_states() {
+        const HARD_CODED_FALLBACK: std::time::Duration = std::time::Duration::from_secs(30);
+        let _g = DEFAULT_TIMEOUT_TEST_LOCK.lock().unwrap();
+
+        // State 1a: absent + server default set → server default applies
+        set_default_test_timeout(Some(15));
+        let absent = serde_json::json!({});
+        let t = match opt_per_test_timeout_explicit(&absent).unwrap() {
+            None => default_test_timeout().or(Some(HARD_CODED_FALLBACK)),
+            Some(explicit) => explicit,
+        };
+        assert_eq!(t, Some(std::time::Duration::from_secs(15)));
+
+        // State 1b: absent + no server default → hard-coded fallback applies
+        set_default_test_timeout(None);
+        let t = match opt_per_test_timeout_explicit(&absent).unwrap() {
+            None => default_test_timeout().or(Some(HARD_CODED_FALLBACK)),
+            Some(explicit) => explicit,
+        };
+        assert_eq!(t, Some(HARD_CODED_FALLBACK));
+
+        // State 2: explicit 0 → no per-test watchdog, even with server default set
+        set_default_test_timeout(Some(15));
+        let zero = serde_json::json!({"per_test_timeout_secs": 0});
+        let t = match opt_per_test_timeout_explicit(&zero).unwrap() {
+            None => default_test_timeout().or(Some(HARD_CODED_FALLBACK)),
+            Some(explicit) => explicit,
+        };
+        assert_eq!(t, None);
+
+        // State 3: explicit positive → caller's budget wins over server default
+        let ninety = serde_json::json!({"per_test_timeout_secs": 90});
+        let t = match opt_per_test_timeout_explicit(&ninety).unwrap() {
+            None => default_test_timeout().or(Some(HARD_CODED_FALLBACK)),
+            Some(explicit) => explicit,
+        };
+        assert_eq!(t, Some(std::time::Duration::from_secs(90)));
+
+        set_default_test_timeout(None); // restore
+    }
+
+    /// The overall and per-test knobs must parse independently from the
+    /// same args blob without either's value leaking into the other.
+    #[test]
+    fn timeout_and_per_test_timeout_parse_independently() {
+        let args = serde_json::json!({
+            "timeout_secs": 120,
+            "per_test_timeout_secs": 30,
+        });
+        let overall = opt_timeout_explicit(&args).unwrap();
+        let per_test = opt_per_test_timeout_explicit(&args).unwrap();
+        assert_eq!(overall, Some(Some(std::time::Duration::from_secs(120))));
+        assert_eq!(per_test, Some(Some(std::time::Duration::from_secs(30))));
+    }
+
+    #[test]
+    fn timeout_and_per_test_timeout_independent_disable() {
+        // Overall disabled, per-test set
+        let a = serde_json::json!({"timeout_secs": 0, "per_test_timeout_secs": 30});
+        assert_eq!(opt_timeout_explicit(&a).unwrap(), Some(None));
+        assert_eq!(
+            opt_per_test_timeout_explicit(&a).unwrap(),
+            Some(Some(std::time::Duration::from_secs(30)))
+        );
+
+        // Per-test disabled, overall set
+        let b = serde_json::json!({"timeout_secs": 120, "per_test_timeout_secs": 0});
+        assert_eq!(
+            opt_timeout_explicit(&b).unwrap(),
+            Some(Some(std::time::Duration::from_secs(120)))
+        );
+        assert_eq!(opt_per_test_timeout_explicit(&b).unwrap(), Some(None));
+    }
+
     #[test]
     fn is_build_finished_line_matches_cargo_record() {
         // The exact compact JSON cargo emits with --message-format=json.
@@ -3335,12 +3626,10 @@ mod tests {
         std::fs::create_dir_all(&base).unwrap();
         let file_parent = base.join("not_a_dir");
         std::fs::write(&file_parent, b"").unwrap();
-        let err = validate_relative_output_path(
-            "not_a_dir/out.ndjson",
-            Some(base.to_str().unwrap()),
-        )
-        .unwrap_err()
-        .to_string();
+        let err =
+            validate_relative_output_path("not_a_dir/out.ndjson", Some(base.to_str().unwrap()))
+                .unwrap_err()
+                .to_string();
         let _ = std::fs::remove_dir_all(&base);
         assert!(err.contains("parent directory"), "unexpected error: {err}");
     }

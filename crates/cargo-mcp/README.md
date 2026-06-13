@@ -303,22 +303,102 @@ for secrets — the env block is passed verbatim to the cargo child process
 (visible via OS-level process inspection) and may be captured by future
 logging additions, so treat it as not confidential.
 
-**Timeouts (`timeout_secs`)**
+**Timeouts (`timeout_secs` and `per_test_timeout_secs`)**
 
-`cargo_test` accepts an optional `timeout_secs` (and other long-running
-tools accept it as well). The budget covers only test **execution** — the
-clock starts when compilation and linking finish (cargo's `build-finished`
-record), so a slow build never trips the timeout.
+`cargo_test` has two independent timeout knobs that can be combined
+freely. Both apply only to the test **execution** phase: each clock
+arms when compilation and linking finish (cargo's `build-finished`
+record), so a slow build never trips either of them.
 
-- Omit `timeout_secs` to apply the server default
-  (`cargo-mcp.test.timeoutSecs`, 30s when launched via the VS Code
-  extension; no default otherwise).
-- Pass `timeout_secs: N` to use a specific budget for this run.
-- Pass `timeout_secs: 0` to disable the timeout for this run.
+- **`timeout_secs`** is a hard OVERALL wall-clock cap on the whole
+  execution phase. Same meaning whether or not `test_filter` is set;
+  in filter mode it bounds all per-binary launches together. Use it to
+  keep throughput going on a slow system. Defaults:
+    - Unfiltered: server default applies
+      (`cargo-mcp.test.timeoutSecs`, 30s via the VS Code extension;
+      none otherwise).
+    - Filter mode: **no default** — omit to let a long matched run
+      complete unbounded, pass an explicit positive value to cap it.
+    - Pass `0` to disable for this call regardless of the server
+      default.
+- **`per_test_timeout_secs`** is a per-test idle watchdog — ONLY
+  meaningful when `test_filter` is set; ignored otherwise. The clock
+  arms on each per-binary `build-finished` record and resets on every
+  libtest boundary line (`running N tests` or
+  `test <name> ... ok|FAILED|ignored`). A long suite of fast tests
+  never trips it; a single hung test does. If the watchdog fires for
+  one binary, that binary's cargo process tree is killed and the
+  orchestrator records `exit_code: -1` plus an inline
+  `cargo-mcp test_filter: per-binary run failed: TimeoutError` body,
+  then moves on to the next matched binary. Defaults to the server
+  setting (30s via the VS Code extension) so hung-test protection is
+  on by default in filter mode; when the server default is also
+  absent or set to `0`, filter mode still applies a hard-coded
+  **30-second** fallback. The only way to fully disable per-test
+  protection for a call is to pass `per_test_timeout_secs: 0`
+  explicitly.
 
-Raise it (or pass `0`) for runs you know are slow (long integration
-suites, benchmark-style tests, tests that poll). Lower it when sanity-
-checking a fix to fail fast on an infinite loop.
+Raise either (or pass `0` to disable) for runs you know are slow —
+long integration suites, benchmark-style tests, tests that internally
+poll. Lower either when sanity-checking a fix to fail fast on an
+infinite loop. When both are set in filter mode, whichever fires
+first kills the launch.
+
+**Regex-based test selection (`test_filter`)**
+
+`cargo_test` accepts an optional `test_filter` object that runs only the
+tests whose names match a regular expression — the equivalent of a
+hand-curated `cargo test --exact <name1> <name2> …` invocation, generated
+from the regex. The orchestrator does a single `--no-run` build, lists
+tests with libtest's `--list`, matches names against the regex, then
+launches one cargo process per test binary that has matches (additional
+launches only when the OS argv length limit forces chunking the name list).
+
+```jsonc
+{
+  "test_filter": {
+    "pattern": "tests::parser::(commas|braces)$", // required: RE2-style regex
+    "include_ignored": false                        // optional, default false
+  }
+}
+```
+
+- `pattern` uses the [`regex`](https://docs.rs/regex) crate (RE2-style:
+  linear-time, no backreferences, no lookaround). It is matched against
+  the libtest test name — typically `module::path::test_name`. Use `^` /
+  `$` if you want a full-name match; otherwise it matches as a substring.
+  IMPORTANT: integration tests (under `tests/`) enumerate **without** a
+  `module::` prefix, while unit tests inside the crate enumerate as
+  `mod::sub::test_name`. A leading `^` anchor binds to that prefix —
+  `^foo` matches integration test `foo` but NOT unit test
+  `tools::tests::foo`. To span both, either drop the anchor (substring
+  match) or include both forms in the alternation
+  (e.g. `^(foo|tools::tests::foo)$`).
+- When `include_ignored: true`, ignored tests are enumerated via
+  `--list --ignored` and run with `--include-ignored`. Default `false`
+  excludes them, matching plain `cargo test` semantics.
+- Selection is across all test binaries built for the package selection
+  (lib, integration tests, `--bin` targets compiled with tests, examples,
+  benches with `profile.test`). Doctests are **not** selectable via
+  `test_filter` in this revision — they are a separate cargo target with
+  no libtest `--list` analogue.
+- Hung-test protection is provided by `per_test_timeout_secs` (see
+  *Timeouts* above), which defaults on under filter mode. A hard
+  overall cap is available as `timeout_secs`; in filter mode it
+  defaults off, so by default a long matched run is allowed to
+  complete as long as each individual test makes progress.
+- The response includes two filter-mode trailers in addition to the
+  usual records: an `x-cargo-mcp-test-filter-discovery` record that
+  reports how many tests each binary enumerated vs. matched, and an
+  `x-cargo-mcp-test-filter-summary` trailer with the totals (enumerated,
+  matched, launches, exit code).
+
+Use it when you have a focused fix and want to re-run just the
+relevant tests without retyping a `--exact` list, or when you want to
+run a regex-defined slice of a suite (e.g. "all tests under one
+module"). Don't use it for first-time runs of an unfamiliar suite
+(plain `cargo_test` is faster when you want everything) or for
+doctests.
 
 **Redirecting full output to a file (`output_path`)**
 
@@ -370,8 +450,14 @@ the summary indicates failures worth drilling into.
   "lib": true,                        // optional: only library (unit) tests
   "test": "integration_tests",        // optional: specific integration test target name
   "no_fail_fast": true,               // optional: run all tests even if some fail
-  "timeout_secs": 0,                  // optional: 0 disables the timeout for this run
+  "timeout_secs": 0,                  // optional: overall wall-clock cap; 0 disables
+  "per_test_timeout_secs": 30,        // optional: per-test idle watchdog (filter mode only); 0 disables
   "env": { "RUST_BACKTRACE": "1" },   // optional: one-shot env for this call only
+  // optional: regex-based selection.
+  "test_filter": {
+    "pattern": "tests::parser::(commas|braces)$", // required: RE2-style regex
+    "include_ignored": false                        // optional, default false
+  },
   "output_path": "target/cargo-mcp/test.ndjson" // optional: full NDJSON to file; result is a summary
 }
 ```
