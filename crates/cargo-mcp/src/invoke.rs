@@ -923,7 +923,9 @@ pub fn run_cargo_streaming_with_timeout(
             args,
             working_dir,
             attempt_budget,
+            None, // retry-aware path uses overall budget only; no per-test reset
             arm_deadline,
+            None,
             on_stdout_line,
         )
         .map_err(|e| -> Box<dyn std::error::Error> {
@@ -1031,13 +1033,76 @@ pub fn run_cargo_streaming_with_timeout(
     }))
 }
 
+/// Run `cargo <args>` with a streaming callback and up to **two independent
+/// watchdogs** — a hard overall cap and a per-test idle cap.
+///
+/// Differs from [`run_cargo_streaming_with_timeout`] in two ways:
+///
+/// 1. **Two deadlines, not one.**
+///    - `overall_timeout`: a single wall-clock cap that arms once (on the
+///      first stdout line satisfying `arm_deadline`, or at spawn if no arm
+///      predicate is given) and **never** resets. This is the
+///      "keep-throughput-going" cap on the whole execution phase.
+///    - `per_test_timeout`: armed on the same trigger as `overall_timeout`
+///      and then **reset to `now + per_test_timeout`** every time a
+///      streamed stdout line satisfies `reset_deadline`. This is the
+///      "hung-test" cap used by `cargo_test`'s `test_filter` mode — each
+///      `test ... ok|FAILED|ignored` boundary line refreshes it.
+///
+///    Either may be `None`. If both are `Some`, whichever expires first
+///    terminates the child; the `TimeoutError::elapsed` value is the time
+///    since arming regardless of which deadline fired.
+///
+/// 2. **No retry-on-busy.** A `cargo test` invocation is not safe to silently
+///    re-run partway through execution: a flaky test that happens to print a
+///    busy-file marker into its own stdout could trigger a redundant
+///    execution of the entire (filtered) test set. `test_filter`'s build
+///    phase already ran under the retry-on-busy regime, so by the time we
+///    reach this function we are only executing pre-built binaries.
+pub fn run_cargo_streaming_with_watchdog(
+    args: &[&str],
+    working_dir: Option<&str>,
+    overall_timeout: Option<Duration>,
+    per_test_timeout: Option<Duration>,
+    arm_deadline: Option<ArmDeadline<'_>>,
+    reset_deadline: Option<ArmDeadline<'_>>,
+    on_stdout_line: &mut dyn FnMut(&str),
+) -> Result<CargoOutput, Box<dyn std::error::Error>> {
+    run_cargo_streaming_once(
+        args,
+        working_dir,
+        overall_timeout,
+        per_test_timeout,
+        arm_deadline,
+        reset_deadline,
+        on_stdout_line,
+    )
+}
+
 /// Single-attempt body of [`run_cargo_streaming`]; see that function for the
 /// retry policy and contract.
+///
+/// Two independent deadlines may be active simultaneously:
+/// - `overall_timeout` arms on the first stdout line that satisfies
+///   `arm_deadline` (or at spawn if no arm predicate is given) and **never**
+///   resets — it bounds the entire execution phase as a hard wall clock.
+/// - `per_test_timeout` arms on the same trigger and additionally resets
+///   back to `now + per_test_timeout` on every subsequent stdout line that
+///   satisfies `reset_deadline` — the per-test watchdog used by the
+///   `cargo_test` `test_filter` feature, where each
+///   `test ... ok|FAILED|ignored` boundary line refreshes the budget.
+///
+/// If both are `Some`, whichever elapses first terminates the child.
+/// `armed_at` is captured only at the initial arming, so the `TimeoutError`
+/// elapsed value reports execution-relative time regardless of how many
+/// resets occurred or which deadline fired.
 fn run_cargo_streaming_once(
     args: &[&str],
     working_dir: Option<&str>,
-    timeout: Option<Duration>,
+    overall_timeout: Option<Duration>,
+    per_test_timeout: Option<Duration>,
     arm_deadline: Option<ArmDeadline<'_>>,
+    reset_deadline: Option<ArmDeadline<'_>>,
     on_stdout_line: &mut dyn FnMut(&str),
 ) -> Result<CargoOutput, Box<dyn std::error::Error>> {
     let (cargo_path, source) = resolve_cargo_binary();
@@ -1093,15 +1158,23 @@ fn run_cargo_streaming_once(
     // checked_add: a caller-supplied timeout near Duration::MAX would panic
     // on `start + t`. Treat overflow as "no deadline" rather than crashing.
     //
-    // Normal mode: arm the deadline at spawn. Deferred-arming mode
-    // (`arm_deadline` is `Some`): leave it unset and arm it the first time a
-    // streamed stdout line satisfies the predicate (e.g. cargo's
+    // Normal mode: arm both deadlines at spawn. Deferred-arming mode
+    // (`arm_deadline` is `Some`): leave them unset and arm them the first
+    // time a streamed stdout line satisfies the predicate (e.g. cargo's
     // `build-finished` record), so only test execution is timed. `armed_at`
-    // records that instant so the timeout's reported `elapsed` is relative to
-    // execution start, not process spawn.
-    let mut deadline = match arm_deadline {
-        Some(_) => None,
-        None => timeout.and_then(|t| start.checked_add(t)),
+    // records that instant so the timeout's reported `elapsed` is relative
+    // to execution start, not process spawn.
+    let arming_required = arm_deadline.is_some();
+    let mut armed = !arming_required;
+    let mut overall_deadline = if armed {
+        overall_timeout.and_then(|t| start.checked_add(t))
+    } else {
+        None
+    };
+    let mut per_test_deadline = if armed {
+        per_test_timeout.and_then(|t| start.checked_add(t))
+    } else {
+        None
     };
     let mut armed_at: Option<Instant> = None;
     let mut stdout_buf = String::new();
@@ -1112,7 +1185,14 @@ fn run_cargo_streaming_once(
             outcome = WaitOutcome::Cancelled;
             break;
         }
-        if let Some(d) = deadline
+        // Whichever deadline elapses first wins; both checked together so
+        // the overall cap can fire even when the per-test watchdog is
+        // being reset on a busy stream.
+        let earliest_deadline = match (overall_deadline, per_test_deadline) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        if let Some(d) = earliest_deadline
             && Instant::now() >= d
         {
             let elapsed = armed_at.unwrap_or(start).elapsed();
@@ -1121,14 +1201,33 @@ fn run_cargo_streaming_once(
         }
         match rx.recv_timeout(tick) {
             Ok(Some(l)) => {
-                // Arm the deadline on the marker line (deferred-arming mode).
-                if deadline.is_none()
-                    && let (Some(t), Some(pred)) = (timeout, arm_deadline)
+                // Arm both deadlines on the marker line (deferred-arming mode).
+                let mut just_armed = false;
+                if !armed
+                    && let Some(pred) = arm_deadline
                     && pred(&l)
                 {
                     let now = Instant::now();
                     armed_at = Some(now);
-                    deadline = now.checked_add(t);
+                    armed = true;
+                    overall_deadline = overall_timeout.and_then(|t| now.checked_add(t));
+                    per_test_deadline = per_test_timeout.and_then(|t| now.checked_add(t));
+                    just_armed = true;
+                }
+                // After arming, an optional reset predicate refreshes ONLY the
+                // per-test deadline on each matching line \u2014 the per-test
+                // watchdog used by `cargo_test`'s `test_filter` mode, where
+                // every test completion (`test ... ok|FAILED|ignored`)
+                // should re-arm the clock so a long suite of fast tests
+                // never trips the per-test budget. The overall deadline is
+                // intentionally untouched: it bounds the whole run regardless
+                // of how much per-test progress is being made.
+                if armed
+                    && !just_armed
+                    && let (Some(t), Some(pred)) = (per_test_timeout, reset_deadline)
+                    && pred(&l)
+                {
+                    per_test_deadline = Instant::now().checked_add(t);
                 }
                 on_stdout_line(&l);
                 stdout_buf.push_str(&l);

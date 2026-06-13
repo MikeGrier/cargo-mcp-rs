@@ -20,6 +20,10 @@ documentation = "https://docs.rs/cargo-mcp"
 [workspace.dependencies]
 serde       = { version = "1", features = ["derive"] }
 serde_json  = "1"
+# Pure-Rust, RE2-style regex engine. Used by `cargo_test`'s `test_filter`
+# parameter to select individual test cases by pattern across enumerated
+# libtest harnesses. Linear-time matching, no backreferences.
+regex       = { version = "1", default-features = false, features = ["std", "perf", "unicode"] }
 
 # Release profile: tuned for shipped binary size (bundled inside the VS Code
 # extension VSIX).
