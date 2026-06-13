@@ -1118,7 +1118,13 @@ fn summarize_ndjson(body: &str, path: &str, bytes: u64, lines: usize, kind: Summ
 /// Decide whether one NDJSON record from the full body should be replayed
 /// into the summary returned to the caller.
 ///
-/// Always kept: the status trailer, `build-finished`, `x-cargo-mcp-stderr`.
+/// Always kept: the status trailer, `build-finished`, `x-cargo-mcp-stderr`,
+/// and the two `cargo_test` filter-mode trailers
+/// (`x-cargo-mcp-test-filter-discovery` and
+/// `x-cargo-mcp-test-filter-summary`), which carry the per-binary plan /
+/// rollup totals callers rely on to interpret a `test_filter` response and
+/// would otherwise be lost when `output_path` redirects the full transcript
+/// to disk.
 /// Conditionally kept: `compiler-message` only when `message.level == "error"`;
 /// `x-cargo-mcp-test-output` only when [`is_test_summary_line`] matches (and
 /// only in [`SummaryKind::Test`] mode).
@@ -1133,7 +1139,10 @@ fn keep_in_summary(line: &str, kind: SummaryKind) -> bool {
     }
     let reason = v.get("reason").and_then(|r| r.as_str()).unwrap_or("");
     match reason {
-        "build-finished" | STDERR_REASON => true,
+        "build-finished"
+        | STDERR_REASON
+        | "x-cargo-mcp-test-filter-discovery"
+        | "x-cargo-mcp-test-filter-summary" => true,
         "compiler-message" => v
             .get("message")
             .and_then(|m| m.get("level"))

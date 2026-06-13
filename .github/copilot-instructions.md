@@ -117,6 +117,7 @@ directory; no `..` components; parent must already exist) that receives the
 | `x-cargo-mcp-stderr` (when present) | |
 | status trailer (`{"status":...}`) | |
 | **`cargo_test` only:** libtest summary/failure markers — `running N tests`, ` ... FAILED`, `failures:`, `---- name stdout ----`, `panicked at`, `note: run with`, `test result:` | |
+| **`cargo_test` filter mode only:** `x-cargo-mcp-test-filter-discovery` and `x-cargo-mcp-test-filter-summary` trailers (per-binary plan and rollup totals) | |
 
 **Use `output_path` when:**
 

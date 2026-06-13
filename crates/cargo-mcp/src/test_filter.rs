@@ -491,12 +491,19 @@ struct BinaryRunOutcome {
 /// feature selection so the same toolchain and profile resolve as during
 /// the discovery build — but narrows the target down to exactly one binary
 /// and appends the matched names under libtest's `--exact` mode.
+/// When the caller supplied a `+<toolchain>` argument it is reapplied here
+/// (as a leading token, the same way phase 1's `--no-run` build inserts it)
+/// so the execution launches use the same toolchain cargo just compiled
+/// against; otherwise rustup's default toolchain selection would silently
+/// trigger a rebuild (or fail outright when the caller's toolchain is the
+/// only one with the test binary).
 fn build_per_binary_argv<'a>(
     args: &'a Value,
     common: &'a CommonOpts,
     discovered: &'a DiscoveredBinary,
     names_chunk: &'a [&str],
     include_ignored: bool,
+    toolchain: Option<&'a str>,
 ) -> Vec<&'a str> {
     let mut argv: Vec<&'a str> = vec!["test", "--message-format=json"];
     // Always pass --package <name> to disambiguate workspace members.
@@ -539,6 +546,13 @@ fn build_per_binary_argv<'a>(
     for name in names_chunk {
         argv.push(name);
     }
+    // Reapply `+<toolchain>` last so it lands as the first argv token after
+    // construction is done (mirrors how phase 1's `--no-run` build inserts
+    // it at index 0). Done after pushing the rest of the argv to keep the
+    // index math obvious.
+    if let Some(t) = toolchain {
+        argv.insert(0, t);
+    }
     argv
 }
 
@@ -574,6 +588,7 @@ fn run_one_binary(
     discovered: &DiscoveredBinary,
     include_ignored: bool,
     wd: Option<&str>,
+    toolchain: Option<&str>,
     overall_timeout: Option<Duration>,
     phase3_arm: &Cell<Option<Instant>>,
     per_test_timeout: Option<Duration>,
@@ -590,7 +605,8 @@ fn run_one_binary(
             continue;
         }
         launches += 1;
-        let argv = build_per_binary_argv(args, common, discovered, &chunk, include_ignored);
+        let argv =
+            build_per_binary_argv(args, common, discovered, &chunk, include_ignored, toolchain);
         // Compute this launch's overall budget:
         //   - if some prior launch has already armed the shared phase-3
         //     deadline, use the absolute deadline so per-launch build/
@@ -785,6 +801,22 @@ pub fn run(
     let discovered = match_tests(enumerated, &filter.regex);
     let total_enumerated: usize = discovered.iter().map(|d| d.all_tests.len()).sum();
     let total_matched: usize = discovered.iter().map(|d| d.matched.len()).sum();
+    // Number of cargo launches we would issue if nothing aborts early
+    // (i.e. no overall-deadline short-circuit, no enumeration error). Each
+    // binary with at least one match contributes one launch per non-empty
+    // chunk. Computed up front so the discovery record reports the *plan*
+    // (`launches_planned`) and the rollup trailer's `launches` field
+    // reports what actually ran — the two can legitimately differ when an
+    // overall timeout trims phase 3.
+    let total_launches_planned: usize = discovered
+        .iter()
+        .map(|d| {
+            chunk_test_names(&d.matched)
+                .iter()
+                .filter(|c| !c.is_empty())
+                .count()
+        })
+        .sum();
 
     // ── phase 3: per-binary execution ────────────────────────────────────
     // The overall cap is shared across every per-binary launch and is
@@ -842,6 +874,7 @@ pub fn run(
             d,
             filter.include_ignored,
             wd,
+            toolchain.as_deref(),
             overall_timeout,
             &phase3_arm,
             per_test_timeout,
@@ -872,7 +905,7 @@ pub fn run(
         &discovered,
         total_enumerated,
         total_matched,
-        total_launches,
+        total_launches_planned,
         &enumeration_errors,
     );
     body.push_str(&discovery);
@@ -913,7 +946,7 @@ fn build_discovery_record(
     discovered: &[DiscoveredBinary],
     total_enumerated: usize,
     total_matched: usize,
-    total_launches: usize,
+    launches_planned: usize,
     enumeration_errors: &[String],
 ) -> String {
     let binaries: Vec<Value> = discovered
@@ -942,7 +975,7 @@ fn build_discovery_record(
         "include_ignored": filter.include_ignored,
         "tests_enumerated": total_enumerated,
         "tests_matched": total_matched,
-        "launches_planned": total_launches,
+        "launches_planned": launches_planned,
         "binaries": binaries,
         "enumeration_errors": enumeration_errors,
     }))
