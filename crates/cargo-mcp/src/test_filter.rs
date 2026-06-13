@@ -479,6 +479,11 @@ struct BinaryRunOutcome {
     /// Number of chunks that actually ran (== 1 when matches fit a single
     /// launch; > 1 when chunking kicked in).
     launches: usize,
+    /// `true` when the shared overall deadline was already exceeded
+    /// before (or during) this binary's run, so the orchestrator can
+    /// short-circuit the outer loop instead of emitting a synthetic
+    /// timeout body per remaining binary.
+    overall_deadline_exceeded: bool,
 }
 
 /// Build the cargo argv used to *execute* a specific binary's matched tests.
@@ -512,10 +517,18 @@ fn build_per_binary_argv<'a>(
     tools::push_feature_flags(&mut argv, args, common);
     tools::push_compilation_options(&mut argv, args, common, false);
     tools::push_manifest_options(&mut argv, args, common, true);
-    // Always run with --no-fail-fast: a failure in the first matched case
-    // should not prevent the remaining matches from executing. The caller's
-    // own `no_fail_fast` is intentionally ignored here because the whole
-    // point of `test_filter` is to run "exactly this set".
+    // Always pass --no-fail-fast defensively. In this per-binary, per-
+    // chunk invocation it is largely a no-op: cargo's `--no-fail-fast`
+    // controls whether *subsequent test binaries* still run after one
+    // fails, but the orchestrator already drives one cargo invocation
+    // per binary (and per chunk) itself, so cross-target fail-fast is
+    // moot. libtest within the single binary already runs the full
+    // `--exact` name set regardless of individual test failures. The
+    // flag is kept anyway so that if cargo ever extends `--fail-fast`
+    // semantics to a per-target / per-name set, this invocation still
+    // honours the documented "run exactly this set" contract; the
+    // caller's own `no_fail_fast` is intentionally ignored here for
+    // the same reason.
     argv.push("--no-fail-fast");
     // Harness arguments after the `--` separator.
     argv.push("--");
@@ -571,6 +584,7 @@ fn run_one_binary(
     let mut formatted = Vec::with_capacity(chunks.len());
     let mut agg_exit_code = 0i32;
     let mut launches = 0usize;
+    let mut overall_deadline_exceeded = false;
     for chunk in chunks {
         if chunk.is_empty() {
             continue;
@@ -636,11 +650,22 @@ fn run_one_binary(
             }
         };
         formatted.push(body);
+        // If the overall deadline was already exceeded going into this
+        // launch, no later chunk for this binary (or later binary) can
+        // possibly run within the budget either. Stop after emitting one
+        // synthetic timeout body so the response does not balloon with
+        // one TimeoutError per remaining chunk — the orchestrator will
+        // see `overall_deadline_exceeded` and break the outer loop too.
+        if already_elapsed {
+            overall_deadline_exceeded = true;
+            break;
+        }
     }
     BinaryRunOutcome {
         formatted,
         exit_code: agg_exit_code,
         launches,
+        overall_deadline_exceeded,
     }
 }
 
@@ -796,6 +821,21 @@ pub fn run(
         if d.matched.is_empty() {
             continue;
         }
+        // Cheap check at the top of each iteration: if the shared overall
+        // deadline has already passed, skip every remaining binary instead
+        // of letting `run_one_binary` emit a synthetic timeout body for it.
+        // (`run_one_binary`'s internal already_elapsed branch still covers
+        // the case where the deadline trips *during* the first launch of
+        // the current binary.)
+        if let (Some(arm_t), Some(budget)) = (phase3_arm.get(), overall_timeout)
+            && let Some(d_abs) = arm_t.checked_add(budget)
+            && Instant::now() >= d_abs
+        {
+            if overall_exit_code == 0 {
+                overall_exit_code = -1;
+            }
+            break;
+        }
         let outcome = run_one_binary(
             args,
             &common,
@@ -813,6 +853,9 @@ pub fn run(
             overall_exit_code = outcome.exit_code;
         }
         binary_bodies.extend(outcome.formatted);
+        if outcome.overall_deadline_exceeded {
+            break;
+        }
     }
 
     // ── response assembly ───────────────────────────────────────────────
