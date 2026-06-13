@@ -1405,6 +1405,89 @@ pub fn run_cargo_to_file(
     })
 }
 
+/// Run an **arbitrary** subprocess (not necessarily cargo) to completion,
+/// capturing its full stdout and stderr, under the same cancel-token and
+/// optional wall-clock-deadline supervision used by the cargo runners.
+///
+/// The caller supplies a fully-prepared [`Command`] (program + args + any
+/// process-specific env). This helper adds `Stdio::null()` on stdin and
+/// `Stdio::piped()` on stdout/stderr, applies `working_dir` if given, then
+/// spawns via [`ManagedChild`] so that cancellation and deadline expiry
+/// kill the **entire process tree**. Stdout and stderr are drained on
+/// background threads to prevent pipe-buffer deadlock if the child writes
+/// substantial output on both streams.
+///
+/// Returns the captured output as a [`CargoOutput`] (its three fields —
+/// `stdout`, `stderr`, `exit_code` — are generic enough to describe any
+/// subprocess, so we reuse the type rather than introduce a parallel one).
+///
+/// Returns [`CancelledError`] if the cancel token fires, [`TimeoutError`]
+/// if `timeout` is supplied and elapses. The child is tree-killed in both
+/// cases.
+pub fn run_subprocess_capture(
+    mut cmd: Command,
+    working_dir: Option<&str>,
+    timeout: Option<Duration>,
+) -> Result<CargoOutput, Box<dyn std::error::Error>> {
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(dir) = working_dir {
+        cmd.current_dir(dir);
+    }
+
+    let mut child = ManagedChild::spawn(&mut cmd)?;
+    let stdout_pipe = child.take_stdout().expect("stdout is piped");
+    let stderr_pipe = child.take_stderr().expect("stderr is piped");
+
+    let stdout_thread = thread::spawn(move || -> String {
+        let mut buf = String::new();
+        let _ = BufReader::new(stdout_pipe).read_to_string(&mut buf);
+        buf
+    });
+    let stderr_thread = thread::spawn(move || -> String {
+        let mut buf = String::new();
+        let _ = BufReader::new(stderr_pipe).read_to_string(&mut buf);
+        buf
+    });
+
+    let start = Instant::now();
+    let deadline = timeout.and_then(|t| start.checked_add(t));
+    let status = loop {
+        match child.try_wait()? {
+            Some(s) => break s,
+            None => {
+                if is_cancelled() {
+                    child.kill_tree();
+                    let _ = stdout_thread.join();
+                    let _ = stderr_thread.join();
+                    return Err(Box::new(CancelledError));
+                }
+                if let Some(d) = deadline
+                    && Instant::now() >= d
+                {
+                    child.kill_tree();
+                    let _ = stdout_thread.join();
+                    let _ = stderr_thread.join();
+                    return Err(Box::new(TimeoutError {
+                        elapsed: start.elapsed(),
+                    }));
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+    };
+
+    let stdout_buf = stdout_thread.join().unwrap_or_default();
+    let stderr_buf = stderr_thread.join().unwrap_or_default();
+    let exit_code = status.code().unwrap_or(-1);
+    Ok(CargoOutput {
+        stdout: stdout_buf,
+        stderr: stderr_buf,
+        exit_code,
+    })
+}
+
 // ── tests ─────────────────────────────────────────────────────────────────────
 
 /// Serializes every test (unit **or** integration) that reads or mutates the

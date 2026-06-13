@@ -31,7 +31,7 @@
 //! parallel doctest pipeline.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use regex::Regex;
@@ -285,6 +285,16 @@ fn extract_package_name(package_id: &str) -> String {
 
 // ── per-binary enumeration ──────────────────────────────────────────────────
 
+/// Hard wall-clock cap on a single `--list` enumeration of a test binary.
+///
+/// A healthy libtest binary lists its tests in milliseconds even for large
+/// suites. We pick a generous cap (well above any realistic enumeration)
+/// purely as a safety net: if a binary hangs in global initialization, we
+/// surface a `TimeoutError` for that binary (which the orchestrator records
+/// in `enumeration_errors` and treats as an overall error) rather than
+/// wedging the whole `cargo_test` request indefinitely.
+const ENUMERATION_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Invoke a compiled test binary with `--list` and parse its name catalogue.
 ///
 /// libtest's `--list` output is a sequence of `<name>: <kind>` lines, plus a
@@ -294,13 +304,20 @@ fn extract_package_name(package_id: &str) -> String {
 /// run a second `--list --ignored` pass to discover the ignored cases —
 /// `--list` alone hides them and there is no stable text marker on each
 /// line that says "ignored".
+///
+/// `working_dir` is forwarded to the child so the binary runs with the same
+/// cwd the caller will use for execution (phase 3) and that cargo used for
+/// the build (phase 1). Without this, enumeration would run with whatever
+/// cwd the MCP server process happens to hold, which can produce different
+/// initialization behaviour than the execution launches.
 fn enumerate_tests(
     binary: &Path,
     include_ignored: bool,
+    working_dir: Option<&str>,
 ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    let mut tests = list_tests(binary, false)?;
+    let mut tests = list_tests(binary, false, working_dir)?;
     if include_ignored {
-        let ignored = list_tests(binary, true)?;
+        let ignored = list_tests(binary, true, working_dir)?;
         tests.extend(ignored);
     }
     // Dedupe defensively in case a future libtest revision starts including
@@ -313,37 +330,35 @@ fn enumerate_tests(
 fn list_tests(
     binary: &Path,
     ignored_only: bool,
+    working_dir: Option<&str>,
 ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     let mut cmd = Command::new(binary);
     cmd.arg("--list");
     if ignored_only {
         cmd.arg("--ignored");
     }
-    let output = cmd
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
+    // Run under the cancel-token + wall-clock supervisor so a hung test
+    // binary (e.g. stuck in global initialization) is killed instead of
+    // wedging the whole `cargo_test` request.
+    let output = invoke::run_subprocess_capture(cmd, working_dir, Some(ENUMERATION_TIMEOUT))
         .map_err(|e| -> Box<dyn std::error::Error> {
             format!(
-                "failed to launch test binary for --list enumeration: {} ({e})",
+                "failed to enumerate tests via --list on {} ({e})",
                 binary.display()
             )
             .into()
         })?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+    if output.exit_code != 0 {
         return Err(format!(
             "test binary {} exited with code {} during --list enumeration: {}",
             binary.display(),
-            output.status.code().unwrap_or(-1),
-            stderr.trim()
+            output.exit_code,
+            output.stderr.trim()
         )
         .into());
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
     let mut tests = Vec::new();
-    for line in stdout.lines() {
+    for line in output.stdout.lines() {
         let line = line.trim_end();
         if line.is_empty() {
             continue;
@@ -703,7 +718,7 @@ pub fn run(
     let mut enumerated: Vec<(TestBinary, Vec<String>)> = Vec::with_capacity(binaries.len());
     let mut enumeration_errors: Vec<String> = Vec::new();
     for binary in binaries {
-        match enumerate_tests(&binary.executable, filter.include_ignored) {
+        match enumerate_tests(&binary.executable, filter.include_ignored, wd) {
             Ok(tests) => enumerated.push((binary, tests)),
             Err(e) => {
                 enumeration_errors.push(format!("{}: {e}", binary.executable.display()));
