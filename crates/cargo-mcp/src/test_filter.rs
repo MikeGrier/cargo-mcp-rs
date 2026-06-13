@@ -384,9 +384,12 @@ fn list_tests(
 /// phase so per-binary discovery records can report both counts.
 struct DiscoveredBinary {
     binary: TestBinary,
-    /// Every test the binary advertises via `--list`, in libtest order.
-    /// Retained even when no match was found so the discovery record can
-    /// report `tests_enumerated` accurately.
+    /// Every test the binary advertises via `--list`, sorted and deduped
+    /// by [`enumerate_tests`] for deterministic discovery output (the
+    /// libtest harness emission order is not stable across rustc versions
+    /// or `--include-ignored` merging). Retained even when no match was
+    /// found so the discovery record can report `tests_enumerated`
+    /// accurately.
     all_tests: Vec<String>,
     /// The subset of `all_tests` whose name matched the caller's regex.
     matched: Vec<String>,
@@ -529,18 +532,6 @@ fn build_per_binary_argv<'a>(
 /// Execute one matched binary, splitting into multiple cargo launches if the
 /// argv would otherwise exceed [`ARGV_NAME_CHUNK_BYTES`]. Each launch is
 /// supervised by up to two independent watchdogs:
-/// - `phase3_deadline`: shared OVERALL wall-clock cap for the entire
-///   execution phase (phase 3) across every per-binary launch. Each launch
-///   receives the *remaining* budget — the slice between `Instant::now()`
-///   and `phase3_deadline` — as its per-launch overall watchdog. If the
-///   deadline has already elapsed by the time we reach a launch, the launch
-///   is failed synthetically without spawning cargo.
-/// - `per_test_timeout`: per-test idle cap (arms on `build-finished`, resets
-///   on every libtest boundary line). Independent across launches.
-///
-/// Execute one matched binary, splitting into multiple cargo launches if the
-/// argv would otherwise exceed [`ARGV_NAME_CHUNK_BYTES`]. Each launch is
-/// supervised by up to two independent watchdogs:
 /// - `overall_timeout` + `phase3_arm`: shared OVERALL wall-clock cap for the
 ///   entire execution phase across every per-binary launch. The orchestrator
 ///   passes a `Cell<Option<Instant>>` that the wrapped `arm` predicate fills
@@ -600,9 +591,16 @@ fn run_one_binary(
         };
         let already_elapsed = overall_deadline_abs.is_some_and(|d| Instant::now() >= d);
         let result = if already_elapsed {
-            Err(Box::<dyn std::error::Error>::from(
-                "overall test_filter timeout exceeded before launch",
-            ))
+            // Report this as a real `TimeoutError` (matching the type/message
+            // shape the inner watchdog would have produced if the deadline
+            // had fired mid-launch) so callers and tests that downcast to
+            // `TimeoutError` to distinguish timeouts from other failures
+            // continue to work for this short-circuit branch.
+            let elapsed = phase3_arm
+                .get()
+                .map(|arm_t| Instant::now().saturating_duration_since(arm_t))
+                .unwrap_or_default();
+            Err(Box::new(invoke::TimeoutError { elapsed }) as Box<dyn std::error::Error>)
         } else {
             invoke::run_cargo_streaming_with_watchdog(
                 &argv,
