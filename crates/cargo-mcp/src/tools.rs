@@ -990,17 +990,6 @@ pub(crate) enum SummaryKind {
     Test,
 }
 
-impl SummaryKind {
-    /// True when this kind's summary keeps libtest summary/failure marker
-    /// lines from `x-cargo-mcp-test-output` records. Used by [`test_filter`]
-    /// to decide whether to inherit `Test` semantics when an `output_path`
-    /// is requested for a filtered run.
-    #[allow(dead_code)]
-    pub(crate) fn is_test(self) -> bool {
-        matches!(self, SummaryKind::Test)
-    }
-}
-
 /// Discriminator for the NDJSON pointer record inserted into a summary that
 /// tells the caller where the full transcript was written.
 pub(crate) const OUTPUT_FILE_REASON: &str = "x-cargo-mcp-output-file";

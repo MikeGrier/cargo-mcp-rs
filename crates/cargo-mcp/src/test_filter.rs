@@ -956,6 +956,19 @@ pub fn run(
     body.push_str(&rollup);
     body.push('\n');
 
+    // Standard status trailer as the final line, matching the documented
+    // `cargo_test` output shape. Consumers that read the last line to
+    // determine overall success/failure work identically in filter and
+    // non-filter modes; the preceding `x-cargo-mcp-test-filter-summary`
+    // carries the filter-specific rollup.
+    let status_trailer = if overall_exit_code == 0 {
+        r#"{"status":"success"}"#.to_owned()
+    } else {
+        format!(r#"{{"status":"error","exit_code":{overall_exit_code}}}"#)
+    };
+    body.push_str(&status_trailer);
+    body.push('\n');
+
     let is_error = overall_exit_code != 0;
     let text = tools::write_output_path_and_summarize(body, output_path, wd, SummaryKind::Test)?;
     Ok(Some(ToolResult::Text { text, is_error }))
