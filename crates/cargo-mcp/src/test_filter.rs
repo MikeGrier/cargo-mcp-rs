@@ -807,12 +807,14 @@ pub fn run(
                 // (`<binary> --list`) under our enumeration watchdog, not
                 // cargo itself. Substitute an enumeration-specific message
                 // (including the configured budget) so the surfaced error
-                // is not misleading.
+                // is not misleading. The outer `<binary>: ...` prefix
+                // already identifies the executable, so the timeout
+                // message itself names only the `--list` invocation to
+                // avoid printing the path twice.
                 let msg = if e.is::<invoke::TimeoutError>() {
                     format!(
-                        "enumeration timed out after {:.1}s (`{} --list` did not finish)",
+                        "enumeration timed out after {:.1}s (`--list` did not finish)",
                         ENUMERATION_TIMEOUT.as_secs_f64(),
-                        binary.executable.display(),
                     )
                 } else {
                     format!("{e}")
