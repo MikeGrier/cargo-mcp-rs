@@ -1634,11 +1634,13 @@ pub fn list() -> Value {
                              is killed and the orchestrator moves on to the next matched \
                              binary (one hung test does not block the rest of the filter \
                              run from completing). If omitted under `test_filter`, the \
-                             server-configured default applies (30 seconds when launched by \
-                             the VS Code extension; no default otherwise) so hung-test \
-                             protection is on by default. Pass 0 to disable per-test \
-                             protection for this run. May be combined with `timeout_secs`; \
-                             whichever fires first wins."
+                             server-configured default applies (30 seconds when launched \
+                             by the VS Code extension); when that default is also absent \
+                             or set to 0, filter mode still applies a hard-coded 30-second \
+                             fallback so hung-test protection is on by default. The only \
+                             way to fully disable per-test protection for a call is to pass \
+                             `per_test_timeout_secs: 0` explicitly in the tool arguments. \
+                             May be combined with `timeout_secs`; whichever fires first wins."
                     }
                 },
                 "required": []

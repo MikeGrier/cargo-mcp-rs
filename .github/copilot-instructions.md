@@ -181,7 +181,11 @@ of the filter run from completing.
 
 - Omit under `test_filter` to let the server default apply (same
   `cargo-mcp.test.timeoutSecs` source, **30 seconds** under the VS Code
-  extension); pass `0` to disable per-test protection for this run.
+  extension). When the server default is absent or set to `0`, filter
+  mode still applies a hard-coded **30-second** fallback so hung-test
+  protection is on by default. The only way to fully disable per-test
+  protection for a call is to pass `per_test_timeout_secs: 0`
+  explicitly in the tool arguments.
 - Combine with `timeout_secs` when you want both ("kill a hung test fast,
   but also cap the whole run").
 
@@ -286,3 +290,36 @@ appears in `x-cargo-mcp-stderr`.
 Source files in this repository may contain non-ASCII characters. When editing
 files, prefer the editor's built-in edit tools over PowerShell file I/O
 (`Set-Content`, `Out-File`, `>`) to avoid encoding corruption.
+
+
+## Responding to PR review comments
+
+When addressing review comments on a pull request (Copilot reviewer or
+human), **reply on each individual review thread**, not only with a
+summary comment on the PR conversation.
+
+Why: as a PR accumulates more rounds of review, a single summary comment
+makes it impossible to tell from the GitHub UI which inline threads are
+old vs. new, or which have been addressed. A per-thread reply leaves an
+"author replied" marker on each line where the reviewer raised an issue.
+
+Procedure:
+
+1. Fetch the inline review comments and their IDs:
+   ```pwsh
+   gh api repos/<owner>/<repo>/pulls/<num>/comments --jq '.[] | {id, path, line, user: .user.login, body: (.body | .[0:80])}'
+   ```
+2. For each comment, post a reply to that specific thread:
+   ```pwsh
+   gh api -X POST "repos/<owner>/<repo>/pulls/<num>/comments/<comment-id>/replies" -F body=@reply.md
+   ```
+3. Keep each reply short and concrete: name the commit SHA that
+   addressed it and (when small) quote the new behaviour. If you
+   intentionally chose not to act on a comment, say so on that thread.
+4. A summary comment on the PR conversation is fine *in addition*, but
+   never *instead*.
+
+The VS Code GitHub Pull Request extension's `resolveReviewThread` tool
+often reports `canResolve: false` for Copilot-authored threads; in that
+case post the per-thread reply via `gh api` as above and let the human
+maintainer resolve.

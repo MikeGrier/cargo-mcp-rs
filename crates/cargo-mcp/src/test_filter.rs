@@ -30,6 +30,7 @@
 //! intentionally excluded from filter selection; a future revision can add a
 //! parallel doctest pipeline.
 
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -537,6 +538,28 @@ fn build_per_binary_argv<'a>(
 /// - `per_test_timeout`: per-test idle cap (arms on `build-finished`, resets
 ///   on every libtest boundary line). Independent across launches.
 ///
+/// Execute one matched binary, splitting into multiple cargo launches if the
+/// argv would otherwise exceed [`ARGV_NAME_CHUNK_BYTES`]. Each launch is
+/// supervised by up to two independent watchdogs:
+/// - `overall_timeout` + `phase3_arm`: shared OVERALL wall-clock cap for the
+///   entire execution phase across every per-binary launch. The orchestrator
+///   passes a `Cell<Option<Instant>>` that the wrapped `arm` predicate fills
+///   on the first per-binary `build-finished` line emitted *across all
+///   launches*. Before each launch we read the cell:
+///   - if it is still `None` (no launch has armed yet \u2014 typically the very
+///     first launch), we pass `overall_timeout` as a Duration so the inner
+///     watchdog arms it on this launch's own `build-finished`;
+///   - if it is `Some(arm_t)`, we compute the absolute deadline
+///     `arm_t + overall_timeout` and pass it to the inner watchdog directly,
+///     so per-launch cargo startup / incremental-build time inside L2+
+///     cannot extend the shared cap.
+///
+///   This honours the documented contract that the overall clock arms on
+///   the first `build-finished` and bounds only test execution.
+/// - `per_test_timeout`: per-test idle cap (arms on each launch's local
+///   `build-finished`, resets on every libtest boundary line). Independent
+///   across launches.
+///
 /// Whichever fires first kills the launch; the orchestrator then moves on to
 /// the next chunk / binary so one hung test does not block the rest of the
 /// matched run from completing.
@@ -547,8 +570,10 @@ fn run_one_binary(
     discovered: &DiscoveredBinary,
     include_ignored: bool,
     wd: Option<&str>,
-    phase3_deadline: Option<Instant>,
+    overall_timeout: Option<Duration>,
+    phase3_arm: &Cell<Option<Instant>>,
     per_test_timeout: Option<Duration>,
+    arm: invoke::ArmDeadline<'_>,
     on_progress: &mut dyn FnMut(&str),
 ) -> BinaryRunOutcome {
     let chunks = chunk_test_names(&discovered.matched);
@@ -561,12 +586,20 @@ fn run_one_binary(
         }
         launches += 1;
         let argv = build_per_binary_argv(args, common, discovered, &chunk, include_ignored);
-        // Compute the slice of the shared overall budget remaining for this
-        // launch. If the deadline has already elapsed, fail this launch
-        // synthetically rather than spawning cargo and racing the watchdog.
-        let remaining_overall =
-            phase3_deadline.map(|d| d.saturating_duration_since(Instant::now()));
-        let result = if let Some(Duration::ZERO) = remaining_overall {
+        // Compute this launch's overall budget:
+        //   - if some prior launch has already armed the shared phase-3
+        //     deadline, use the absolute deadline so per-launch build/
+        //     startup time cannot extend the cap;
+        //   - otherwise pass overall_timeout as a Duration and let the
+        //     inner watchdog arm it on this launch's own build-finished
+        //     (which the wrapped `arm` predicate will also capture into
+        //     `phase3_arm` for use by every subsequent launch).
+        let overall_deadline_abs = match (phase3_arm.get(), overall_timeout) {
+            (Some(arm_t), Some(budget)) => arm_t.checked_add(budget),
+            _ => None,
+        };
+        let already_elapsed = overall_deadline_abs.is_some_and(|d| Instant::now() >= d);
+        let result = if already_elapsed {
             Err(Box::<dyn std::error::Error>::from(
                 "overall test_filter timeout exceeded before launch",
             ))
@@ -574,9 +607,10 @@ fn run_one_binary(
             invoke::run_cargo_streaming_with_watchdog(
                 &argv,
                 wd,
-                remaining_overall,
+                overall_timeout,
+                overall_deadline_abs,
                 per_test_timeout,
-                Some(&tools::is_build_finished_line),
+                Some(arm),
                 Some(&is_test_completion_or_start),
                 on_progress,
             )
@@ -730,13 +764,26 @@ pub fn run(
     let total_matched: usize = discovered.iter().map(|d| d.matched.len()).sum();
 
     // ── phase 3: per-binary execution ────────────────────────────────────
-    // Capture the start of phase 3 and convert `overall_timeout` into a
-    // shared absolute deadline, so the OVERALL cap covers wall-clock across
-    // *all* per-binary launches rather than restarting per launch. Each
-    // call into `run_one_binary` receives the remaining slice of this
-    // budget; once exhausted, subsequent launches fail synthetically.
-    let phase3_start = Instant::now();
-    let phase3_deadline = overall_timeout.map(|t| phase3_start + t);
+    // The overall cap is shared across every per-binary launch and is
+    // anchored on the *first* `build-finished` line emitted across all
+    // launches (matching the documented contract that the overall clock
+    // arms when test execution begins). We wrap the build-finished arm
+    // predicate so the first time it returns true, it records
+    // `Instant::now()` into `phase3_arm`. `run_one_binary` reads that
+    // cell before each launch to decide whether to pass `overall_timeout`
+    // as a Duration (no prior launch has armed yet) or as an absolute
+    // deadline `arm_t + overall_timeout` (some prior launch has armed,
+    // so reuse the same deadline regardless of this launch's startup
+    // time). `Cell` is fine here: the wrapped predicate is only invoked
+    // from the inner watchdog's single-threaded poll loop.
+    let phase3_arm: Cell<Option<Instant>> = Cell::new(None);
+    let wrapped_arm = |line: &str| -> bool {
+        let matched = tools::is_build_finished_line(line);
+        if matched && phase3_arm.get().is_none() {
+            phase3_arm.set(Some(Instant::now()));
+        }
+        matched
+    };
     let mut binary_bodies: Vec<String> = Vec::new();
     let mut total_launches: usize = 0;
     let mut overall_exit_code: i32 = 0;
@@ -757,8 +804,10 @@ pub fn run(
             d,
             filter.include_ignored,
             wd,
-            phase3_deadline,
+            overall_timeout,
+            &phase3_arm,
             per_test_timeout,
+            &wrapped_arm,
             sink.as_mut(),
         );
         total_launches += outcome.launches;

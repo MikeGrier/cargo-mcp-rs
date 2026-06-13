@@ -330,9 +330,13 @@ record), so a slow build never trips either of them.
   one binary, that binary's cargo process tree is killed and the
   orchestrator records `exit_code: -1` plus an inline
   `cargo-mcp test_filter: per-binary run failed: TimeoutError` body,
-  then moves on to the next matched binary. Defaults to the same
-  server setting (30s via the VS Code extension) so hung-test
-  protection is on by default in filter mode; pass `0` to disable.
+  then moves on to the next matched binary. Defaults to the server
+  setting (30s via the VS Code extension) so hung-test protection is
+  on by default in filter mode; when the server default is also
+  absent or set to `0`, filter mode still applies a hard-coded
+  **30-second** fallback. The only way to fully disable per-test
+  protection for a call is to pass `per_test_timeout_secs: 0`
+  explicitly.
 
 Raise either (or pass `0` to disable) for runs you know are slow —
 long integration suites, benchmark-style tests, tests that internally

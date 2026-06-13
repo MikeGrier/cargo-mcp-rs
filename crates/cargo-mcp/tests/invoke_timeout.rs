@@ -317,6 +317,7 @@ fn run_sleeper_with_watchdog(
         &["check"],
         None,
         overall,
+        None,
         per_test,
         arm,
         reset,

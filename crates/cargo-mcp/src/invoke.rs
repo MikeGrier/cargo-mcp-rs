@@ -923,6 +923,7 @@ pub fn run_cargo_streaming_with_timeout(
             args,
             working_dir,
             attempt_budget,
+            None, // retry-aware path: no shared absolute deadline (each attempt arms its own)
             None, // retry-aware path uses overall budget only; no per-test reset
             arm_deadline,
             None,
@@ -1043,15 +1044,25 @@ pub fn run_cargo_streaming_with_timeout(
 ///      first stdout line satisfying `arm_deadline`, or at spawn if no arm
 ///      predicate is given) and **never** resets. This is the
 ///      "keep-throughput-going" cap on the whole execution phase.
-///    - `per_test_timeout`: armed on the same trigger as `overall_timeout`
-///      and then **reset to `now + per_test_timeout`** every time a
-///      streamed stdout line satisfies `reset_deadline`. This is the
-///      "hung-test" cap used by `cargo_test`'s `test_filter` mode — each
-///      `test ... ok|FAILED|ignored` boundary line refreshes it.
+///    - `overall_deadline_abs`: an **absolute** wall-clock deadline that,
+///      when `Some`, takes precedence over `overall_timeout` and is used
+///      as-is (no arming behaviour, no `armed_at` offset). This is the
+///      hook the `cargo_test` `test_filter` orchestrator uses to share a
+///      single execution-phase deadline across every per-binary launch:
+///      the orchestrator captures the *first* per-binary `build-finished`
+///      instant and computes `arm_t + overall_timeout` once, then passes
+///      that same absolute deadline into every subsequent launch so per-
+///      launch build/startup time inside L2+ cannot extend the cap.
+///      When both are `Some`, `overall_deadline_abs` wins.
+///    - `per_test_timeout`: armed on the same trigger as the Duration-
+///      based `overall_timeout` and then **reset to `now + per_test_timeout`**
+///      every time a streamed stdout line satisfies `reset_deadline`. This
+///      is the "hung-test" cap used by `cargo_test`'s `test_filter` mode —
+///      each `test ... ok|FAILED|ignored` boundary line refreshes it.
 ///
-///    Either may be `None`. If both are `Some`, whichever expires first
-///    terminates the child; the `TimeoutError::elapsed` value is the time
-///    since arming regardless of which deadline fired.
+///    Any of the three may be `None`. If multiple are `Some`, whichever
+///    expires first terminates the child; the `TimeoutError::elapsed`
+///    value is the time since arming regardless of which deadline fired.
 ///
 /// 2. **No retry-on-busy.** A `cargo test` invocation is not safe to silently
 ///    re-run partway through execution: a flaky test that happens to print a
@@ -1059,10 +1070,12 @@ pub fn run_cargo_streaming_with_timeout(
 ///    execution of the entire (filtered) test set. `test_filter`'s build
 ///    phase already ran under the retry-on-busy regime, so by the time we
 ///    reach this function we are only executing pre-built binaries.
+#[allow(clippy::too_many_arguments)] // each input is independent; bundling them would obscure intent
 pub fn run_cargo_streaming_with_watchdog(
     args: &[&str],
     working_dir: Option<&str>,
     overall_timeout: Option<Duration>,
+    overall_deadline_abs: Option<Instant>,
     per_test_timeout: Option<Duration>,
     arm_deadline: Option<ArmDeadline<'_>>,
     reset_deadline: Option<ArmDeadline<'_>>,
@@ -1072,6 +1085,7 @@ pub fn run_cargo_streaming_with_watchdog(
         args,
         working_dir,
         overall_timeout,
+        overall_deadline_abs,
         per_test_timeout,
         arm_deadline,
         reset_deadline,
@@ -1086,6 +1100,10 @@ pub fn run_cargo_streaming_with_watchdog(
 /// - `overall_timeout` arms on the first stdout line that satisfies
 ///   `arm_deadline` (or at spawn if no arm predicate is given) and **never**
 ///   resets — it bounds the entire execution phase as a hard wall clock.
+///   `overall_deadline_abs`, when `Some`, takes precedence: the overall
+///   deadline is set from it immediately (at spawn) and is never extended
+///   by per-launch arming. The orchestrator uses this to share a single
+///   deadline across multiple launches.
 /// - `per_test_timeout` arms on the same trigger and additionally resets
 ///   back to `now + per_test_timeout` on every subsequent stdout line that
 ///   satisfies `reset_deadline` — the per-test watchdog used by the
@@ -1096,10 +1114,12 @@ pub fn run_cargo_streaming_with_watchdog(
 /// `armed_at` is captured only at the initial arming, so the `TimeoutError`
 /// elapsed value reports execution-relative time regardless of how many
 /// resets occurred or which deadline fired.
+#[allow(clippy::too_many_arguments)] // each input is independent; bundling them would obscure intent
 fn run_cargo_streaming_once(
     args: &[&str],
     working_dir: Option<&str>,
     overall_timeout: Option<Duration>,
+    overall_deadline_abs: Option<Instant>,
     per_test_timeout: Option<Duration>,
     arm_deadline: Option<ArmDeadline<'_>>,
     reset_deadline: Option<ArmDeadline<'_>>,
@@ -1166,10 +1186,17 @@ fn run_cargo_streaming_once(
     // to execution start, not process spawn.
     let arming_required = arm_deadline.is_some();
     let mut armed = !arming_required;
-    let mut overall_deadline = if armed {
-        overall_timeout.and_then(|t| start.checked_add(t))
-    } else {
-        None
+    // overall_deadline_abs takes precedence over the Duration-based arming:
+    // when Some, the overall deadline is set from it at spawn and is never
+    // touched by the per-launch arming branch below. This is how the
+    // `test_filter` orchestrator shares a single execution-phase deadline
+    // across every per-binary launch (captured from L1's first build-
+    // finished and reused for L2+ without restarting on each launch's
+    // local arming).
+    let mut overall_deadline = match overall_deadline_abs {
+        Some(d) => Some(d),
+        None if armed => overall_timeout.and_then(|t| start.checked_add(t)),
+        None => None,
     };
     let mut per_test_deadline = if armed {
         per_test_timeout.and_then(|t| start.checked_add(t))
@@ -1210,7 +1237,13 @@ fn run_cargo_streaming_once(
                     let now = Instant::now();
                     armed_at = Some(now);
                     armed = true;
-                    overall_deadline = overall_timeout.and_then(|t| now.checked_add(t));
+                    // Only set overall_deadline from the Duration here if
+                    // the caller did NOT supply an absolute one. When
+                    // overall_deadline_abs is Some it was already pinned
+                    // at spawn and per-launch arming must not extend it.
+                    if overall_deadline_abs.is_none() {
+                        overall_deadline = overall_timeout.and_then(|t| now.checked_add(t));
+                    }
                     per_test_deadline = per_test_timeout.and_then(|t| now.checked_add(t));
                     just_armed = true;
                 }
