@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.7.0](https://github.com/MikeGrier/cargo-mcp-rs/compare/v0.6.2...v0.7.0) (2026-06-13)
+
+
+### Features
+
+* **cargo-mcp:** add cargo_test test_filter and two-knob timeouts ([1314c11](https://github.com/MikeGrier/cargo-mcp-rs/commit/1314c11d784280b4aaebf18292eb225d24cee084))
+* **cargo-mcp:** add cargo_test test_filter and two-knob timeouts ([bfcd487](https://github.com/MikeGrier/cargo-mcp-rs/commit/bfcd487159a621efe53f6ff535ac751b01d99ee7))
+
+
+### Bug Fixes
+
+* **invoke,test_filter:** per-test elapsed = last reset; enumeration timeout message ([30a68c9](https://github.com/MikeGrier/cargo-mcp-rs/commit/30a68c92ecdcc2150485b9a7c8fe832bc4e49092))
+* **invoke:** apply per-call env overrides to run_subprocess_capture ([e94c38a](https://github.com/MikeGrier/cargo-mcp-rs/commit/e94c38a062c84e01858a00f611f66ecf39cd60aa))
+* **invoke:** TimeoutError elapsed uses shared anchor when overall fires ([648c0a4](https://github.com/MikeGrier/cargo-mcp-rs/commit/648c0a429134a9d6da193f95cfa4b908b2ccf79d))
+* **test_filter,tools:** append status trailer in filter mode; drop unused SummaryKind::is_test ([5ef7302](https://github.com/MikeGrier/cargo-mcp-rs/commit/5ef73022613dbade88f19acf56a10632b52a2fe2))
+* **test_filter:** address PR review feedback ([089c382](https://github.com/MikeGrier/cargo-mcp-rs/commit/089c38292041045490d601f45cab63245bf0f67b))
+* **test_filter:** anchor overall cap on first build-finished; docs ([14af95a](https://github.com/MikeGrier/cargo-mcp-rs/commit/14af95a64b4762b5da9a22f53ddece1179f92c81))
+* **test_filter:** drop duplicate executable path in enumeration timeout message ([e3d9452](https://github.com/MikeGrier/cargo-mcp-rs/commit/e3d9452598f9f5856127f7abd948ded32449e716))
+* **test_filter:** forward +toolchain into per-binary launches; planned vs actual launches; keep filter trailers in summary ([a118dae](https://github.com/MikeGrier/cargo-mcp-rs/commit/a118dae813f2f063b067fbf890caadd9276efe94))
+* **test_filter:** honor working_dir and add timeout to --list ([153067e](https://github.com/MikeGrier/cargo-mcp-rs/commit/153067e72e0d0a934ee2b973fcb98c8d201dd9be))
+* **test_filter:** round-4 review polish ([a076810](https://github.com/MikeGrier/cargo-mcp-rs/commit/a0768109c7e88baf6b7fae3f7344c70ca1442c43))
+* **test_filter:** short-circuit on exceeded overall deadline; clarify --no-fail-fast ([1054bae](https://github.com/MikeGrier/cargo-mcp-rs/commit/1054baea35af98326941ab7995358abbc963a115))
+
 ## [0.6.2](https://github.com/MikeGrier/cargo-mcp-rs/compare/v0.6.1...v0.6.2) (2026-06-11)
 
 
