@@ -30,19 +30,15 @@
 //! intentionally excluded from filter selection; a future revision can add a
 //! parallel doctest pipeline.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use regex::Regex;
 use serde_json::Value;
 
 use crate::invoke::{self, CargoOutput};
-use crate::tools::{
-    self, CommonOpts, INVOCATION_REASON, OUTPUT_FILE_REASON, STDERR_REASON, SummaryKind,
-    TEST_OUTPUT_REASON, ToolResult,
-};
+use crate::tools::{self, CommonOpts, SummaryKind, ToolResult};
 
 /// Conservative per-binary upper bound on the joined length of all `--exact`
 /// test-name positional arguments. Below the Windows CreateProcess command-
@@ -517,10 +513,14 @@ fn build_per_binary_argv<'a>(
 /// Execute one matched binary, splitting into multiple cargo launches if the
 /// argv would otherwise exceed [`ARGV_NAME_CHUNK_BYTES`]. Each launch is
 /// supervised by up to two independent watchdogs:
-/// - `overall_timeout`: hard wall-clock cap on the launch's whole execution
-///   phase (arms on `build-finished`, never resets).
+/// - `phase3_deadline`: shared OVERALL wall-clock cap for the entire
+///   execution phase (phase 3) across every per-binary launch. Each launch
+///   receives the *remaining* budget — the slice between `Instant::now()`
+///   and `phase3_deadline` — as its per-launch overall watchdog. If the
+///   deadline has already elapsed by the time we reach a launch, the launch
+///   is failed synthetically without spawning cargo.
 /// - `per_test_timeout`: per-test idle cap (arms on `build-finished`, resets
-///   on every libtest boundary line).
+///   on every libtest boundary line). Independent across launches.
 ///
 /// Whichever fires first kills the launch; the orchestrator then moves on to
 /// the next chunk / binary so one hung test does not block the rest of the
@@ -532,7 +532,7 @@ fn run_one_binary(
     discovered: &DiscoveredBinary,
     include_ignored: bool,
     wd: Option<&str>,
-    overall_timeout: Option<Duration>,
+    phase3_deadline: Option<Instant>,
     per_test_timeout: Option<Duration>,
     on_progress: &mut dyn FnMut(&str),
 ) -> BinaryRunOutcome {
@@ -546,15 +546,26 @@ fn run_one_binary(
         }
         launches += 1;
         let argv = build_per_binary_argv(args, common, discovered, &chunk, include_ignored);
-        let result = invoke::run_cargo_streaming_with_watchdog(
-            &argv,
-            wd,
-            overall_timeout,
-            per_test_timeout,
-            Some(&tools::is_build_finished_line),
-            Some(&is_test_completion_or_start),
-            on_progress,
-        );
+        // Compute the slice of the shared overall budget remaining for this
+        // launch. If the deadline has already elapsed, fail this launch
+        // synthetically rather than spawning cargo and racing the watchdog.
+        let remaining_overall =
+            phase3_deadline.map(|d| d.saturating_duration_since(Instant::now()));
+        let result = if let Some(Duration::ZERO) = remaining_overall {
+            Err(Box::<dyn std::error::Error>::from(
+                "overall test_filter timeout exceeded before launch",
+            ))
+        } else {
+            invoke::run_cargo_streaming_with_watchdog(
+                &argv,
+                wd,
+                remaining_overall,
+                per_test_timeout,
+                Some(&tools::is_build_finished_line),
+                Some(&is_test_completion_or_start),
+                on_progress,
+            )
+        };
         let body = match result {
             Ok(out) => {
                 if out.exit_code != 0 && agg_exit_code == 0 {
@@ -661,12 +672,15 @@ pub fn run(
     if let Some(ref t) = toolchain {
         no_run_argv.insert(0, t);
     }
-    let no_run_out = invoke::run_cargo_streaming_with_watchdog(
+    // Run the build phase via the standard streaming-with-timeout path so it
+    // retains the existing retry-on-transient-busy behaviour (relevant on
+    // Windows, where `cargo test --no-run` can intermittently hit
+    // `os error 32/5` while writing artifacts). The watchdog runner is
+    // reserved for execution, where retries are intentionally unsafe.
+    let no_run_out = invoke::run_cargo_streaming_with_timeout(
         &no_run_argv,
         wd,
         None, // build phase is never timed by either watchdog
-        None,
-        None,
         None,
         sink.as_mut(),
     )?;
@@ -701,9 +715,23 @@ pub fn run(
     let total_matched: usize = discovered.iter().map(|d| d.matched.len()).sum();
 
     // ── phase 3: per-binary execution ────────────────────────────────────
+    // Capture the start of phase 3 and convert `overall_timeout` into a
+    // shared absolute deadline, so the OVERALL cap covers wall-clock across
+    // *all* per-binary launches rather than restarting per launch. Each
+    // call into `run_one_binary` receives the remaining slice of this
+    // budget; once exhausted, subsequent launches fail synthetically.
+    let phase3_start = Instant::now();
+    let phase3_deadline = overall_timeout.map(|t| phase3_start + t);
     let mut binary_bodies: Vec<String> = Vec::new();
     let mut total_launches: usize = 0;
     let mut overall_exit_code: i32 = 0;
+    // Treat any phase-2 enumeration failures as an overall error: the
+    // discovery record carries the per-binary errors, and the caller would
+    // otherwise see `status: success` even though the regex was matched
+    // against fewer binaries than discovery enumerated.
+    if !enumeration_errors.is_empty() {
+        overall_exit_code = -1;
+    }
     for d in &discovered {
         if d.matched.is_empty() {
             continue;
@@ -714,7 +742,7 @@ pub fn run(
             d,
             filter.include_ignored,
             wd,
-            overall_timeout,
+            phase3_deadline,
             per_test_timeout,
             sink.as_mut(),
         );
@@ -814,18 +842,6 @@ fn build_discovery_record(
         "enumeration_errors": enumeration_errors,
     }))
     .unwrap_or_else(|_| "{}".into())
-}
-
-// Keep `INVOCATION_REASON`/`STDERR_REASON`/`OUTPUT_FILE_REASON`/
-// `TEST_OUTPUT_REASON`/`BTreeMap` referenced so a future split into per-
-// binary NDJSON record schemas does not have to re-add the imports.
-#[allow(dead_code)]
-fn _keep_imports_alive() {
-    let _ = INVOCATION_REASON;
-    let _ = STDERR_REASON;
-    let _ = OUTPUT_FILE_REASON;
-    let _ = TEST_OUTPUT_REASON;
-    let _ = std::mem::size_of::<BTreeMap<String, String>>();
 }
 
 #[cfg(test)]

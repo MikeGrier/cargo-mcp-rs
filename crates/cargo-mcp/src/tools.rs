@@ -2499,12 +2499,13 @@ fn call_test(
     // under the per-test watchdog). Peek at args first so `on_progress` is
     // only handed off (and consumed) when the filter path will actually run.
     if crate::test_filter::is_filter_requested(args) {
-        return crate::test_filter::run(args, on_progress).map(|opt| {
-            opt.expect(
-                "test_filter::run returned None despite is_filter_requested == true; \
-                 the two helpers disagree on what counts as a filter request",
-            )
-        });
+        if let Some(result) = crate::test_filter::run(args, on_progress)? {
+            return Ok(result);
+        }
+        // Defensive fall-through: if the filter pipeline declined the call
+        // (e.g. a future refactor relaxes `is_filter_requested`), run the
+        // unfiltered path rather than panicking.
+        return call_test_unfiltered(args, None);
     }
     call_test_unfiltered(args, on_progress)
 }
