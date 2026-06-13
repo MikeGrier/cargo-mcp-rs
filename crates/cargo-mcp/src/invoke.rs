@@ -1062,11 +1062,15 @@ pub fn run_cargo_streaming_with_timeout(
 ///
 ///    Any of the three may be `None`. If multiple are `Some`, whichever
 ///    expires first terminates the child. `TimeoutError::elapsed` is
-///    measured from the local arming instant in the per-test case; for the
-///    overall deadline it is measured from the shared cross-launch anchor
-///    (`overall_deadline_abs - overall_timeout`) when both are supplied,
-///    so it reflects the configured budget rather than this launch's local
-///    clock.
+///    measured per-clock so the message reflects the budget that fired:
+///    for the per-test watchdog, time since the *last reset*
+///    (recovered as `per_test_deadline - per_test_timeout`), not since
+///    initial arming — otherwise after many resets the value would
+///    look much larger than the configured per-test budget; for the
+///    overall deadline, time since the shared cross-launch anchor
+///    (`overall_deadline_abs - overall_timeout`) when both are
+///    supplied, so it reflects the configured budget rather than this
+///    launch's local clock.
 ///
 /// 2. **No retry-on-busy.** A `cargo test` invocation is not safe to silently
 ///    re-run partway through execution: a flaky test that happens to print a
@@ -1115,15 +1119,17 @@ pub fn run_cargo_streaming_with_watchdog(
 ///   `test ... ok|FAILED|ignored` boundary line refreshes the budget.
 ///
 /// If both are `Some`, whichever elapses first terminates the child.
-/// `armed_at` is captured only at the initial arming, so when the per-test
-/// watchdog fires the `TimeoutError::elapsed` value reports
-/// execution-relative time regardless of how many resets occurred. When the
-/// overall deadline fires and the caller supplied both
-/// `overall_deadline_abs` and `overall_timeout`, the reported elapsed is
-/// derived from `overall_deadline_abs - overall_timeout` instead so it
-/// reflects the shared cross-launch anchor (the first per-binary
-/// `build-finished` captured by the `test_filter` orchestrator) rather
-/// than this single launch's local clock.
+/// `TimeoutError::elapsed` is reported per-clock so the message reflects
+/// the budget that fired: when the per-test watchdog fires, elapsed is
+/// measured from the *last reset* (`per_test_deadline -
+/// per_test_timeout`) so it stays close to the configured per-test
+/// budget rather than ballooning after many resets. When the overall
+/// deadline fires and the caller supplied both `overall_deadline_abs`
+/// and `overall_timeout`, the reported elapsed is derived from
+/// `overall_deadline_abs - overall_timeout` so it reflects the shared
+/// cross-launch anchor (the first per-binary `build-finished` captured
+/// by the `test_filter` orchestrator) rather than this single launch's
+/// local clock.
 #[allow(clippy::too_many_arguments)] // each input is independent; bundling them would obscure intent
 fn run_cargo_streaming_once(
     args: &[&str],
@@ -1229,16 +1235,30 @@ fn run_cargo_streaming_once(
         let overall_fired = matches!(overall_deadline, Some(d) if now >= d);
         let per_test_fired = matches!(per_test_deadline, Some(d) if now >= d);
         if overall_fired || per_test_fired {
-            // For per-test timeouts, report elapsed since this launch's
-            // local arming. For the overall deadline, when the caller
-            // supplied both `overall_deadline_abs` and `overall_timeout`
-            // (the `test_filter` L2+ case) the abs deadline was anchored
-            // by the orchestrator on the *first* per-binary
-            // `build-finished` across all launches; recover that anchor
-            // as `overall_deadline_abs - overall_timeout` so the reported
-            // elapsed matches the configured overall budget rather than
-            // this single launch's local clock.
-            let elapsed = if overall_fired
+            // The reported `elapsed` is per-clock so the message matches
+            // the budget that actually fired:
+            //   - per-test (only): time since the last reset, recovered as
+            //     `per_test_timeout - (per_test_deadline - now_at_break)`.
+            //     `armed_at` would over-report after many resets, making
+            //     the message look like the budget was larger than it
+            //     actually was;
+            //   - overall (only) with both `overall_deadline_abs` and
+            //     `overall_timeout` supplied: elapsed since the shared
+            //     cross-launch anchor `overall_deadline_abs -
+            //     overall_timeout` (captured by the `test_filter`
+            //     orchestrator on the first per-binary `build-finished`),
+            //     so the reported value reflects the configured overall
+            //     budget rather than this single launch's local clock;
+            //   - both fired together (rare): fall back to
+            //     `armed_at.elapsed()` — the overall watchdog ran longer
+            //     than the per-test reset window in this case anyway.
+            let elapsed = if per_test_fired
+                && !overall_fired
+                && let (Some(d), Some(t)) = (per_test_deadline, per_test_timeout)
+            {
+                let last_reset = d.checked_sub(t).unwrap_or(start);
+                now.saturating_duration_since(last_reset)
+            } else if overall_fired
                 && !per_test_fired
                 && let (Some(d), Some(t)) = (overall_deadline_abs, overall_timeout)
             {

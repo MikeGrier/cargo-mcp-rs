@@ -340,14 +340,22 @@ fn list_tests(
     }
     // Run under the cancel-token + wall-clock supervisor so a hung test
     // binary (e.g. stuck in global initialization) is killed instead of
-    // wedging the whole `cargo_test` request.
+    // wedging the whole `cargo_test` request. `invoke::TimeoutError` is
+    // passed through unchanged so the orchestrator can detect it via
+    // downcast and substitute an enumeration-specific message (the
+    // default `TimeoutError` Display text mentions "cargo subprocess",
+    // which would be misleading for a test-binary `--list` watchdog).
     let output = invoke::run_subprocess_capture(cmd, working_dir, Some(ENUMERATION_TIMEOUT))
         .map_err(|e| -> Box<dyn std::error::Error> {
-            format!(
-                "failed to enumerate tests via --list on {} ({e})",
-                binary.display()
-            )
-            .into()
+            if e.is::<invoke::TimeoutError>() {
+                e
+            } else {
+                format!(
+                    "failed to enumerate tests via --list on {} ({e})",
+                    binary.display()
+                )
+                .into()
+            }
         })?;
     if output.exit_code != 0 {
         return Err(format!(
@@ -794,7 +802,22 @@ pub fn run(
         match enumerate_tests(&binary.executable, filter.include_ignored, wd) {
             Ok(tests) => enumerated.push((binary, tests)),
             Err(e) => {
-                enumeration_errors.push(format!("{}: {e}", binary.executable.display()));
+                // The default `TimeoutError` Display text mentions "cargo
+                // subprocess", but this path is timing out a *test binary*
+                // (`<binary> --list`) under our enumeration watchdog, not
+                // cargo itself. Substitute an enumeration-specific message
+                // (including the configured budget) so the surfaced error
+                // is not misleading.
+                let msg = if e.is::<invoke::TimeoutError>() {
+                    format!(
+                        "enumeration timed out after {:.1}s (`{} --list` did not finish)",
+                        ENUMERATION_TIMEOUT.as_secs_f64(),
+                        binary.executable.display(),
+                    )
+                } else {
+                    format!("{e}")
+                };
+                enumeration_errors.push(format!("{}: {msg}", binary.executable.display()));
             }
         }
     }
