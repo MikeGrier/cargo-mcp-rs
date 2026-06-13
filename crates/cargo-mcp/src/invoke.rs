@@ -1488,10 +1488,14 @@ pub fn run_cargo_to_file(
 ///
 /// The caller supplies a fully-prepared [`Command`] (program + args + any
 /// process-specific env). This helper adds `Stdio::null()` on stdin and
-/// `Stdio::piped()` on stdout/stderr, applies `working_dir` if given, then
-/// spawns via [`ManagedChild`] so that cancellation and deadline expiry
-/// kill the **entire process tree**. Stdout and stderr are drained on
-/// background threads to prevent pipe-buffer deadlock if the child writes
+/// `Stdio::piped()` on stdout/stderr, installs the same explicit
+/// environment block as the cargo runners (parent env, then built-in
+/// defaults, then the thread-local `EXTRA_ENV` overrides — see
+/// [`build_subprocess_env`]) so per-call `env` parameters apply to
+/// non-cargo helpers too, applies `working_dir` if given, then spawns via
+/// [`ManagedChild`] so that cancellation and deadline expiry kill the
+/// **entire process tree**. Stdout and stderr are drained on background
+/// threads to prevent pipe-buffer deadlock if the child writes
 /// substantial output on both streams.
 ///
 /// Returns the captured output as a [`CargoOutput`] (its three fields —
@@ -1509,6 +1513,15 @@ pub fn run_subprocess_capture(
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // Use the same explicit env block as the cargo-spawning paths so
+    // non-cargo subprocesses (e.g. `<test-binary> --list` enumeration from
+    // `test_filter`) see the per-call `env` overrides installed via
+    // [`set_extra_env`] plus our built-in defaults. Without this, filter
+    // mode would enumerate tests under a different environment than the
+    // build/execution cargo invocations, which can change discovery
+    // behaviour (global init, feature flags via env, etc.) and break the
+    // tool-level contract that `env` applies to the whole operation.
+    cmd.env_clear().envs(build_subprocess_env());
     if let Some(dir) = working_dir {
         cmd.current_dir(dir);
     }
