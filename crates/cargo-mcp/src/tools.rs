@@ -2693,7 +2693,7 @@ fn run_fmt_per_package(
         sections.push(format_text_output(&out, &argv, wd));
     }
     Ok(ToolResult::Text {
-        text: sections.join("\n"),
+        text: sections.join("\n\n"),
         is_error: overall_exit != 0,
     })
 }
@@ -3952,5 +3952,27 @@ mod tests {
         let mut sorted = members.clone();
         sorted.sort();
         assert_eq!(members, sorted, "members must be sorted");
+    }
+
+    /// `run_fmt_per_package` documents that per-package sections are
+    /// joined by *blank lines* — i.e. consumers that split on `\n\n`
+    /// must see one chunk per package. A regression to `join("\n")`
+    /// would silently smash adjacent sections together because
+    /// `format_text_output` does not end its body with a trailing
+    /// newline. Assert the join shape directly so the docstring
+    /// promise stays honest.
+    #[test]
+    fn fmt_section_join_inserts_blank_line_between_sections() {
+        let s1 = format_text_output(&fake_output(0, "first", ""), &["fmt", "-p", "a"], None);
+        let s2 = format_text_output(&fake_output(0, "second", ""), &["fmt", "-p", "b"], None);
+        let joined = [s1.clone(), s2.clone()].join("\n\n");
+        assert!(
+            joined.contains("\n\n"),
+            "joined sections must contain a blank line: {joined:?}",
+        );
+        // Specifically, a blank line between the two sections — not just
+        // somewhere inside one of them.
+        let between = format!("{}\n\n{}", s1.trim_end_matches('\n'), s2);
+        assert_eq!(joined, between, "join shape changed");
     }
 }
