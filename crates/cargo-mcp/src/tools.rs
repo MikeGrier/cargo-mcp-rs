@@ -412,7 +412,7 @@ pub(crate) fn opt_bool(args: &Value, key: &str) -> bool {
     if let Some(b) = coerce_bool(v) {
         return b;
     }
-    let preview = truncate_for_log(&v.to_string(), 200);
+    let preview = preview_value_for_log(v, 200);
     invoke::emit_mcp_log(
         "warning",
         &format!(
@@ -424,20 +424,49 @@ pub(crate) fn opt_bool(args: &Value, key: &str) -> bool {
     false
 }
 
-/// Truncate a string for inclusion in an MCP log notification. If `s` fits
-/// in `max_chars` (counted as Unicode scalar values, not bytes), it is
-/// returned unchanged; otherwise the prefix is kept and a `... (N more
-/// chars truncated)` suffix is appended so the reader can tell the
-/// preview was clipped. Keeps log messages bounded when callers pass a
-/// huge object/array for a field that expected a scalar.
-fn truncate_for_log(s: &str, max_chars: usize) -> String {
-    let total = s.chars().count();
-    if total <= max_chars {
-        return s.to_string();
+/// Produce a bounded, allocation-light preview of a JSON value for an MCP
+/// log notification. Scalars (null/bool/number) are rendered directly;
+/// strings are clipped at `max_chars` Unicode scalars *without* first
+/// materialising the full string when it is long; arrays and objects are
+/// summarised by shape (`<array of N elements>` / `<object with N keys>`)
+/// rather than serialised, so a giant nested structure mistakenly passed
+/// for a boolean never allocates more than the preview itself.
+fn preview_value_for_log(v: &Value, max_chars: usize) -> String {
+    match v {
+        Value::Null => "null".to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::Number(n) => n.to_string(),
+        Value::String(s) => {
+            // Quote like JSON so the reader can tell it was a string,
+            // and clip the inner content without serialising the whole
+            // string first.
+            let inner = truncate_str_for_log(s, max_chars);
+            format!("\"{inner}\"")
+        }
+        Value::Array(a) => format!("<array of {} elements>", a.len()),
+        Value::Object(o) => format!("<object with {} keys>", o.len()),
     }
-    let kept: String = s.chars().take(max_chars).collect();
-    let dropped = total - max_chars;
-    format!("{kept}... ({dropped} more chars truncated)")
+}
+
+/// Clip `s` to at most `max_chars` Unicode scalar values (not bytes). If
+/// truncation is needed, append `... (N more chars truncated)` so the
+/// reader can tell the preview was clipped. Walks the string with
+/// `char_indices` to find the UTF-8 boundary at scalar `max_chars` and
+/// allocates only the kept prefix plus the short suffix — never the full
+/// input as a fresh owned `String`.
+fn truncate_str_for_log(s: &str, max_chars: usize) -> String {
+    let mut iter = s.char_indices();
+    let byte_end = match iter.nth(max_chars) {
+        Some((idx, _)) => idx,
+        None => return s.to_string(),
+    };
+    let dropped = s[byte_end..].chars().count();
+    debug_assert!(dropped > 0);
+    let mut out = String::with_capacity(byte_end + 32);
+    out.push_str(&s[..byte_end]);
+    use std::fmt::Write as _;
+    let _ = write!(out, "... ({dropped} more chars truncated)");
+    out
 }
 
 /// Best-effort coercion of a JSON value to a boolean, accepting the loose
@@ -3994,16 +4023,16 @@ mod tests {
     }
 
     #[test]
-    fn truncate_for_log_passes_through_short_strings() {
-        assert_eq!(truncate_for_log("hello", 200), "hello");
+    fn truncate_str_for_log_passes_through_short_strings() {
+        assert_eq!(truncate_str_for_log("hello", 200), "hello");
         let exactly = "x".repeat(200);
-        assert_eq!(truncate_for_log(&exactly, 200), exactly);
+        assert_eq!(truncate_str_for_log(&exactly, 200), exactly);
     }
 
     #[test]
-    fn truncate_for_log_clips_long_strings_with_marker() {
+    fn truncate_str_for_log_clips_long_strings_with_marker() {
         let long = "x".repeat(500);
-        let got = truncate_for_log(&long, 200);
+        let got = truncate_str_for_log(&long, 200);
         assert!(got.starts_with(&"x".repeat(200)));
         assert!(got.ends_with("... (300 more chars truncated)"));
         // Bounded length: 200 kept + a short fixed suffix.
@@ -4011,14 +4040,58 @@ mod tests {
     }
 
     #[test]
-    fn truncate_for_log_counts_unicode_scalars_not_bytes() {
+    fn truncate_str_for_log_counts_unicode_scalars_not_bytes() {
         // Each emoji is multi-byte in UTF-8 but one Unicode scalar.
         let emoji = "\u{1F600}".repeat(10);
         // Under the limit (10 scalars <= 200): pass-through.
-        assert_eq!(truncate_for_log(&emoji, 200), emoji);
+        assert_eq!(truncate_str_for_log(&emoji, 200), emoji);
         // Over the limit: kept prefix is 3 scalars (not 3 bytes).
-        let got = truncate_for_log(&emoji, 3);
+        let got = truncate_str_for_log(&emoji, 3);
         assert!(got.starts_with(&"\u{1F600}".repeat(3)));
         assert!(got.ends_with("... (7 more chars truncated)"));
+    }
+
+    #[test]
+    fn preview_value_for_log_renders_scalars_directly() {
+        assert_eq!(preview_value_for_log(&serde_json::json!(null), 200), "null");
+        assert_eq!(preview_value_for_log(&serde_json::json!(true), 200), "true");
+        assert_eq!(preview_value_for_log(&serde_json::json!(42), 200), "42");
+        assert_eq!(
+            preview_value_for_log(&serde_json::json!("hi"), 200),
+            "\"hi\""
+        );
+    }
+
+    #[test]
+    fn preview_value_for_log_summarises_arrays_and_objects() {
+        // Huge nested values would explode if we serialised the whole
+        // thing — the preview must summarise by shape instead.
+        let big_array = Value::Array(vec![serde_json::json!("x"); 100_000]);
+        let preview = preview_value_for_log(&big_array, 200);
+        assert_eq!(preview, "<array of 100000 elements>");
+
+        let mut big_obj = serde_json::Map::new();
+        for i in 0..1_000 {
+            big_obj.insert(format!("k{i}"), serde_json::json!(i));
+        }
+        let preview = preview_value_for_log(&Value::Object(big_obj), 200);
+        assert_eq!(preview, "<object with 1000 keys>");
+    }
+
+    #[test]
+    fn preview_value_for_log_clips_huge_strings_without_full_alloc() {
+        // The whole point of the helper: a 10 MB string passed where a
+        // boolean was expected must not be re-allocated in full just to
+        // build the warning. Verify the preview is bounded.
+        let huge = "a".repeat(10_000_000);
+        let preview = preview_value_for_log(&Value::String(huge), 200);
+        // Quoted prefix + clip marker; far below input size.
+        assert!(preview.starts_with("\"aaaaaaaaaa"));
+        assert!(preview.ends_with("more chars truncated)\""));
+        assert!(
+            preview.len() < 260,
+            "preview not bounded: {} chars",
+            preview.len()
+        );
     }
 }
