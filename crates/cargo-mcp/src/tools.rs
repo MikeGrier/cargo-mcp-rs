@@ -121,6 +121,21 @@ for cargo just because a previous step used the terminal.\n\n\
 | `cargo_publish` | `cargo publish` |\n\
 | `cargo_setup` | *(no terminal equivalent)* |\n\
 | `cargo_diagnostic` | *(no terminal equivalent)* |\n\n\
+### Boolean arguments\n\n\
+Every `cargo_*` tool that takes boolean flags (`all_targets`, `release`,\n\
+`workspace`, `lib`, `bins`, `tests`, `benches`, `examples`, `all_features`,\n\
+`no_default_features`, `verbose`, `frozen`, `locked`, `offline`, …)\n\
+expects a JSON boolean (`true` / `false`). The server also accepts the\n\
+loose forms `\"true\"` / `\"false\"` / `\"1\"` / `\"0\"` / `\"yes\"` / `\"no\"` /\n\
+`\"on\"` / `\"off\"` (case-insensitive) and the integers `0` / `1`, because\n\
+some LLM tool-call serializers emit strings or integers instead of native\n\
+booleans. Prefer the canonical native boolean when you have a choice.\n\n\
+A present-but-unrecognised value (e.g. `\"maybe\"`, an object, an integer\n\
+other than 0/1) is treated as `false` and the server emits a `warning`-level\n\
+MCP `notifications/message` naming the field. **If the CLI flag you\n\
+expected (`--all-targets`, `--release`, …) is missing from the echoed\n\
+`x-cargo-mcp-invocation` argv, look for a warning notification — you\n\
+almost certainly sent the boolean in an unrecognised shape.**\n\n\
 ### cargo_test — timeout\n\n\
 When launched by the VS Code extension, `cargo_test` applies a server-side\n\
 default timeout from the `cargo-mcp.test.timeoutSecs` setting (**30 seconds**\n\
@@ -368,9 +383,61 @@ pub(crate) fn opt_str<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
     args.get(key).and_then(|v| v.as_str())
 }
 
-/// Extract an optional boolean field from JSON args (defaults to false).
+/// Extract an optional boolean field from JSON args (defaults to `false`).
+///
+/// Accepts loose JSON shapes that LLM tool-call serializers commonly emit
+/// instead of a strict JSON boolean:
+///
+/// - JSON `true` / `false` (the canonical form)
+/// - Strings `"true"` / `"false"` / `"1"` / `"0"` / `"yes"` / `"no"` /
+///   `"on"` / `"off"` (case-insensitive, surrounding whitespace ignored)
+/// - Integers `1` (true) and `0` (false)
+///
+/// Any present-but-unrecognised shape (e.g. an object, an array, an
+/// unrecognised string, an integer other than 0/1) is treated as `false`
+/// and a `warning`-level MCP `notifications/message` is emitted naming
+/// the field so the agent sees the silent drop instead of getting a
+/// surprising argv. Absent fields stay silent.
 pub(crate) fn opt_bool(args: &Value, key: &str) -> bool {
-    args.get(key).and_then(|v| v.as_bool()).unwrap_or(false)
+    let Some(v) = args.get(key) else {
+        return false;
+    };
+    if let Some(b) = coerce_bool(v) {
+        return b;
+    }
+    invoke::emit_mcp_log(
+        "warning",
+        &format!(
+            "ignoring unrecognised value for boolean argument `{key}`: {v}; \
+             treating as false. Accepted shapes: true/false, \
+             \"true\"/\"false\"/\"1\"/\"0\"/\"yes\"/\"no\"/\"on\"/\"off\", or integers 0/1.",
+        ),
+    );
+    false
+}
+
+/// Best-effort coercion of a JSON value to a boolean, accepting the loose
+/// shapes documented on [`opt_bool`]. Returns `None` when the value is not
+/// recognisable as either truthy or falsy.
+fn coerce_bool(v: &Value) -> Option<bool> {
+    if let Some(b) = v.as_bool() {
+        return Some(b);
+    }
+    if let Some(s) = v.as_str() {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" | "on" => return Some(true),
+            "false" | "0" | "no" | "off" => return Some(false),
+            _ => return None,
+        }
+    }
+    if let Some(n) = v.as_i64() {
+        return match n {
+            1 => Some(true),
+            0 => Some(false),
+            _ => None,
+        };
+    }
+    None
 }
 
 /// Extract an optional integer field from JSON args as its string form, for
@@ -3836,6 +3903,59 @@ mod tests {
             "some random captured output",
         ] {
             assert!(!is_test_summary_line(dropped), "should drop: {dropped:?}");
+        }
+    }
+
+    #[test]
+    fn opt_bool_accepts_native_boolean() {
+        let args = serde_json::json!({ "a": true, "b": false });
+        assert!(opt_bool(&args, "a"));
+        assert!(!opt_bool(&args, "b"));
+    }
+
+    #[test]
+    fn opt_bool_defaults_false_for_absent_field() {
+        let args = serde_json::json!({});
+        assert!(!opt_bool(&args, "missing"));
+    }
+
+    #[test]
+    fn opt_bool_coerces_recognised_string_forms() {
+        for s in ["true", "True", "TRUE", " true ", "1", "yes", "YES", "on"] {
+            let args = serde_json::json!({ "k": s });
+            assert!(opt_bool(&args, "k"), "expected truthy for {s:?}");
+        }
+        for s in ["false", "False", "FALSE", " false ", "0", "no", "NO", "off"] {
+            let args = serde_json::json!({ "k": s });
+            assert!(!opt_bool(&args, "k"), "expected falsy for {s:?}");
+        }
+    }
+
+    #[test]
+    fn opt_bool_coerces_integer_zero_and_one() {
+        assert!(opt_bool(&serde_json::json!({ "k": 1 }), "k"));
+        assert!(!opt_bool(&serde_json::json!({ "k": 0 }), "k"));
+    }
+
+    #[test]
+    fn opt_bool_unrecognised_shape_returns_false() {
+        // Emits a `warning` MCP notification as a side effect; the tested
+        // behaviour here is the returned value, which must default to
+        // `false` so the caller doesn't accidentally pass a stray flag.
+        for v in [
+            serde_json::json!("maybe"),
+            serde_json::json!(2),
+            serde_json::json!(-1),
+            serde_json::json!({}),
+            serde_json::json!([true]),
+            serde_json::json!(null),
+        ] {
+            let args = serde_json::json!({ "k": v });
+            assert!(
+                !opt_bool(&args, "k"),
+                "expected false for unrecognised shape: {}",
+                args["k"],
+            );
         }
     }
 }

@@ -399,7 +399,7 @@ fn log_invocation(path: &Path, source: ResolutionSource, working_dir: Option<&st
 ///
 /// `io::Stdout` uses a reentrant mutex, so locking here is safe even when
 /// the main loop is already holding the stdout lock between message reads.
-fn emit_mcp_log(level: &str, message: &str) {
+pub(crate) fn emit_mcp_log(level: &str, message: &str) {
     let frame = serde_json::json!({
         "jsonrpc": "2.0",
         "method": "notifications/message",
