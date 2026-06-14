@@ -4114,18 +4114,20 @@ mod tests {
 
     #[test]
     fn preview_value_for_log_summarises_arrays_and_objects() {
-        // Huge nested values would explode if we serialised the whole
-        // thing — the preview must summarise by shape instead.
-        let big_array = Value::Array(vec![serde_json::json!("x"); 100_000]);
-        let preview = preview_value_for_log(&big_array, 200);
-        assert_eq!(preview, "<array of 100000 elements>");
+        // Nested values must summarise by shape (length / key-count)
+        // rather than serialising element-by-element. A handful of
+        // entries is enough to verify the formatter — the production
+        // O(1) path is `.len()`, so input size doesn't change coverage.
+        let arr = Value::Array(vec![serde_json::json!("x"); 8]);
+        let preview = preview_value_for_log(&arr, 200);
+        assert_eq!(preview, "<array of 8 elements>");
 
-        let mut big_obj = serde_json::Map::new();
-        for i in 0..1_000 {
-            big_obj.insert(format!("k{i}"), serde_json::json!(i));
+        let mut obj = serde_json::Map::new();
+        for i in 0..4 {
+            obj.insert(format!("k{i}"), serde_json::json!(i));
         }
-        let preview = preview_value_for_log(&Value::Object(big_obj), 200);
-        assert_eq!(preview, "<object with 1000 keys>");
+        let preview = preview_value_for_log(&Value::Object(obj), 200);
+        assert_eq!(preview, "<object with 4 keys>");
     }
 
     #[test]
