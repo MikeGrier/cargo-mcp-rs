@@ -393,15 +393,22 @@ pub(crate) fn opt_str<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
 ///   `"on"` / `"off"` (case-insensitive, surrounding whitespace ignored)
 /// - Integers `1` (true) and `0` (false)
 ///
-/// Any present-but-unrecognised shape (e.g. an object, an array, an
-/// unrecognised string, an integer other than 0/1) is treated as `false`
-/// and a `warning`-level MCP `notifications/message` is emitted naming
-/// the field so the agent sees the silent drop instead of getting a
-/// surprising argv. Absent fields stay silent.
+/// Absent fields and explicit JSON `null` are both treated as `false`
+/// silently, matching the convention of [`opt_str`], [`opt_timeout`],
+/// and [`opt_env`] — some clients serialize a missing optional as
+/// `null` and warning on every such case would create needless log
+/// noise. Any *non-null* present-but-unrecognised shape (e.g. an
+/// object, an array, an unrecognised string, an integer other than
+/// 0/1) is treated as `false` and a `warning`-level MCP
+/// `notifications/message` is emitted naming the field so the agent
+/// sees the silent drop instead of getting a surprising argv.
 pub(crate) fn opt_bool(args: &Value, key: &str) -> bool {
     let Some(v) = args.get(key) else {
         return false;
     };
+    if v.is_null() {
+        return false;
+    }
     if let Some(b) = coerce_bool(v) {
         return b;
     }
@@ -3948,7 +3955,6 @@ mod tests {
             serde_json::json!(-1),
             serde_json::json!({}),
             serde_json::json!([true]),
-            serde_json::json!(null),
         ] {
             let args = serde_json::json!({ "k": v });
             assert!(
@@ -3957,5 +3963,16 @@ mod tests {
                 args["k"],
             );
         }
+    }
+
+    #[test]
+    fn opt_bool_null_treated_as_absent() {
+        // Some clients serialize missing optionals as JSON `null`. That
+        // must behave the same as an absent key (silent `false`),
+        // matching `opt_str`/`opt_timeout`/`opt_env`, so we don't spam
+        // a warning notification for every boolean flag a caller leaves
+        // out as `null`.
+        let args = serde_json::json!({ "k": null });
+        assert!(!opt_bool(&args, "k"));
     }
 }
