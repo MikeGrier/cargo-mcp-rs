@@ -121,6 +121,23 @@ for cargo just because a previous step used the terminal.\n\n\
 | `cargo_publish` | `cargo publish` |\n\
 | `cargo_setup` | *(no terminal equivalent)* |\n\
 | `cargo_diagnostic` | *(no terminal equivalent)* |\n\n\
+### Boolean arguments\n\n\
+Every `cargo_*` tool that takes boolean flags (`all_targets`, `release`,\n\
+`workspace`, `lib`, `bins`, `tests`, `benches`, `examples`, `all_features`,\n\
+`no_default_features`, `verbose`, `frozen`, `locked`, `offline`, …)\n\
+expects a JSON boolean (`true` / `false`). The server also accepts the\n\
+loose forms `\"true\"` / `\"false\"` / `\"1\"` / `\"0\"` / `\"yes\"` / `\"no\"` /\n\
+`\"on\"` / `\"off\"` (case-insensitive) and the integers `0` / `1`, because\n\
+some LLM tool-call serializers emit strings or integers instead of native\n\
+booleans. Prefer the canonical native boolean when you have a choice.\n\n\
+The same coercion applies to nested boolean fields, e.g.\n\
+`cargo_test`'s `test_filter.include_ignored`.\n\n\
+A present-but-unrecognised value (e.g. `\"maybe\"`, an object, an integer\n\
+other than 0/1) is treated as `false` and the server emits a `warning`-level\n\
+MCP `notifications/message` naming the field. **If the CLI flag you\n\
+expected (`--all-targets`, `--release`, …) is missing from the echoed\n\
+`x-cargo-mcp-invocation` argv, look for a warning notification — you\n\
+almost certainly sent the boolean in an unrecognised shape.**\n\n\
 ### cargo_test — timeout\n\n\
 When launched by the VS Code extension, `cargo_test` applies a server-side\n\
 default timeout from the `cargo-mcp.test.timeoutSecs` setting (**30 seconds**\n\
@@ -368,9 +385,141 @@ pub(crate) fn opt_str<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
     args.get(key).and_then(|v| v.as_str())
 }
 
-/// Extract an optional boolean field from JSON args (defaults to false).
+/// Extract an optional boolean field from JSON args (defaults to `false`).
+///
+/// Accepts loose JSON shapes that LLM tool-call serializers commonly emit
+/// instead of a strict JSON boolean:
+///
+/// - JSON `true` / `false` (the canonical form)
+/// - Strings `"true"` / `"false"` / `"1"` / `"0"` / `"yes"` / `"no"` /
+///   `"on"` / `"off"` (case-insensitive, surrounding whitespace ignored)
+/// - Integers `1` (true) and `0` (false)
+///
+/// Absent fields and explicit JSON `null` are both treated as `false`
+/// silently, matching the convention of [`opt_str`], [`opt_timeout`],
+/// and [`opt_env`] — some clients serialize a missing optional as
+/// `null` and warning on every such case would create needless log
+/// noise. Any *non-null* present-but-unrecognised shape (e.g. an
+/// object, an array, an unrecognised string, an integer other than
+/// 0/1) is treated as `false` and a `warning`-level MCP
+/// `notifications/message` is emitted naming the field so the agent
+/// sees the silent drop instead of getting a surprising argv.
 pub(crate) fn opt_bool(args: &Value, key: &str) -> bool {
-    args.get(key).and_then(|v| v.as_bool()).unwrap_or(false)
+    let Some(v) = args.get(key) else {
+        return false;
+    };
+    if v.is_null() {
+        return false;
+    }
+    if let Some(b) = coerce_bool(v) {
+        return b;
+    }
+    let preview = preview_value_for_log(v, 200);
+    invoke::emit_mcp_log(
+        "warning",
+        &format!(
+            "ignoring unrecognised value for boolean argument `{key}`: {preview}; \
+             treating as false. Accepted shapes: true/false, \
+             \"true\"/\"false\"/\"1\"/\"0\"/\"yes\"/\"no\"/\"on\"/\"off\", or integers 0/1.",
+        ),
+    );
+    false
+}
+
+/// Produce a bounded, allocation-light preview of a JSON value for an MCP
+/// log notification. Scalars (null/bool/number) are rendered directly;
+/// strings are clipped at `max_chars` Unicode scalars *without* first
+/// materialising the full string when it is long; arrays and objects are
+/// summarised by shape (`<array of N elements>` / `<object with N keys>`)
+/// rather than serialised, so a giant nested structure mistakenly passed
+/// for a boolean never allocates more than the preview itself.
+fn preview_value_for_log(v: &Value, max_chars: usize) -> String {
+    match v {
+        Value::Null => "null".to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::Number(n) => n.to_string(),
+        Value::String(s) => {
+            // Clip first (bounded work), then render the clipped slice
+            // as a proper JSON string literal so embedded quotes,
+            // backslashes, and control characters (`"`, `\n`, `\\`,
+            // `\u0000`, …) are escaped — the preview is meant to be
+            // human-readable and unambiguous, not a raw byte dump.
+            // `serde_json::to_string` on a bounded `&str` allocates at
+            // most a small multiple of the kept prefix.
+            let inner = truncate_str_for_log(s, max_chars);
+            serde_json::to_string(&inner).unwrap_or_else(|_| format!("\"{inner}\""))
+        }
+        Value::Array(a) => format!("<array of {} elements>", a.len()),
+        Value::Object(o) => format!("<object with {} keys>", o.len()),
+    }
+}
+
+/// Clip `s` to at most `max_chars` Unicode scalar values (not bytes). If
+/// truncation is needed, append `... (N more bytes truncated)` so the
+/// reader can tell the preview was clipped. Walks the string with
+/// `char_indices` to find the UTF-8 boundary at scalar `max_chars`,
+/// then derives the dropped quantity from the remaining byte length
+/// (`s.len() - byte_end`, O(1)) rather than counting characters in the
+/// remainder — counting chars would scan the entire tail and make the
+/// helper O(n) on huge inputs, defeating the fast-reject in
+/// `coerce_bool`. Allocates only the kept prefix plus the short suffix.
+fn truncate_str_for_log(s: &str, max_chars: usize) -> String {
+    let mut iter = s.char_indices();
+    let byte_end = match iter.nth(max_chars) {
+        Some((idx, _)) => idx,
+        None => return s.to_string(),
+    };
+    let dropped_bytes = s.len() - byte_end;
+    debug_assert!(dropped_bytes > 0);
+    let mut out = String::with_capacity(byte_end + 32);
+    out.push_str(&s[..byte_end]);
+    use std::fmt::Write as _;
+    let _ = write!(out, "... ({dropped_bytes} more bytes truncated)");
+    out
+}
+
+/// Best-effort coercion of a JSON value to a boolean, accepting the loose
+/// shapes documented on [`opt_bool`]. Returns `None` when the value is not
+/// recognisable as either truthy or falsy.
+fn coerce_bool(v: &Value) -> Option<bool> {
+    if let Some(b) = v.as_bool() {
+        return Some(b);
+    }
+    if let Some(s) = v.as_str() {
+        let trimmed = s.trim();
+        // Longest accepted token is 5 bytes ("false"). Fast-reject
+        // anything longer *before* doing any per-byte work, so a huge
+        // string passed where a boolean was expected costs O(1) instead
+        // of allocating a fresh lowercased copy (or scanning the whole
+        // input). `eq_ignore_ascii_case` matches case-insensitively
+        // without allocating.
+        if trimmed.len() > 5 {
+            return None;
+        }
+        if trimmed.eq_ignore_ascii_case("true")
+            || trimmed == "1"
+            || trimmed.eq_ignore_ascii_case("yes")
+            || trimmed.eq_ignore_ascii_case("on")
+        {
+            return Some(true);
+        }
+        if trimmed.eq_ignore_ascii_case("false")
+            || trimmed == "0"
+            || trimmed.eq_ignore_ascii_case("no")
+            || trimmed.eq_ignore_ascii_case("off")
+        {
+            return Some(false);
+        }
+        return None;
+    }
+    if let Some(n) = v.as_i64() {
+        return match n {
+            1 => Some(true),
+            0 => Some(false),
+            _ => None,
+        };
+    }
+    None
 }
 
 /// Extract an optional integer field from JSON args as its string form, for
@@ -3837,5 +3986,198 @@ mod tests {
         ] {
             assert!(!is_test_summary_line(dropped), "should drop: {dropped:?}");
         }
+    }
+
+    #[test]
+    fn opt_bool_accepts_native_boolean() {
+        let args = serde_json::json!({ "a": true, "b": false });
+        assert!(opt_bool(&args, "a"));
+        assert!(!opt_bool(&args, "b"));
+    }
+
+    #[test]
+    fn opt_bool_defaults_false_for_absent_field() {
+        let args = serde_json::json!({});
+        assert!(!opt_bool(&args, "missing"));
+    }
+
+    #[test]
+    fn opt_bool_coerces_recognised_string_forms() {
+        for s in ["true", "True", "TRUE", " true ", "1", "yes", "YES", "on"] {
+            let args = serde_json::json!({ "k": s });
+            assert!(opt_bool(&args, "k"), "expected truthy for {s:?}");
+        }
+        for s in ["false", "False", "FALSE", " false ", "0", "no", "NO", "off"] {
+            let args = serde_json::json!({ "k": s });
+            assert!(!opt_bool(&args, "k"), "expected falsy for {s:?}");
+        }
+    }
+
+    #[test]
+    fn opt_bool_coerces_integer_zero_and_one() {
+        assert!(opt_bool(&serde_json::json!({ "k": 1 }), "k"));
+        assert!(!opt_bool(&serde_json::json!({ "k": 0 }), "k"));
+    }
+
+    #[test]
+    fn opt_bool_unrecognised_shape_returns_false() {
+        // Emits a `warning` MCP notification as a side effect; the tested
+        // behaviour here is the returned value, which must default to
+        // `false` so the caller doesn't accidentally pass a stray flag.
+        for v in [
+            serde_json::json!("maybe"),
+            serde_json::json!(2),
+            serde_json::json!(-1),
+            serde_json::json!({}),
+            serde_json::json!([true]),
+        ] {
+            let args = serde_json::json!({ "k": v });
+            assert!(
+                !opt_bool(&args, "k"),
+                "expected false for unrecognised shape: {}",
+                args["k"],
+            );
+        }
+    }
+
+    #[test]
+    fn opt_bool_null_treated_as_absent() {
+        // Some clients serialize missing optionals as JSON `null`. That
+        // must behave the same as an absent key (silent `false`),
+        // matching `opt_str`/`opt_timeout`/`opt_env`, so we don't spam
+        // a warning notification for every boolean flag a caller leaves
+        // out as `null`.
+        let args = serde_json::json!({ "k": null });
+        assert!(!opt_bool(&args, "k"));
+    }
+
+    #[test]
+    fn opt_bool_rejects_huge_string_without_allocating_lowercase() {
+        // A previous revision called `s.trim().to_ascii_lowercase()`,
+        // which allocates a fresh `String` proportional to the entire
+        // input — so a 1 MB string passed where a boolean was expected
+        // would cost a 1 MB allocation and a full-string scan even
+        // though no accepted token is longer than 5 bytes. The fast-
+        // reject `trimmed.len() > 5` path must keep this an O(1)
+        // rejection. We can't easily measure allocations from a test,
+        // but we can assert behaviour: a 1 MB input returns `false` and
+        // the test wall-clock stays bounded (huge strings here would
+        // make the suite flake on slow CI).
+        let huge = "a".repeat(1_000_000);
+        let args = serde_json::json!({ "k": huge });
+        assert!(!opt_bool(&args, "k"));
+    }
+
+    #[test]
+    fn truncate_str_for_log_passes_through_short_strings() {
+        assert_eq!(truncate_str_for_log("hello", 200), "hello");
+        let exactly = "x".repeat(200);
+        assert_eq!(truncate_str_for_log(&exactly, 200), exactly);
+    }
+
+    #[test]
+    fn truncate_str_for_log_clips_long_strings_with_marker() {
+        let long = "x".repeat(500);
+        let got = truncate_str_for_log(&long, 200);
+        assert!(got.starts_with(&"x".repeat(200)));
+        // ASCII: dropped chars == dropped bytes (300).
+        assert!(got.ends_with("... (300 more bytes truncated)"));
+        // Bounded length: 200 kept + a short fixed suffix.
+        assert!(got.len() < 260, "preview not bounded: {} chars", got.len());
+    }
+
+    #[test]
+    fn truncate_str_for_log_counts_kept_in_scalars_dropped_in_bytes() {
+        // Each emoji is multi-byte in UTF-8 (4 bytes) but one Unicode
+        // scalar. We clip the kept prefix at scalar boundaries (so we
+        // never split a codepoint) but report the dropped quantity in
+        // bytes — counting dropped *chars* would scan the entire tail
+        // and make the helper O(n) on huge inputs.
+        let emoji = "\u{1F600}".repeat(10);
+        // Under the limit (10 scalars <= 200): pass-through.
+        assert_eq!(truncate_str_for_log(&emoji, 200), emoji);
+        // Over the limit: kept prefix is 3 scalars (not 3 bytes), and
+        // the remaining 7 scalars are reported as 7 * 4 = 28 bytes.
+        let got = truncate_str_for_log(&emoji, 3);
+        assert!(got.starts_with(&"\u{1F600}".repeat(3)));
+        assert!(got.ends_with("... (28 more bytes truncated)"));
+    }
+
+    #[test]
+    fn preview_value_for_log_renders_scalars_directly() {
+        assert_eq!(preview_value_for_log(&serde_json::json!(null), 200), "null");
+        assert_eq!(preview_value_for_log(&serde_json::json!(true), 200), "true");
+        assert_eq!(preview_value_for_log(&serde_json::json!(42), 200), "42");
+        assert_eq!(
+            preview_value_for_log(&serde_json::json!("hi"), 200),
+            "\"hi\""
+        );
+    }
+
+    #[test]
+    fn preview_value_for_log_summarises_arrays_and_objects() {
+        // Nested values must summarise by shape (length / key-count)
+        // rather than serialising element-by-element. A handful of
+        // entries is enough to verify the formatter — the production
+        // O(1) path is `.len()`, so input size doesn't change coverage.
+        let arr = Value::Array(vec![serde_json::json!("x"); 8]);
+        let preview = preview_value_for_log(&arr, 200);
+        assert_eq!(preview, "<array of 8 elements>");
+
+        let mut obj = serde_json::Map::new();
+        for i in 0..4 {
+            obj.insert(format!("k{i}"), serde_json::json!(i));
+        }
+        let preview = preview_value_for_log(&Value::Object(obj), 200);
+        assert_eq!(preview, "<object with 4 keys>");
+    }
+
+    #[test]
+    fn preview_value_for_log_clips_huge_strings_without_full_alloc() {
+        // The whole point of the helper: a string passed where a
+        // boolean was expected must not be re-allocated in full just to
+        // build the warning. 10 KB is two orders of magnitude over the
+        // 200-char clip budget here, which is plenty to demonstrate
+        // bounded output without paying the multi-megabyte allocation
+        // cost in every test run.
+        let huge = "a".repeat(10_000);
+        let preview = preview_value_for_log(&Value::String(huge), 200);
+        // Quoted prefix + clip marker; far below input size.
+        assert!(preview.starts_with("\"aaaaaaaaaa"));
+        assert!(preview.ends_with("more bytes truncated)\""));
+        assert!(
+            preview.len() < 260,
+            "preview not bounded: {} chars",
+            preview.len()
+        );
+    }
+
+    #[test]
+    fn preview_value_for_log_escapes_quotes_backslashes_and_control_chars() {
+        // String previews must be valid JSON string literals so embedded
+        // `"`, `\`, and control characters don't make the warning
+        // ambiguous (or accidentally close the surrounding quote). The
+        // result must round-trip back through `serde_json::from_str` as
+        // the original (possibly clipped) string.
+        let s = "she said \"hi\"\nthen \\ slashed";
+        let preview = preview_value_for_log(&Value::String(s.to_string()), 200);
+        let parsed: String = serde_json::from_str(&preview).unwrap_or_else(|e| {
+            panic!("preview is not a valid JSON string literal: {preview:?} ({e})")
+        });
+        assert_eq!(parsed, s);
+        // And the raw escapes appear in the preview (not the literal
+        // bytes) — guards against a regression to bare `format!`.
+        assert!(
+            preview.contains("\\\""),
+            "missing escaped quote: {preview:?}"
+        );
+        assert!(
+            preview.contains("\\\\"),
+            "missing escaped backslash: {preview:?}"
+        );
+        assert!(
+            preview.contains("\\n"),
+            "missing escaped newline: {preview:?}"
+        );
     }
 }

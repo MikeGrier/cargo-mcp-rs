@@ -848,10 +848,11 @@ fn registry_label(pkg_id: &str) -> Option<String> {
 /// cargo's own precedence.
 fn profile_tag(args: &Value) -> String {
     let explicit = args.get("profile").and_then(|v| v.as_str());
-    let release = args
-        .get("release")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    // Route through `opt_bool` so `release: "true"` / `release: 1` / etc.
+    // coerce identically to how the tool dispatcher reads the same field,
+    // and an unrecognised shape produces the same MCP warning rather than
+    // silently tagging a release build as `[D]`.
+    let release = tools::opt_bool(args, "release");
     let name = match explicit {
         Some(p) => p,
         None if release => "release",

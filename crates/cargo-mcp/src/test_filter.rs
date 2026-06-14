@@ -105,10 +105,11 @@ impl FilterArgs {
         let regex = Regex::new(&pattern).map_err(|e| -> Box<dyn std::error::Error> {
             format!("test_filter.pattern is not a valid regex: {e}").into()
         })?;
-        let include_ignored = obj
-            .get("include_ignored")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        // Coerce via `opt_bool` so loose JSON shapes
+        // (`include_ignored: "true"` etc.) behave the same as for every
+        // other boolean tool argument, instead of being silently dropped
+        // to `false` and surprising the caller.
+        let include_ignored = tools::opt_bool(v, "include_ignored");
         Ok(Some(Self {
             regex,
             pattern_source: pattern,
