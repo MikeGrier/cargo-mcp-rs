@@ -4132,10 +4132,13 @@ mod tests {
 
     #[test]
     fn preview_value_for_log_clips_huge_strings_without_full_alloc() {
-        // The whole point of the helper: a 10 MB string passed where a
+        // The whole point of the helper: a string passed where a
         // boolean was expected must not be re-allocated in full just to
-        // build the warning. Verify the preview is bounded.
-        let huge = "a".repeat(10_000_000);
+        // build the warning. 10 KB is two orders of magnitude over the
+        // 200-char clip budget here, which is plenty to demonstrate
+        // bounded output without paying the multi-megabyte allocation
+        // cost in every test run.
+        let huge = "a".repeat(10_000);
         let preview = preview_value_for_log(&Value::String(huge), 200);
         // Quoted prefix + clip marker; far below input size.
         assert!(preview.starts_with("\"aaaaaaaaaa"));
