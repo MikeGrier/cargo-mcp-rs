@@ -453,23 +453,26 @@ fn preview_value_for_log(v: &Value, max_chars: usize) -> String {
 }
 
 /// Clip `s` to at most `max_chars` Unicode scalar values (not bytes). If
-/// truncation is needed, append `... (N more chars truncated)` so the
+/// truncation is needed, append `... (N more bytes truncated)` so the
 /// reader can tell the preview was clipped. Walks the string with
-/// `char_indices` to find the UTF-8 boundary at scalar `max_chars` and
-/// allocates only the kept prefix plus the short suffix — never the full
-/// input as a fresh owned `String`.
+/// `char_indices` to find the UTF-8 boundary at scalar `max_chars`,
+/// then derives the dropped quantity from the remaining byte length
+/// (`s.len() - byte_end`, O(1)) rather than counting characters in the
+/// remainder — counting chars would scan the entire tail and make the
+/// helper O(n) on huge inputs, defeating the fast-reject in
+/// `coerce_bool`. Allocates only the kept prefix plus the short suffix.
 fn truncate_str_for_log(s: &str, max_chars: usize) -> String {
     let mut iter = s.char_indices();
     let byte_end = match iter.nth(max_chars) {
         Some((idx, _)) => idx,
         None => return s.to_string(),
     };
-    let dropped = s[byte_end..].chars().count();
-    debug_assert!(dropped > 0);
+    let dropped_bytes = s.len() - byte_end;
+    debug_assert!(dropped_bytes > 0);
     let mut out = String::with_capacity(byte_end + 32);
     out.push_str(&s[..byte_end]);
     use std::fmt::Write as _;
-    let _ = write!(out, "... ({dropped} more chars truncated)");
+    let _ = write!(out, "... ({dropped_bytes} more bytes truncated)");
     out
 }
 
@@ -4075,21 +4078,27 @@ mod tests {
         let long = "x".repeat(500);
         let got = truncate_str_for_log(&long, 200);
         assert!(got.starts_with(&"x".repeat(200)));
-        assert!(got.ends_with("... (300 more chars truncated)"));
+        // ASCII: dropped chars == dropped bytes (300).
+        assert!(got.ends_with("... (300 more bytes truncated)"));
         // Bounded length: 200 kept + a short fixed suffix.
         assert!(got.len() < 260, "preview not bounded: {} chars", got.len());
     }
 
     #[test]
-    fn truncate_str_for_log_counts_unicode_scalars_not_bytes() {
-        // Each emoji is multi-byte in UTF-8 but one Unicode scalar.
+    fn truncate_str_for_log_counts_kept_in_scalars_dropped_in_bytes() {
+        // Each emoji is multi-byte in UTF-8 (4 bytes) but one Unicode
+        // scalar. We clip the kept prefix at scalar boundaries (so we
+        // never split a codepoint) but report the dropped quantity in
+        // bytes — counting dropped *chars* would scan the entire tail
+        // and make the helper O(n) on huge inputs.
         let emoji = "\u{1F600}".repeat(10);
         // Under the limit (10 scalars <= 200): pass-through.
         assert_eq!(truncate_str_for_log(&emoji, 200), emoji);
-        // Over the limit: kept prefix is 3 scalars (not 3 bytes).
+        // Over the limit: kept prefix is 3 scalars (not 3 bytes), and
+        // the remaining 7 scalars are reported as 7 * 4 = 28 bytes.
         let got = truncate_str_for_log(&emoji, 3);
         assert!(got.starts_with(&"\u{1F600}".repeat(3)));
-        assert!(got.ends_with("... (7 more chars truncated)"));
+        assert!(got.ends_with("... (28 more bytes truncated)"));
     }
 
     #[test]
@@ -4128,7 +4137,7 @@ mod tests {
         let preview = preview_value_for_log(&Value::String(huge), 200);
         // Quoted prefix + clip marker; far below input size.
         assert!(preview.starts_with("\"aaaaaaaaaa"));
-        assert!(preview.ends_with("more chars truncated)\""));
+        assert!(preview.ends_with("more bytes truncated)\""));
         assert!(
             preview.len() < 260,
             "preview not bounded: {} chars",
