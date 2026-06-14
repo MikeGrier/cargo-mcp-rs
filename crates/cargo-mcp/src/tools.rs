@@ -412,15 +412,32 @@ pub(crate) fn opt_bool(args: &Value, key: &str) -> bool {
     if let Some(b) = coerce_bool(v) {
         return b;
     }
+    let preview = truncate_for_log(&v.to_string(), 200);
     invoke::emit_mcp_log(
         "warning",
         &format!(
-            "ignoring unrecognised value for boolean argument `{key}`: {v}; \
+            "ignoring unrecognised value for boolean argument `{key}`: {preview}; \
              treating as false. Accepted shapes: true/false, \
              \"true\"/\"false\"/\"1\"/\"0\"/\"yes\"/\"no\"/\"on\"/\"off\", or integers 0/1.",
         ),
     );
     false
+}
+
+/// Truncate a string for inclusion in an MCP log notification. If `s` fits
+/// in `max_chars` (counted as Unicode scalar values, not bytes), it is
+/// returned unchanged; otherwise the prefix is kept and a `... (N more
+/// chars truncated)` suffix is appended so the reader can tell the
+/// preview was clipped. Keeps log messages bounded when callers pass a
+/// huge object/array for a field that expected a scalar.
+fn truncate_for_log(s: &str, max_chars: usize) -> String {
+    let total = s.chars().count();
+    if total <= max_chars {
+        return s.to_string();
+    }
+    let kept: String = s.chars().take(max_chars).collect();
+    let dropped = total - max_chars;
+    format!("{kept}... ({dropped} more chars truncated)")
 }
 
 /// Best-effort coercion of a JSON value to a boolean, accepting the loose
@@ -3974,5 +3991,34 @@ mod tests {
         // out as `null`.
         let args = serde_json::json!({ "k": null });
         assert!(!opt_bool(&args, "k"));
+    }
+
+    #[test]
+    fn truncate_for_log_passes_through_short_strings() {
+        assert_eq!(truncate_for_log("hello", 200), "hello");
+        let exactly = "x".repeat(200);
+        assert_eq!(truncate_for_log(&exactly, 200), exactly);
+    }
+
+    #[test]
+    fn truncate_for_log_clips_long_strings_with_marker() {
+        let long = "x".repeat(500);
+        let got = truncate_for_log(&long, 200);
+        assert!(got.starts_with(&"x".repeat(200)));
+        assert!(got.ends_with("... (300 more chars truncated)"));
+        // Bounded length: 200 kept + a short fixed suffix.
+        assert!(got.len() < 260, "preview not bounded: {} chars", got.len());
+    }
+
+    #[test]
+    fn truncate_for_log_counts_unicode_scalars_not_bytes() {
+        // Each emoji is multi-byte in UTF-8 but one Unicode scalar.
+        let emoji = "\u{1F600}".repeat(10);
+        // Under the limit (10 scalars <= 200): pass-through.
+        assert_eq!(truncate_for_log(&emoji, 200), emoji);
+        // Over the limit: kept prefix is 3 scalars (not 3 bytes).
+        let got = truncate_for_log(&emoji, 3);
+        assert!(got.starts_with(&"\u{1F600}".repeat(3)));
+        assert!(got.ends_with("... (7 more chars truncated)"));
     }
 }
