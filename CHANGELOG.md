@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.7.1](https://github.com/MikeGrier/cargo-mcp-rs/compare/v0.7.0...v0.7.1) (2026-06-14)
+
+
+### Bug Fixes
+
+* **cargo-mcp:** coerce loose JSON shapes for boolean tool args + warn on silent drop ([33b6c6c](https://github.com/MikeGrier/cargo-mcp-rs/commit/33b6c6cda7e0001cd26e37eb409cbb1f8ef5f826))
+* **tools:** bound warning preview for unrecognised boolean values ([339ee2d](https://github.com/MikeGrier/cargo-mcp-rs/commit/339ee2d96acc3e141d461c955459b03834c91662))
+* **tools:** coerce boolean strings without allocating lowercase copy ([061a642](https://github.com/MikeGrier/cargo-mcp-rs/commit/061a642adb58293b1ddbe759cc5f85170ac6d466))
+* **tools:** coerce loose JSON shapes for boolean tool args + warn on silent drop ([4205f83](https://github.com/MikeGrier/cargo-mcp-rs/commit/4205f83d9dd5804c403a25f5c84a93c9ee4e92f9))
+* **tools:** JSON-escape string previews in opt_bool warnings ([536741c](https://github.com/MikeGrier/cargo-mcp-rs/commit/536741c1325b6aa182e0aafa5a6315a72871fe94))
+* **tools:** preview boolean warning without serialising full JSON value ([31fe211](https://github.com/MikeGrier/cargo-mcp-rs/commit/31fe2111076ce2c0754ae29e815efc6e750cdd40))
+* **tools:** report dropped bytes (O(1)) instead of dropped chars (O(n)) ([7531459](https://github.com/MikeGrier/cargo-mcp-rs/commit/75314596c047048742259b9d4077b74954084f5e))
+* **tools:** route remaining boolean tool args through opt_bool ([aad64d6](https://github.com/MikeGrier/cargo-mcp-rs/commit/aad64d613340a34de9954c88e299b05a3bb848c5))
+* **tools:** treat null as absent in opt_bool to avoid spurious warnings ([60d65e4](https://github.com/MikeGrier/cargo-mcp-rs/commit/60d65e4d61928329bcc7c7ca46a2abcfb8e22cf0))
+
 ## [0.7.0](https://github.com/MikeGrier/cargo-mcp-rs/compare/v0.6.2...v0.7.0) (2026-06-13)
 
 
