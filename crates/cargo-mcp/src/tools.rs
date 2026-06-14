@@ -437,11 +437,15 @@ fn preview_value_for_log(v: &Value, max_chars: usize) -> String {
         Value::Bool(b) => b.to_string(),
         Value::Number(n) => n.to_string(),
         Value::String(s) => {
-            // Quote like JSON so the reader can tell it was a string,
-            // and clip the inner content without serialising the whole
-            // string first.
+            // Clip first (bounded work), then render the clipped slice
+            // as a proper JSON string literal so embedded quotes,
+            // backslashes, and control characters (`"`, `\n`, `\\`,
+            // `\u0000`, …) are escaped — the preview is meant to be
+            // human-readable and unambiguous, not a raw byte dump.
+            // `serde_json::to_string` on a bounded `&str` allocates at
+            // most a small multiple of the kept prefix.
             let inner = truncate_str_for_log(s, max_chars);
-            format!("\"{inner}\"")
+            serde_json::to_string(&inner).unwrap_or_else(|_| format!("\"{inner}\""))
         }
         Value::Array(a) => format!("<array of {} elements>", a.len()),
         Value::Object(o) => format!("<object with {} keys>", o.len()),
@@ -4129,6 +4133,35 @@ mod tests {
             preview.len() < 260,
             "preview not bounded: {} chars",
             preview.len()
+        );
+    }
+
+    #[test]
+    fn preview_value_for_log_escapes_quotes_backslashes_and_control_chars() {
+        // String previews must be valid JSON string literals so embedded
+        // `"`, `\`, and control characters don't make the warning
+        // ambiguous (or accidentally close the surrounding quote). The
+        // result must round-trip back through `serde_json::from_str` as
+        // the original (possibly clipped) string.
+        let s = "she said \"hi\"\nthen \\ slashed";
+        let preview = preview_value_for_log(&Value::String(s.to_string()), 200);
+        let parsed: String = serde_json::from_str(&preview).unwrap_or_else(|e| {
+            panic!("preview is not a valid JSON string literal: {preview:?} ({e})")
+        });
+        assert_eq!(parsed, s);
+        // And the raw escapes appear in the preview (not the literal
+        // bytes) — guards against a regression to bare `format!`.
+        assert!(
+            preview.contains("\\\""),
+            "missing escaped quote: {preview:?}"
+        );
+        assert!(
+            preview.contains("\\\\"),
+            "missing escaped backslash: {preview:?}"
+        );
+        assert!(
+            preview.contains("\\n"),
+            "missing escaped newline: {preview:?}"
         );
     }
 }
