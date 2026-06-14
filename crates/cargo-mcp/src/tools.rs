@@ -477,11 +477,31 @@ fn coerce_bool(v: &Value) -> Option<bool> {
         return Some(b);
     }
     if let Some(s) = v.as_str() {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "true" | "1" | "yes" | "on" => return Some(true),
-            "false" | "0" | "no" | "off" => return Some(false),
-            _ => return None,
+        let trimmed = s.trim();
+        // Longest accepted token is 5 bytes ("false"). Fast-reject
+        // anything longer *before* doing any per-byte work, so a huge
+        // string passed where a boolean was expected costs O(1) instead
+        // of allocating a fresh lowercased copy (or scanning the whole
+        // input). `eq_ignore_ascii_case` matches case-insensitively
+        // without allocating.
+        if trimmed.len() > 5 {
+            return None;
         }
+        if trimmed.eq_ignore_ascii_case("true")
+            || trimmed == "1"
+            || trimmed.eq_ignore_ascii_case("yes")
+            || trimmed.eq_ignore_ascii_case("on")
+        {
+            return Some(true);
+        }
+        if trimmed.eq_ignore_ascii_case("false")
+            || trimmed == "0"
+            || trimmed.eq_ignore_ascii_case("no")
+            || trimmed.eq_ignore_ascii_case("off")
+        {
+            return Some(false);
+        }
+        return None;
     }
     if let Some(n) = v.as_i64() {
         return match n {
@@ -4019,6 +4039,23 @@ mod tests {
         // a warning notification for every boolean flag a caller leaves
         // out as `null`.
         let args = serde_json::json!({ "k": null });
+        assert!(!opt_bool(&args, "k"));
+    }
+
+    #[test]
+    fn opt_bool_rejects_huge_string_without_allocating_lowercase() {
+        // A previous revision called `s.trim().to_ascii_lowercase()`,
+        // which allocates a fresh `String` proportional to the entire
+        // input — so a 1 MB string passed where a boolean was expected
+        // would cost a 1 MB allocation and a full-string scan even
+        // though no accepted token is longer than 5 bytes. The fast-
+        // reject `trimmed.len() > 5` path must keep this an O(1)
+        // rejection. We can't easily measure allocations from a test,
+        // but we can assert behaviour: a 1 MB input returns `false` and
+        // the test wall-clock stays bounded (huge strings here would
+        // make the suite flake on slow CI).
+        let huge = "a".repeat(1_000_000);
+        let args = serde_json::json!({ "k": huge });
         assert!(!opt_bool(&args, "k"));
     }
 
