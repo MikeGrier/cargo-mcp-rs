@@ -130,6 +130,8 @@ loose forms `\"true\"` / `\"false\"` / `\"1\"` / `\"0\"` / `\"yes\"` / `\"no\"` 
 `\"on\"` / `\"off\"` (case-insensitive) and the integers `0` / `1`, because\n\
 some LLM tool-call serializers emit strings or integers instead of native\n\
 booleans. Prefer the canonical native boolean when you have a choice.\n\n\
+The same coercion applies to nested boolean fields, e.g.\n\
+`cargo_test`'s `test_filter.include_ignored`.\n\n\
 A present-but-unrecognised value (e.g. `\"maybe\"`, an object, an integer\n\
 other than 0/1) is treated as `false` and the server emits a `warning`-level\n\
 MCP `notifications/message` naming the field. **If the CLI flag you\n\
