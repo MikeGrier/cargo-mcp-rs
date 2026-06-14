@@ -2616,43 +2616,126 @@ fn call_clippy(
 }
 
 fn call_fmt_check(args: &Value) -> Result<ToolResult, Box<dyn std::error::Error>> {
-    let wd = opt_str(args, "working_dir");
-    let tc = toolchain_arg(args);
-    let mut argv: Vec<&str> = vec!["fmt", "--check"];
-    let pkg = opt_str(args, "package").map(String::from);
-    if let Some(ref p) = pkg {
-        argv.push("--package");
-        argv.push(p);
-    }
-    if let Some(ref t) = tc {
-        argv.insert(0, t);
-    }
-    let out = invoke::run_cargo(&argv, wd)?;
-    let is_error = out.exit_code != 0;
-    Ok(ToolResult::Text {
-        text: format_text_output(&out, &argv, wd),
-        is_error,
-    })
+    run_fmt_per_package(args, /* check */ true)
 }
 
 fn call_fmt(args: &Value) -> Result<ToolResult, Box<dyn std::error::Error>> {
+    run_fmt_per_package(args, /* check */ false)
+}
+
+/// Shared body of `cargo_fmt` and `cargo_fmt_check`.
+///
+/// Rather than running a single `cargo fmt` at the workspace root,
+/// enumerate workspace members via `cargo metadata` and run
+/// `cargo [+toolchain] fmt [--check] -p <pkg>` once per member. The
+/// observable result is the same — every member is formatted (or
+/// checked) — but each invocation's argv stays small. A single
+/// `cargo fmt` over a workspace with many source files can blow past
+/// Windows' ~32 KB argv limit and abort with `os error 206 (The
+/// filename or extension is too long.)` before formatting anything;
+/// per-package keeps the worst case bounded by the largest single
+/// package instead of the whole workspace.
+///
+/// When the caller passes an explicit `package`, the metadata step is
+/// skipped and a single per-package invocation runs (preserving the
+/// previous behaviour for that case).
+///
+/// Output: one `format_text_output` block per invocation, joined by
+/// blank lines. Aggregate `is_error` is true iff any invocation
+/// exited non-zero.
+fn run_fmt_per_package(
+    args: &Value,
+    check: bool,
+) -> Result<ToolResult, Box<dyn std::error::Error>> {
     let wd = opt_str(args, "working_dir");
     let tc = toolchain_arg(args);
-    let mut argv: Vec<&str> = vec!["fmt"];
-    let pkg = opt_str(args, "package").map(String::from);
-    if let Some(ref p) = pkg {
-        argv.push("--package");
-        argv.push(p);
+    let user_pkg = opt_str(args, "package").map(String::from);
+
+    let pkgs: Vec<String> = match user_pkg {
+        Some(p) => vec![p],
+        None => list_workspace_members(wd, tc.as_deref())?,
+    };
+
+    if pkgs.is_empty() {
+        // No workspace members found (extremely unusual — a virtual
+        // workspace with zero members). Synthesize a single header-only
+        // success so the caller still sees a structured response.
+        let mut argv: Vec<&str> = vec!["fmt"];
+        if check {
+            argv.push("--check");
+        }
+        if let Some(ref t) = tc {
+            argv.insert(0, t);
+        }
+        let header = invocation_header(&argv, wd);
+        return Ok(ToolResult::Text {
+            text: format!("{header}(no workspace members found)"),
+            is_error: false,
+        });
     }
-    if let Some(ref t) = tc {
+
+    let mut sections: Vec<String> = Vec::with_capacity(pkgs.len());
+    let mut overall_exit: i32 = 0;
+    for pkg in &pkgs {
+        let mut argv: Vec<&str> = vec!["fmt"];
+        if check {
+            argv.push("--check");
+        }
+        argv.push("--package");
+        argv.push(pkg);
+        if let Some(ref t) = tc {
+            argv.insert(0, t);
+        }
+        let out = invoke::run_cargo(&argv, wd)?;
+        if overall_exit == 0 && out.exit_code != 0 {
+            overall_exit = out.exit_code;
+        }
+        sections.push(format_text_output(&out, &argv, wd));
+    }
+    Ok(ToolResult::Text {
+        text: sections.join("\n\n"),
+        is_error: overall_exit != 0,
+    })
+}
+
+/// Enumerate workspace member package names by shelling out to
+/// `cargo metadata --no-deps --format-version=1` at `wd` (with an
+/// optional toolchain override) and parsing the response with the
+/// `cargo_metadata` crate.
+///
+/// Routing through `invoke::run_cargo` (instead of
+/// `cargo_metadata::MetadataCommand::exec()` directly) keeps the
+/// same toolchain / working-dir / env handling that every other
+/// cargo invocation in cargo-mcp uses.
+fn list_workspace_members(
+    wd: Option<&str>,
+    tc: Option<&str>,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let mut argv: Vec<&str> = vec!["metadata", "--no-deps", "--format-version=1"];
+    if let Some(t) = tc {
         argv.insert(0, t);
     }
     let out = invoke::run_cargo(&argv, wd)?;
-    let is_error = out.exit_code != 0;
-    Ok(ToolResult::Text {
-        text: format_text_output(&out, &argv, wd),
-        is_error,
-    })
+    if out.exit_code != 0 {
+        return Err(format!(
+            "cargo metadata failed (exit {}); cannot enumerate workspace members for fmt: {}",
+            out.exit_code,
+            out.stderr.trim(),
+        )
+        .into());
+    }
+    let meta = cargo_metadata::MetadataCommand::parse(&out.stdout)?;
+    let members: std::collections::HashSet<&cargo_metadata::PackageId> =
+        meta.workspace_members.iter().collect();
+    let mut names: Vec<String> = meta
+        .packages
+        .iter()
+        .filter(|p| members.contains(&p.id))
+        .map(|p| p.name.to_string())
+        .collect();
+    names.sort();
+    names.dedup();
+    Ok(names)
 }
 
 fn call_tree(args: &Value) -> Result<ToolResult, Box<dyn std::error::Error>> {
@@ -3837,5 +3920,59 @@ mod tests {
         ] {
             assert!(!is_test_summary_line(dropped), "should drop: {dropped:?}");
         }
+    }
+
+    /// `list_workspace_members` shells out to `cargo metadata` and parses
+    /// the result with the `cargo_metadata` crate. Point it at this
+    /// workspace's root and verify it sees the expected members. This
+    /// covers the cargo-invocation wiring (toolchain prefix slot,
+    /// argv shape, exit-code handling) and the metadata-crate parse path
+    /// — the two failure modes that would silently leave fmt running on
+    /// the wrong set of packages.
+    #[test]
+    fn list_workspace_members_finds_this_workspace() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let workspace_root = std::path::Path::new(manifest_dir)
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("workspace root is two levels above CARGO_MANIFEST_DIR")
+            .to_string_lossy()
+            .into_owned();
+        let members = list_workspace_members(Some(&workspace_root), None)
+            .expect("cargo metadata should succeed on this workspace");
+        assert!(
+            members.contains(&"cargo-mcp".to_string()),
+            "expected `cargo-mcp` in members, got {members:?}",
+        );
+        assert!(
+            members.contains(&"rm-test-helpers".to_string()),
+            "expected `rm-test-helpers` in members, got {members:?}",
+        );
+        // Sorted + dedup'd is documented behaviour; assert it.
+        let mut sorted = members.clone();
+        sorted.sort();
+        assert_eq!(members, sorted, "members must be sorted");
+    }
+
+    /// `run_fmt_per_package` documents that per-package sections are
+    /// joined by *blank lines* — i.e. consumers that split on `\n\n`
+    /// must see one chunk per package. A regression to `join("\n")`
+    /// would silently smash adjacent sections together because
+    /// `format_text_output` does not end its body with a trailing
+    /// newline. Assert the join shape directly so the docstring
+    /// promise stays honest.
+    #[test]
+    fn fmt_section_join_inserts_blank_line_between_sections() {
+        let s1 = format_text_output(&fake_output(0, "first", ""), &["fmt", "-p", "a"], None);
+        let s2 = format_text_output(&fake_output(0, "second", ""), &["fmt", "-p", "b"], None);
+        let joined = [s1.clone(), s2.clone()].join("\n\n");
+        assert!(
+            joined.contains("\n\n"),
+            "joined sections must contain a blank line: {joined:?}",
+        );
+        // Specifically, a blank line between the two sections — not just
+        // somewhere inside one of them.
+        let between = format!("{}\n\n{}", s1.trim_end_matches('\n'), s2);
+        assert_eq!(joined, between, "join shape changed");
     }
 }

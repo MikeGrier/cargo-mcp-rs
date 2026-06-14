@@ -30,6 +30,7 @@ path = "src/main.rs"
 serde       = { workspace = true }
 serde_json  = { workspace = true }
 regex       = { workspace = true }
+cargo_metadata = "0.23.1"
 
 # Windows-only Restart Manager bindings, used by `src/rm/` to ask the OS
 # which process is holding a file in `target\` open after a sharing
