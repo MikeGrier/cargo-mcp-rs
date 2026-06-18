@@ -702,6 +702,45 @@ the path-extraction step still runs but no holder lookup is performed
 
 ---
 
+## Incremental-session finalise advisory (Windows Dev Drive / ReFS)
+
+On Windows volumes that use ReFS — including Dev Drive — rustc occasionally
+cannot rename the `-working` incremental compilation session directory to its
+final name after a build. When this happens rustc emits:
+
+```
+warning: error finalizing incremental compilation session directory `...`: ...
+```
+
+This is an advisory about the incremental cache, not about the source code.
+The build itself succeeded. The only consequence is that **the next build
+cannot reuse work from this compilation** — it falls back to a full rebuild
+for the affected crate.
+
+cargo-mcp handles this in two ways:
+
+**Proactive cleanup (`--clear-incr-working`)** — if the `--clear-incr-working=true`
+flag is passed at startup (or `cargo-mcp.clearIncrWorking` is enabled in VS Code
+settings), cargo-mcp walks `target/<profile>/incremental/` before each cargo
+invocation and removes any stale `*-working` directories left behind by a
+previous failed finalise. This prevents the rename from failing in the first
+place on the next run.
+
+**Diagnostic demotion** — the advisory is demoted from `warning` (or `error`
+when `-D warnings` is active) to `note` in the NDJSON stream that
+cargo-mcp returns. This keeps it out of the error summary and prevents it
+from being mistaken for a compile failure.
+
+If the advisory is the **only** reason cargo exited non-zero (which only
+happens when `-D warnings` is active), cargo-mcp overrides the exit code to
+0 and injects an `x-cargo-mcp-note` record explaining the situation, so the
+AI agent sees a coherent "build succeeded" picture.
+
+This advisory is fixed natively in rustc 1.96.0: the diagnostic was changed
+from `warn` to `note`, which is unaffected by `-D warnings`.
+
+---
+
 ## Building from source
 
 For contributors or platforms not covered by a pre-built release:

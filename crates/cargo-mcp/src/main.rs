@@ -64,6 +64,9 @@ struct StartupConfig {
     /// Default wall-clock timeout for `cargo_test` calls that do not supply
     /// an explicit `timeout_secs`. `None` means no default (wait forever).
     test_timeout_secs: Option<u64>,
+    /// Whether to proactively delete stale `*-working` incremental-session
+    /// directories under `target/` before each cargo invocation.
+    clear_incr_working: bool,
     warnings: Vec<String>,
 }
 
@@ -84,6 +87,7 @@ fn parse_config() -> StartupConfig {
         retry_max_attempts: 3,
         rm_lookup_enabled: false,
         test_timeout_secs: None,
+        clear_incr_working: false,
         warnings: Vec::new(),
     };
     for arg in std::env::args_os().skip(1) {
@@ -159,6 +163,16 @@ fn parse_config() -> StartupConfig {
                     ));
                 }
             }
+        } else if let Some(rest) = s.strip_prefix("--clear-incr-working=") {
+            match parse_bool_flag(rest) {
+                Some(b) => cfg.clear_incr_working = b,
+                None => {
+                    cfg.warnings.push(format!(
+                        "ignoring invalid --clear-incr-working value: {rest:?} \
+                         (expected one of: true/false, 1/0, yes/no, on/off)"
+                    ));
+                }
+            }
         }
     }
     cfg
@@ -220,6 +234,7 @@ fn main() {
         cfg.retry_max_attempts,
     );
     invoke::set_rm_lookup_enabled(cfg.rm_lookup_enabled);
+    invoke::set_clear_incr_working(cfg.clear_incr_working);
     tools::set_default_test_timeout(cfg.test_timeout_secs);
 
     let stdin = io::stdin();
@@ -283,6 +298,14 @@ fn main() {
                     .to_string(),
             );
         }
+    }
+    if cfg.clear_incr_working {
+        log_info(
+            &mut out,
+            "incremental -working cleanup: ENABLED (stale *-working dirs removed before \
+             each cargo invocation)"
+                .to_string(),
+        );
     }
 
     // Replay any warnings collected during CLI parsing through the MCP log

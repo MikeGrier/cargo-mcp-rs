@@ -1,5 +1,17 @@
 # Changelog
 
+## [Unreleased]
+
+### Features
+
+* **invoke:** add `--clear-incr-working` flag (VS Code: `cargo-mcp.clearIncrWorking`) to proactively delete stale `*-working` incremental session directories before each cargo invocation, preventing the rename failure that triggers the advisory on Windows Dev Drive / ReFS volumes
+
+### Bug Fixes
+
+* **invoke:** fix false-positive retry loop when a test fails and the incremental-session finalise advisory fires in the same run — the advisory text contains `"Access is denied"` / `"(os error 5)"` and was incorrectly triggering the file-busy retry logic, causing cargo-mcp to give up after 3 attempts even though the test failure was genuine and retrying could not fix it
+* **invoke:** demote the incremental-session finalise `compiler-message` from `warning` (or `-D warnings`-escalated `error`) to `note` in the NDJSON stream so agents do not treat it as a compile failure
+* **invoke:** override spurious exit 101 when `-D warnings` escalates the incr-finalize advisory to a hard error but the source compiled without errors; injects an `x-cargo-mcp-note` record explaining the situation
+
 ## [0.7.1](https://github.com/MikeGrier/cargo-mcp-rs/compare/v0.7.0...v0.7.1) (2026-06-14)
 
 

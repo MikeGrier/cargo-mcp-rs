@@ -1084,6 +1084,31 @@ pub(crate) fn format_test_output(out: &CargoOutput, argv: &[&str], wd: Option<&s
     format!("{header}{body}")
 }
 
+/// Strip ANSI/VT100 CSI escape sequences (e.g. `\x1b[31m`, `\x1b[0m`) from `s`.
+///
+/// `rustfmt` emits colour codes in its diff output even when its stdout is not
+/// a terminal, so the raw text that reaches the MCP client contains stray
+/// `\x1b[…m` tokens. This removes them without pulling in a regex dependency.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' && chars.peek() == Some(&'[') {
+            chars.next(); // consume '['
+            // consume parameter and final bytes up to and including the
+            // command byte (0x40–0x7E).
+            for c in chars.by_ref() {
+                if ('\x40'..='\x7e').contains(&c) {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Format a [`CargoOutput`] from a command with no JSON mode (fmt, tree, clean).
 ///
 /// Combines stdout and stderr into a single text block prefixed with
@@ -2779,7 +2804,7 @@ fn call_fmt_check(args: &Value) -> Result<ToolResult, Box<dyn std::error::Error>
     let out = invoke::run_cargo(&argv, wd)?;
     let is_error = out.exit_code != 0;
     Ok(ToolResult::Text {
-        text: format_text_output(&out, &argv, wd),
+        text: strip_ansi(&format_text_output(&out, &argv, wd)),
         is_error,
     })
 }
