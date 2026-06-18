@@ -783,8 +783,14 @@ fn clear_incr_working_dirs(working_dir: Option<&str>) {
             continue;
         };
         for session_entry in session_iter.flatten() {
+            // Use DirEntry::file_type() (no symlink follow) so we never call
+            // remove_dir_all through a symlink pointing outside the target tree.
+            let Ok(ft) = session_entry.file_type() else {
+                continue;
+            };
             let path = session_entry.path();
-            if path.is_dir()
+            if ft.is_dir()
+                && !ft.is_symlink()
                 && path
                     .file_name()
                     .and_then(|n| n.to_str())
@@ -1554,7 +1560,13 @@ fn run_cargo_streaming_once(
     // compiled cleanly. Demote the exit code to 0 and inject an explanatory
     // record so the caller sees a coherent picture. This matches the fix
     // shipped in rustc 1.96.0 (rust-lang/rust#154110).
-    let exit_code = if exit_code != 0 && exit_due_only_to_incr_finalize(&stdout_buf) {
+    //
+    // Guard on build-finished.success:false so we never override a non-zero
+    // exit that came from test failures after a successful compilation.
+    let exit_code = if exit_code != 0
+        && stdout_buf.contains(r#"{"reason":"build-finished","success":false}"#)
+        && exit_due_only_to_incr_finalize(&stdout_buf)
+    {
         // Patch the build-finished record so consumers keying off
         // `success: false` don't see a phantom failure.
         let patched = stdout_buf.replace(
