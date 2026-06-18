@@ -274,7 +274,7 @@ fn exit_due_only_to_incr_finalize(stdout: &str) -> bool {
             .unwrap_or("");
         match level {
             // A genuine compile error remains — exit is not solely incr-finalize.
-            "error" | "error: internal compiler error" => return false,
+            "error" => return false,
             // A demoted note: check if it is the incr-finalize message.
             "note"
                 if msg.contains("finalizing incremental")
@@ -755,9 +755,17 @@ fn clear_incr_working_dirs(working_dir: Option<&str>) {
     if !CLEAR_INCR_WORKING.load(Ordering::Relaxed) {
         return;
     }
-    let target_dir = if let Some(v) =
-        std::env::var_os("CARGO_TARGET_DIR").filter(|v| !v.is_empty())
-    {
+    // Per-call env overrides (thread-local EXTRA_ENV) take precedence over the
+    // server process environment, mirroring how build_subprocess_env works.
+    let mut target_dir_env = std::env::var_os("CARGO_TARGET_DIR");
+    EXTRA_ENV.with(|e| {
+        for (k, v) in e.borrow().iter() {
+            if k == "CARGO_TARGET_DIR" {
+                target_dir_env = v.as_ref().map(std::ffi::OsString::from);
+            }
+        }
+    });
+    let target_dir = if let Some(v) = target_dir_env.filter(|v| !v.is_empty()) {
         PathBuf::from(v)
     } else {
         let base = working_dir
@@ -1547,6 +1555,13 @@ fn run_cargo_streaming_once(
     // record so the caller sees a coherent picture. This matches the fix
     // shipped in rustc 1.96.0 (rust-lang/rust#154110).
     let exit_code = if exit_code != 0 && exit_due_only_to_incr_finalize(&stdout_buf) {
+        // Patch the build-finished record so consumers keying off
+        // `success: false` don't see a phantom failure.
+        let patched = stdout_buf.replace(
+            r#"{"reason":"build-finished","success":false}"#,
+            r#"{"reason":"build-finished","success":true}"#,
+        );
+        stdout_buf = patched;
         let note = serde_json::to_string(&serde_json::json!({
             "reason": "x-cargo-mcp-note",
             "text": format!(
