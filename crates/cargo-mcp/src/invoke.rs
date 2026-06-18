@@ -99,6 +99,21 @@ pub fn set_rm_lookup_enabled(enabled: bool) {
     RM_LOOKUP_ENABLED.store(enabled, Ordering::Relaxed);
 }
 
+/// Whether to proactively delete stale incremental-session `-working`
+/// directories under `target/` before spawning cargo. Off by default.
+///
+/// A `-working` suffix means rustc never committed that session (interrupted
+/// or failed the final rename). Leaving them causes the next build to emit
+/// `warning: error finalizing incremental compilation session directory …`
+/// when the new session's rename clashes with the stale one. Removing them
+/// preemptively lets the rename succeed silently.
+static CLEAR_INCR_WORKING: AtomicBool = AtomicBool::new(false);
+
+/// Enable or disable preemptive stale incremental-session cleanup.
+pub fn set_clear_incr_working(enabled: bool) {
+    CLEAR_INCR_WORKING.store(enabled, Ordering::Relaxed);
+}
+
 /// Cargo subcommands whose retry on a transient file-busy error is safe
 /// because the operation is idempotent — re-running cannot produce duplicate
 /// state changes (no crates published twice, no `Cargo.toml` mutated twice,
@@ -155,15 +170,122 @@ fn is_retry_safe(args: &[&str]) -> bool {
 /// previous build process has briefly grabbed a handle on a `.exe`, `.pdb`,
 /// `.rmeta`, or `.lock` file in `target/`.
 pub fn is_transient_busy_error(stderr_or_stdout: &str) -> bool {
-    let s = stderr_or_stdout;
-    let os_error_match =
-        cfg!(windows) && (s.contains("(os error 32)") || s.contains("(os error 5)"));
-    os_error_match
-        || s.contains("being used by another process")
-        || s.contains("Access is denied")
-        || s.contains("access is denied")
-        || s.contains("sharing violation")
-        || s.contains("Sharing violation")
+    // Scan line-by-line so we can exclude the incremental-session finalise
+    // advisory, which surfaces "Access is denied" / "(os error 5)" for a
+    // *rename* failure that is unrelated to file-in-use on build artefacts.
+    // Retrying the cargo command will not resolve it.
+    stderr_or_stdout.lines().any(|line| {
+        if line.contains("finalizing incremental")
+            || line.contains("finalize incremental")
+            || line.contains("incremental compilation session")
+        {
+            return false;
+        }
+        (cfg!(windows) && (line.contains("(os error 32)") || line.contains("(os error 5)")))
+            || line.contains("being used by another process")
+            || line.contains("Access is denied")
+            || line.contains("access is denied")
+            || line.contains("sharing violation")
+            || line.contains("Sharing violation")
+    })
+}
+
+/// If `line` is a `compiler-message` JSON record for the incremental-session
+/// finalise warning, return a copy with its level demoted from `"warning"` to
+/// `"note"` (and the `rendered` prefix fixed to match). Returns `None` when
+/// the line does not match so the caller can skip the JSON round-trip.
+///
+/// Background: rustc emits `warning: error finalizing incremental compilation
+/// session directory …` when it cannot rename the `-working` directory to the
+/// committed name. The build itself succeeded; only the *next* incremental
+/// build is affected. Rustc PR #154110 demotes this to a `note` at the
+/// compiler level, but until that ships everywhere cargo-mcp applies the same
+/// demotion in the streamed output so agents never see it as a warning that
+/// needs action.
+fn maybe_demote_incr_finalize(line: &str) -> Option<String> {
+    // Fast path: avoid JSON parsing for the vast majority of lines.
+    if !line.contains("\"compiler-message\"") || !line.contains("finaliz") {
+        return None;
+    }
+    let mut v: serde_json::Value = serde_json::from_str(line).ok()?;
+    if v.pointer("/reason").and_then(|r| r.as_str()) != Some("compiler-message") {
+        return None;
+    }
+    // Match both "warning" (normal) and "error" (-D warnings escalation).
+    let level = v
+        .pointer("/message/level")
+        .and_then(|l| l.as_str())
+        .unwrap_or("");
+    if level != "warning" && level != "error" {
+        return None;
+    }
+    let original_prefix = if level == "error" { "error: " } else { "warning: " };
+    let msg_text = v
+        .pointer("/message/message")
+        .and_then(|m| m.as_str())
+        .unwrap_or("");
+    if !msg_text.contains("finalizing incremental") && !msg_text.contains("finalize incremental") {
+        return None;
+    }
+    // Demote: change level → "note" and fix the prefix in rendered.
+    let msg_obj = v.pointer_mut("/message")?.as_object_mut()?;
+    msg_obj.insert("level".to_string(), serde_json::json!("note"));
+    if let Some(rendered) = msg_obj.get_mut("rendered")
+        && let Some(s) = rendered.as_str()
+    {
+        *rendered = serde_json::json!(s.replacen(original_prefix, "note: ", 1));
+    }
+    serde_json::to_string(&v).ok()
+}
+
+/// Returns `true` when the only reason a cargo run exited non-zero was that
+/// `-D warnings` escalated the incremental-session finalise advisory to an
+/// error, with no genuine compile errors present.
+///
+/// Two conditions must both hold:
+///
+/// 1. At least one `compiler-message` with `level: "note"` whose text matches
+///    the incremental-session finalise pattern exists in `stdout` — proof that
+///    [`maybe_demote_incr_finalize`] demoted an entry that was originally at
+///    `level: "error"` (produced by `-D warnings`).
+/// 2. No `compiler-message` with `level: "error"` remains (no genuine
+///    compile errors in the output).
+///
+/// This mirrors the root fix in the compiler itself
+/// ([rust-lang/rust#154110](https://github.com/rust-lang/rust/pull/154110),
+/// shipped in rustc 1.96.0), which changed the diagnostic from `emit_warn`
+/// to `emit_note` so it is no longer affected by `-D warnings`.
+fn exit_due_only_to_incr_finalize(stdout: &str) -> bool {
+    let mut found_demoted_incr = false;
+    for line in stdout.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if v.pointer("/reason").and_then(|r| r.as_str()) != Some("compiler-message") {
+            continue;
+        }
+        let level = v
+            .pointer("/message/level")
+            .and_then(|l| l.as_str())
+            .unwrap_or("");
+        let msg = v
+            .pointer("/message/message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("");
+        match level {
+            // A genuine compile error remains — exit is not solely incr-finalize.
+            "error" => return false,
+            // A demoted note: check if it is the incr-finalize message.
+            "note"
+                if msg.contains("finalizing incremental")
+                    || msg.contains("finalize incremental") =>
+            {
+                found_demoted_incr = true;
+            }
+            _ => {}
+        }
+    }
+    found_demoted_incr
 }
 
 // ── toolchain resolution ──────────────────────────────────────────────────────
@@ -620,6 +742,80 @@ fn append_holder_report(stderr: &mut String, report: &[crate::busy_files::FileHo
     }
     stderr.push('\n');
     stderr.push_str(&formatted);
+}
+
+/// Proactively remove stale incremental-session `-working` directories under
+/// the effective `target/` tree before spawning cargo.
+///
+/// No-op when [`CLEAR_INCR_WORKING`] is disabled, or when the target
+/// directory cannot be found or walked. Any deletion failure is logged at
+/// `info` level and silently ignored — a failed cleanup is non-fatal; the
+/// build will still run and may emit the finalise warning as before.
+fn clear_incr_working_dirs(working_dir: Option<&str>) {
+    if !CLEAR_INCR_WORKING.load(Ordering::Relaxed) {
+        return;
+    }
+    // Per-call env overrides (thread-local EXTRA_ENV) take precedence over the
+    // server process environment, mirroring how build_subprocess_env works.
+    let mut target_dir_env = std::env::var_os("CARGO_TARGET_DIR");
+    EXTRA_ENV.with(|e| {
+        for (k, v) in e.borrow().iter() {
+            if k == "CARGO_TARGET_DIR" {
+                target_dir_env = v.as_ref().map(std::ffi::OsString::from);
+            }
+        }
+    });
+    let target_dir = if let Some(v) = target_dir_env.filter(|v| !v.is_empty()) {
+        PathBuf::from(v)
+    } else {
+        let base = working_dir
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        base.join("target")
+    };
+    // Walk target/<profile>/incremental/ looking for *-working dirs.
+    let Ok(profile_iter) = std::fs::read_dir(&target_dir) else {
+        return;
+    };
+    for profile_entry in profile_iter.flatten() {
+        let incr_path = profile_entry.path().join("incremental");
+        let Ok(session_iter) = std::fs::read_dir(&incr_path) else {
+            continue;
+        };
+        for session_entry in session_iter.flatten() {
+            // Use DirEntry::file_type() (no symlink follow) so we never call
+            // remove_dir_all through a symlink pointing outside the target tree.
+            let Ok(ft) = session_entry.file_type() else {
+                continue;
+            };
+            let path = session_entry.path();
+            if ft.is_dir()
+                && !ft.is_symlink()
+                && path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.ends_with("-working"))
+            {
+                match std::fs::remove_dir_all(&path) {
+                    Ok(()) => emit_mcp_log(
+                        "info",
+                        &format!(
+                            "removed stale incremental session directory `{}`",
+                            path.display(),
+                        ),
+                    ),
+                    Err(e) => emit_mcp_log(
+                        "info",
+                        &format!(
+                            "could not remove stale incremental session directory \
+                             `{}`: {e}",
+                            path.display(),
+                        ),
+                    ),
+                }
+            }
+        }
+    }
 }
 
 // ── subprocess runners ────────────────────────────────────────────────────────
@@ -1141,6 +1337,7 @@ fn run_cargo_streaming_once(
     reset_deadline: Option<ArmDeadline<'_>>,
     on_stdout_line: &mut dyn FnMut(&str),
 ) -> Result<CargoOutput, Box<dyn std::error::Error>> {
+    clear_incr_working_dirs(working_dir);
     let (cargo_path, source) = resolve_cargo_binary();
     log_invocation(&cargo_path, source, working_dir, args);
     let mut cmd = Command::new(&cargo_path);
@@ -1272,6 +1469,7 @@ fn run_cargo_streaming_once(
         }
         match rx.recv_timeout(tick) {
             Ok(Some(l)) => {
+                let l = maybe_demote_incr_finalize(&l).unwrap_or(l);
                 // Arm both deadlines on the marker line (deferred-arming mode).
                 let mut just_armed = false;
                 if !armed
@@ -1343,6 +1541,7 @@ fn run_cargo_streaming_once(
 
     // Drain any lines the stdout thread buffered after we broke the loop.
     while let Ok(Some(l)) = rx.try_recv() {
+        let l = maybe_demote_incr_finalize(&l).unwrap_or(l);
         on_stdout_line(&l);
         stdout_buf.push_str(&l);
         stdout_buf.push('\n');
@@ -1355,6 +1554,43 @@ fn run_cargo_streaming_once(
     if exit_code != 0 {
         maybe_append_working_dir_hint(&mut stderr_buf, working_dir);
     }
+
+    // If the build "failed" only because -D warnings escalated the
+    // incremental-session finalise advisory to a hard error, the source
+    // compiled cleanly. Demote the exit code to 0 and inject an explanatory
+    // record so the caller sees a coherent picture. This matches the fix
+    // shipped in rustc 1.96.0 (rust-lang/rust#154110).
+    //
+    // Guard on build-finished.success:false so we never override a non-zero
+    // exit that came from test failures after a successful compilation.
+    let exit_code = if exit_code != 0
+        && stdout_buf.contains(r#"{"reason":"build-finished","success":false}"#)
+        && exit_due_only_to_incr_finalize(&stdout_buf)
+    {
+        // Patch the build-finished record so consumers keying off
+        // `success: false` don't see a phantom failure.
+        let patched = stdout_buf.replace(
+            r#"{"reason":"build-finished","success":false}"#,
+            r#"{"reason":"build-finished","success":true}"#,
+        );
+        stdout_buf = patched;
+        let note = serde_json::to_string(&serde_json::json!({
+            "reason": "x-cargo-mcp-note",
+            "text": format!(
+                "cargo-mcp: build succeeded; exit {exit_code} was caused by \
+                 -D warnings escalating the incremental-session finalise advisory \
+                 to a hard error. The source compiled without errors. \
+                 See the cargo-mcp README for details."
+            ),
+        }))
+        .unwrap_or_default();
+        on_stdout_line(&note);
+        stdout_buf.push_str(&note);
+        stdout_buf.push('\n');
+        0
+    } else {
+        exit_code
+    };
 
     Ok(CargoOutput {
         stdout: stdout_buf,
@@ -1963,6 +2199,27 @@ mod tests {
     }
 
     // ── retry-on-busy detection ──────────────────────────────────────────────
+
+    #[test]
+    fn does_not_match_incr_finalize_advisory() {
+        // The incremental-session finalise advisory contains "Access is denied"
+        // and "(os error 5)" but is not a retryable file-busy error — retrying
+        // won't fix a rename failure on the incremental working directory.
+        let stderr = "note: error finalizing incremental compilation session directory \
+                      `\\\\?\\Q:\\src\\project\\target\\debug\\incremental\\foo-abc\\s-xyz-working`: \
+                      Access is denied. (os error 5)";
+        assert!(!is_transient_busy_error(stderr));
+    }
+
+    #[test]
+    fn incr_finalize_alongside_real_busy_error_is_still_detected() {
+        // If a real file-busy error co-occurs with the incr-finalize advisory,
+        // the real error should still be detected.
+        let stderr = "note: error finalizing incremental compilation session directory \
+                      `target\\debug\\incremental\\foo-working`: Access is denied. (os error 5)\n\
+                      error: failed to write `target\\debug\\foo.pdb`: Access is denied. (os error 5)";
+        assert!(is_transient_busy_error(stderr));
+    }
 
     #[test]
     fn detects_windows_sharing_violation_via_phrase() {
