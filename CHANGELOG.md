@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.7.2](https://github.com/MikeGrier/cargo-mcp-rs/compare/v0.7.1...v0.7.2) (2026-06-18)
+
+
+### Bug Fixes
+
+* address Copilot review comments on PR [#53](https://github.com/MikeGrier/cargo-mcp-rs/issues/53) ([33e8a55](https://github.com/MikeGrier/cargo-mcp-rs/commit/33e8a55095cdba0f8a3480607b3b47197d44e965))
+* address second-round Copilot review comments on PR [#53](https://github.com/MikeGrier/cargo-mcp-rs/issues/53) ([ac3c596](https://github.com/MikeGrier/cargo-mcp-rs/commit/ac3c59687b2868bdc1a6fc9e93d1903a402096af))
+* handle incremental-session finalise advisory on Windows Dev Drive ([a224e8c](https://github.com/MikeGrier/cargo-mcp-rs/commit/a224e8c043a45d14569c04d43641c5b47c5fa6cf))
+
 ## [Unreleased]
 
 ### Features
