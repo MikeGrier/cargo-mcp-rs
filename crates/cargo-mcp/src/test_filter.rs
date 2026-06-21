@@ -763,21 +763,6 @@ fn run_one_test_individually(
     };
     let already_elapsed = overall_deadline_abs.is_some_and(|d| Instant::now() >= d);
 
-    // When no absolute deadline is active yet (first test: phase3_arm is None),
-    // the global overall budget must also be enforced as a Duration so it actually
-    // limits the first invocation. For tests 2+, the absolute deadline already
-    // carries the global cap, so per_test_timeout alone is the per-invocation cap.
-    let effective_timeout = if overall_deadline_abs.is_none() {
-        // Test 1: combine per-test and global budgets; use the tighter of the two.
-        match (per_test_timeout, global_overall_timeout) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        }
-    } else {
-        // Tests 2+: global cap is enforced via overall_deadline_abs.
-        per_test_timeout
-    };
-
     let result = if already_elapsed {
         // Short-circuit: the global budget is already spent. Synthesise a
         // TimeoutError consistent with what the watchdog would have produced
@@ -788,17 +773,27 @@ fn run_one_test_individually(
             .unwrap_or_default();
         Err(Box::new(invoke::TimeoutError { elapsed }) as Box<dyn std::error::Error>)
     } else {
-        // effective_timeout (tighter of per_test_timeout and global_overall_timeout
-        // for test 1; per_test_timeout for tests 2+ where overall_deadline_abs
-        // already carries the global cap) arms on build-finished via `arm` and
-        // never resets — there is only one test per invocation.
-        // No per-test reset predicate needed.
+        // Pass global_overall_timeout as overall_timeout and per_test_timeout
+        // as per_test_timeout (no reset predicate so it acts as a simple
+        // wall-clock cap). The watchdog treats them independently:
+        //
+        // • overall_timeout arms on build-finished when overall_deadline_abs
+        //   is None (test 1), giving the global budget from this invocation's
+        //   execution start. When overall_deadline_abs is Some (tests 2+), the
+        //   watchdog pins overall_deadline to that absolute value at spawn and
+        //   never re-arms it — the Duration is only used for TimeoutError::elapsed
+        //   anchoring: anchor = overall_deadline_abs - global_overall_timeout = t1,
+        //   so elapsed correctly reflects time since the first build-finished.
+        //
+        // • per_test_timeout arms on build-finished and never resets (reset_deadline
+        //   = None), bounding each individual invocation independently of the global
+        //   cap. Whichever fires first terminates the child.
         invoke::run_cargo_streaming_with_watchdog(
             &argv,
             wd,
-            effective_timeout,
+            global_overall_timeout,
             overall_deadline_abs,
-            None,
+            per_test_timeout,
             Some(arm),
             None,
             on_progress,
