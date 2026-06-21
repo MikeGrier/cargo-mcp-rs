@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.8.0](https://github.com/MikeGrier/cargo-mcp-rs/compare/v0.7.2...v0.8.0) (2026-06-21)
+
+
+### Features
+
+* add per-test execution mode for test_filter ([557e558](https://github.com/MikeGrier/cargo-mcp-rs/commit/557e558cc5fcbf4aef06b76c53369a8266c5d82c))
+* add per-test execution mode for test_filter ([97a4cb2](https://github.com/MikeGrier/cargo-mcp-rs/commit/97a4cb23a62576c3f8cba2c140404098cf908da2))
+
+
+### Bug Fixes
+
+* correct TimeoutError::elapsed anchoring in per-test execution mode ([5d8929e](https://github.com/MikeGrier/cargo-mcp-rs/commit/5d8929ef55e94369c43b63c28c9e100311e78441))
+* emit diagnostic body for deadline-exceeded tests in per-test mode ([a5213a4](https://github.com/MikeGrier/cargo-mcp-rs/commit/a5213a42f3d2408e2acdb3316e952fe7cf547443))
+* gate per-binary deadline pre-check to batched mode; add per-test unit tests ([8982c0e](https://github.com/MikeGrier/cargo-mcp-rs/commit/8982c0ed228551ee237bfdc5860e88d9d670fcc1))
+
 ## [0.7.2](https://github.com/MikeGrier/cargo-mcp-rs/compare/v0.7.1...v0.7.2) (2026-06-18)
 
 
