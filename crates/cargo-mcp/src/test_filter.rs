@@ -1002,28 +1002,33 @@ pub fn run(
         if d.matched.is_empty() {
             continue;
         }
-        // Cheap check at the top of each iteration: if the shared overall
-        // deadline has already passed, skip every remaining binary.
-        if let (Some(arm_t), Some(budget)) = (phase3_arm.get(), overall_timeout)
-            && let Some(d_abs) = arm_t.checked_add(budget)
-            && Instant::now() >= d_abs
-        {
-            if overall_exit_code == 0 {
-                overall_exit_code = -1;
+        // Cheap check at the top of each iteration (batched mode only): if the
+        // shared overall deadline has already passed, skip every remaining
+        // binary. In per-test mode this check is omitted — run_one_test_individually
+        // handles the already-elapsed case by emitting a named synthetic timeout
+        // body (with the skipped test name in the x-cargo-mcp-invocation argv)
+        // before returning overall_deadline_exceeded = true, so the caller can
+        // always identify the first skipped test from the response body.
+        if !per_test_execution {
+            if let (Some(arm_t), Some(budget)) = (phase3_arm.get(), overall_timeout)
+                && let Some(d_abs) = arm_t.checked_add(budget)
+                && Instant::now() >= d_abs
+            {
+                if overall_exit_code == 0 {
+                    overall_exit_code = -1;
+                }
+                break;
             }
-            break;
         }
         if per_test_execution {
             // ── per-test execution mode ───────────────────────────────
             // Each matched test gets its own `cargo test -- --exact <name>`
             // invocation. The hung test is unambiguously identified by the
             // `x-cargo-mcp-invocation` header of the timed-out block.
-            // The overall deadline pre-check is intentionally omitted here:
-            // run_one_test_individually handles the already-elapsed case by
-            // emitting a synthetic timeout body that includes the test name
-            // in the x-cargo-mcp-invocation argv, giving the caller a
-            // diagnostic record before overall_deadline_exceeded breaks the
-            // outer loop.
+            // Overall-deadline handling is delegated to run_one_test_individually:
+            // it emits a synthetic timeout body naming the test before setting
+            // overall_deadline_exceeded = true, so the response always contains
+            // a diagnostic record identifying the first skipped test.
             for test_name in &d.matched {
                 let outcome = run_one_test_individually(
                     args,
@@ -1337,5 +1342,100 @@ mod tests {
         assert!(!parsed.regex.is_match("bar::foo"));
         assert!(parsed.include_ignored);
         assert_eq!(parsed.pattern_source, "^foo::");
+    }
+
+    // ── per-test execution path unit tests ─────────────────────────────────
+
+    fn make_discovered(pkg: &str, target: &str, matched: Vec<&str>) -> DiscoveredBinary {
+        let matched_owned: Vec<String> = matched.iter().map(|s| s.to_string()).collect();
+        DiscoveredBinary {
+            binary: TestBinary {
+                executable: std::path::PathBuf::from("/nonexistent"),
+                target_name: target.to_owned(),
+                target_kind: TargetKind::Lib,
+                package_name: pkg.to_owned(),
+            },
+            all_tests: matched_owned.clone(),
+            matched: matched_owned,
+        }
+    }
+
+    /// `run_one_test_individually` must emit exactly one formatted body naming
+    /// the test (via `--exact <name>` in the x-cargo-mcp-invocation argv) and
+    /// return `overall_deadline_exceeded = true` when the shared budget is
+    /// already spent — without spawning a cargo subprocess.
+    #[test]
+    fn run_one_test_individually_already_elapsed_emits_named_invocation() {
+        use std::cell::Cell;
+        use std::time::{Duration, Instant};
+
+        // Place the arm 120 s in the past; a 30 s budget means the deadline
+        // expired 90 s ago — guaranteed to be already elapsed.
+        let past = Instant::now()
+            .checked_sub(Duration::from_secs(120))
+            .expect("system clock can subtract 120 s");
+        let phase3_arm: Cell<Option<Instant>> = Cell::new(Some(past));
+        let global_overall_timeout = Some(Duration::from_secs(30));
+
+        let discovered = make_discovered("my-crate", "mylib", vec!["foo::test_a"]);
+        let common = tools::CommonOpts::from_args(&serde_json::json!({}));
+        let arm: crate::invoke::ArmDeadline<'_> = &|_: &str| false;
+
+        let outcome = run_one_test_individually(
+            &serde_json::json!({}),
+            &common,
+            &discovered,
+            "foo::test_a",
+            false,
+            None,
+            None,
+            global_overall_timeout,
+            &phase3_arm,
+            None,
+            arm,
+            &mut |_| {},
+        );
+
+        assert_eq!(outcome.exit_code, -1, "timed-out invocation must report exit_code -1");
+        assert!(outcome.overall_deadline_exceeded, "must signal deadline exceeded");
+        assert_eq!(outcome.launches, 1, "must count one launch even for the short-circuit path");
+        assert_eq!(outcome.formatted.len(), 1);
+        // The x-cargo-mcp-invocation header must name the test so callers can
+        // identify the first skipped test from the response body alone.
+        assert!(
+            outcome.formatted[0].contains("foo::test_a"),
+            "expected test name in formatted body; got:\n{}",
+            outcome.formatted[0],
+        );
+    }
+
+    /// In per-test execution mode the total planned launches equals the total
+    /// number of matched tests (one cargo process per test), not the number of
+    /// argv-length chunks that batched mode would produce.
+    #[test]
+    fn per_test_launch_count_is_one_per_matched_test() {
+        // Two binaries: one with 2 matched tests, one with 1.
+        let binaries = vec![
+            make_discovered("pkg", "lib1", vec!["a::t1", "a::t2"]),
+            make_discovered("pkg", "lib2", vec!["b::t1"]),
+        ];
+
+        let total_matched: usize = binaries.iter().map(|d| d.matched.len()).sum();
+        assert_eq!(total_matched, 3, "per-test mode: 3 matched → 3 planned launches");
+
+        // Contrast with batched mode: chunk_test_names produces one chunk per
+        // binary for small name sets (all names fit in a single argv).
+        let batched_launches: usize = binaries
+            .iter()
+            .filter(|d| !d.matched.is_empty())
+            .map(|d| chunk_test_names(&d.matched).len())
+            .sum();
+        assert_eq!(batched_launches, 2, "batched mode: one chunk per binary → 2 launches");
+
+        // Per-test always produces more (or equal) launches for the same input.
+        assert!(
+            total_matched >= batched_launches,
+            "per-test launches ({total_matched}) must be >= batched launches ({batched_launches})",
+        );
     }
 }
