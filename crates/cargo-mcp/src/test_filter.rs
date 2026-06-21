@@ -1018,17 +1018,13 @@ pub fn run(
             // Each matched test gets its own `cargo test -- --exact <name>`
             // invocation. The hung test is unambiguously identified by the
             // `x-cargo-mcp-invocation` header of the timed-out block.
+            // The overall deadline pre-check is intentionally omitted here:
+            // run_one_test_individually handles the already-elapsed case by
+            // emitting a synthetic timeout body that includes the test name
+            // in the x-cargo-mcp-invocation argv, giving the caller a
+            // diagnostic record before overall_deadline_exceeded breaks the
+            // outer loop.
             for test_name in &d.matched {
-                // Check overall deadline before each test.
-                if let (Some(arm_t), Some(budget)) = (phase3_arm.get(), overall_timeout)
-                    && let Some(d_abs) = arm_t.checked_add(budget)
-                    && Instant::now() >= d_abs
-                {
-                    if overall_exit_code == 0 {
-                        overall_exit_code = -1;
-                    }
-                    break 'outer;
-                }
                 let outcome = run_one_test_individually(
                     args,
                     &common,
