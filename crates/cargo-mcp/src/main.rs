@@ -64,6 +64,9 @@ struct StartupConfig {
     /// Default wall-clock timeout for `cargo_test` calls that do not supply
     /// an explicit `timeout_secs`. `None` means no default (wait forever).
     test_timeout_secs: Option<u64>,
+    /// Whether `test_filter` mode runs each matched test as its own cargo
+    /// invocation. Set by `--per-test-execution=true`.
+    per_test_execution: bool,
     /// Whether to proactively delete stale `*-working` incremental-session
     /// directories under `target/` before each cargo invocation.
     clear_incr_working: bool,
@@ -87,6 +90,7 @@ fn parse_config() -> StartupConfig {
         retry_max_attempts: 3,
         rm_lookup_enabled: false,
         test_timeout_secs: None,
+        per_test_execution: false,
         clear_incr_working: false,
         warnings: Vec::new(),
     };
@@ -163,6 +167,16 @@ fn parse_config() -> StartupConfig {
                     ));
                 }
             }
+        } else if let Some(rest) = s.strip_prefix("--per-test-execution=") {
+            match parse_bool_flag(rest) {
+                Some(b) => cfg.per_test_execution = b,
+                None => {
+                    cfg.warnings.push(format!(
+                        "ignoring invalid --per-test-execution value: {rest:?} \
+                         (expected one of: true/false, 1/0, yes/no, on/off)"
+                    ));
+                }
+            }
         } else if let Some(rest) = s.strip_prefix("--clear-incr-working=") {
             match parse_bool_flag(rest) {
                 Some(b) => cfg.clear_incr_working = b,
@@ -236,6 +250,7 @@ fn main() {
     invoke::set_rm_lookup_enabled(cfg.rm_lookup_enabled);
     invoke::set_clear_incr_working(cfg.clear_incr_working);
     tools::set_default_test_timeout(cfg.test_timeout_secs);
+    tools::set_per_test_execution(cfg.per_test_execution);
 
     let stdin = io::stdin();
     let stdout = io::stdout();

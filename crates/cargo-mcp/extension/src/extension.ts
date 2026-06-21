@@ -102,6 +102,12 @@ function buildArgs(): string[] {
         args.push(`--test-timeout-secs=${Math.round(testTimeoutSecs)}`);
     }
 
+    // Per-test execution: run each matched test as its own cargo invocation.
+    const perTestExecution = config.get<boolean>("test.perTestExecution", false) ?? false;
+    if (perTestExecution) {
+        args.push("--per-test-execution=true");
+    }
+
     const extraArgs = config.get<string[]>("extraArgs", []) ?? [];
     for (const a of extraArgs) {
         if (typeof a === "string" && a.length > 0) {

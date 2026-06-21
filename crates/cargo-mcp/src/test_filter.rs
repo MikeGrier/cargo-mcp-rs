@@ -712,6 +712,127 @@ pub fn is_filter_requested(args: &Value) -> bool {
         .unwrap_or(false)
 }
 
+/// Run a single test case as its own `cargo test -- --exact <name>` invocation.
+///
+/// Used by the per-test execution path in [`run`] when
+/// `per_test_execution` is `true`. Each invocation:
+/// - arms a per-test wall-clock cap (`per_test_timeout`) on the
+///   `build-finished` record (compilation is already cached from phase 1,
+///   so this fires within a second of cargo startup);
+/// - respects the shared absolute overall deadline computed from the first
+///   `build-finished` across all per-test invocations.
+///
+/// Because only one test runs per cargo process, the hung test is
+/// unambiguously identified by the `x-cargo-mcp-invocation` header of
+/// the timed-out block (its `argv` contains `--exact <name>`).
+#[allow(clippy::too_many_arguments)]
+fn run_one_test_individually(
+    args: &Value,
+    common: &CommonOpts,
+    discovered: &DiscoveredBinary,
+    test_name: &str,
+    include_ignored: bool,
+    wd: Option<&str>,
+    toolchain: Option<&str>,
+    global_overall_timeout: Option<Duration>,
+    phase3_arm: &Cell<Option<Instant>>,
+    per_test_timeout: Option<Duration>,
+    arm: invoke::ArmDeadline<'_>,
+    on_progress: &mut dyn FnMut(&str),
+) -> BinaryRunOutcome {
+    let name_slice: [&str; 1] = [test_name];
+    let argv = build_per_binary_argv(
+        args,
+        common,
+        discovered,
+        &name_slice,
+        include_ignored,
+        toolchain,
+    );
+
+    // The shared absolute overall cap: once phase3_arm has been captured
+    // on the first build-finished across any per-test invocation, compute
+    // arm_t + global_overall_timeout as an absolute deadline that is shared
+    // across all subsequent invocations. When overall_deadline_abs is Some,
+    // run_cargo_streaming_with_watchdog uses it as-is (no deferred arming),
+    // so cargo startup / incremental-check time for invocation N+ cannot
+    // extend the shared budget.
+    let overall_deadline_abs = match (phase3_arm.get(), global_overall_timeout) {
+        (Some(arm_t), Some(budget)) => arm_t.checked_add(budget),
+        _ => None,
+    };
+    let already_elapsed = overall_deadline_abs.is_some_and(|d| Instant::now() >= d);
+
+    // When no absolute deadline is active yet (first test: phase3_arm is None),
+    // the global overall budget must also be enforced as a Duration so it actually
+    // limits the first invocation. For tests 2+, the absolute deadline already
+    // carries the global cap, so per_test_timeout alone is the per-invocation cap.
+    let effective_timeout = if overall_deadline_abs.is_none() {
+        // Test 1: combine per-test and global budgets; use the tighter of the two.
+        match (per_test_timeout, global_overall_timeout) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    } else {
+        // Tests 2+: global cap is enforced via overall_deadline_abs.
+        per_test_timeout
+    };
+
+    let result = if already_elapsed {
+        // Short-circuit: the global budget is already spent. Synthesise a
+        // TimeoutError consistent with what the watchdog would have produced
+        // so callers that downcast see the same type.
+        let elapsed = phase3_arm
+            .get()
+            .map(|arm_t| Instant::now().saturating_duration_since(arm_t))
+            .unwrap_or_default();
+        Err(Box::new(invoke::TimeoutError { elapsed }) as Box<dyn std::error::Error>)
+    } else {
+        // effective_timeout (tighter of per_test_timeout and global_overall_timeout
+        // for test 1; per_test_timeout for tests 2+ where overall_deadline_abs
+        // already carries the global cap) arms on build-finished via `arm` and
+        // never resets — there is only one test per invocation.
+        // No per-test reset predicate needed.
+        invoke::run_cargo_streaming_with_watchdog(
+            &argv,
+            wd,
+            effective_timeout,
+            overall_deadline_abs,
+            None,
+            Some(arm),
+            None,
+            on_progress,
+        )
+    };
+
+    let (formatted_body, exit_code, overall_deadline_exceeded) = match result {
+        Ok(out) => {
+            let code = out.exit_code;
+            let formatted = tools::format_test_output(&out, &argv, wd);
+            let exceeded = overall_deadline_abs.is_some_and(|d| Instant::now() >= d);
+            (formatted, code, exceeded)
+        }
+        Err(e) => {
+            let synthetic = CargoOutput {
+                stdout: String::new(),
+                stderr: format!("cargo-mcp test_filter: per-test run failed: {e}"),
+                exit_code: -1,
+            };
+            let formatted = tools::format_test_output(&synthetic, &argv, wd);
+            let exceeded =
+                already_elapsed || overall_deadline_abs.is_some_and(|d| Instant::now() >= d);
+            (formatted, -1, exceeded)
+        }
+    };
+
+    BinaryRunOutcome {
+        formatted: vec![formatted_body],
+        exit_code,
+        launches: 1,
+        overall_deadline_exceeded,
+    }
+}
+
 /// Top-level orchestrator for `cargo_test` runs with `test_filter` set.
 ///
 /// Returns `Ok(None)` when the caller did not request filter mode (so
@@ -723,6 +844,7 @@ pub fn is_filter_requested(args: &Value) -> bool {
 pub fn run(
     args: &Value,
     on_progress: Option<&mut dyn FnMut(&str)>,
+    per_test_execution: bool,
 ) -> Result<Option<ToolResult>, Box<dyn std::error::Error>> {
     let Some(filter) = FilterArgs::from_args(args)? else {
         return Ok(None);
@@ -834,15 +956,21 @@ pub fn run(
     // (`launches_planned`) and the rollup trailer's `launches` field
     // reports what actually ran — the two can legitimately differ when an
     // overall timeout trims phase 3.
-    let total_launches_planned: usize = discovered
-        .iter()
-        .map(|d| {
-            chunk_test_names(&d.matched)
-                .iter()
-                .filter(|c| !c.is_empty())
-                .count()
-        })
-        .sum();
+    // In per-test execution mode every matched test is its own launch;
+    // otherwise count non-empty chunks (argv-length splitting).
+    let total_launches_planned: usize = if per_test_execution {
+        total_matched
+    } else {
+        discovered
+            .iter()
+            .map(|d| {
+                chunk_test_names(&d.matched)
+                    .iter()
+                    .filter(|c| !c.is_empty())
+                    .count()
+            })
+            .sum()
+    };
 
     // ── phase 3: per-binary execution ────────────────────────────────────
     // The overall cap is shared across every per-binary launch and is
@@ -875,16 +1003,12 @@ pub fn run(
     if !enumeration_errors.is_empty() {
         overall_exit_code = -1;
     }
-    for d in &discovered {
+    'outer: for d in &discovered {
         if d.matched.is_empty() {
             continue;
         }
         // Cheap check at the top of each iteration: if the shared overall
-        // deadline has already passed, skip every remaining binary instead
-        // of letting `run_one_binary` emit a synthetic timeout body for it.
-        // (`run_one_binary`'s internal already_elapsed branch still covers
-        // the case where the deadline trips *during* the first launch of
-        // the current binary.)
+        // deadline has already passed, skip every remaining binary.
         if let (Some(arm_t), Some(budget)) = (phase3_arm.get(), overall_timeout)
             && let Some(d_abs) = arm_t.checked_add(budget)
             && Instant::now() >= d_abs
@@ -894,26 +1018,71 @@ pub fn run(
             }
             break;
         }
-        let outcome = run_one_binary(
-            args,
-            &common,
-            d,
-            filter.include_ignored,
-            wd,
-            toolchain.as_deref(),
-            overall_timeout,
-            &phase3_arm,
-            per_test_timeout,
-            &wrapped_arm,
-            sink.as_mut(),
-        );
-        total_launches += outcome.launches;
-        if outcome.exit_code != 0 && overall_exit_code == 0 {
-            overall_exit_code = outcome.exit_code;
-        }
-        binary_bodies.extend(outcome.formatted);
-        if outcome.overall_deadline_exceeded {
-            break;
+        if per_test_execution {
+            // ── per-test execution mode ───────────────────────────────
+            // Each matched test gets its own `cargo test -- --exact <name>`
+            // invocation. The hung test is unambiguously identified by the
+            // `x-cargo-mcp-invocation` header of the timed-out block.
+            for test_name in &d.matched {
+                // Check overall deadline before each test.
+                if let (Some(arm_t), Some(budget)) = (phase3_arm.get(), overall_timeout)
+                    && let Some(d_abs) = arm_t.checked_add(budget)
+                    && Instant::now() >= d_abs
+                {
+                    if overall_exit_code == 0 {
+                        overall_exit_code = -1;
+                    }
+                    break 'outer;
+                }
+                let outcome = run_one_test_individually(
+                    args,
+                    &common,
+                    d,
+                    test_name,
+                    filter.include_ignored,
+                    wd,
+                    toolchain.as_deref(),
+                    overall_timeout,
+                    &phase3_arm,
+                    per_test_timeout,
+                    &wrapped_arm,
+                    sink.as_mut(),
+                );
+                total_launches += outcome.launches;
+                if outcome.exit_code != 0 && overall_exit_code == 0 {
+                    overall_exit_code = outcome.exit_code;
+                }
+                binary_bodies.extend(outcome.formatted);
+                if outcome.overall_deadline_exceeded {
+                    break 'outer;
+                }
+            }
+        } else {
+            // ── batched execution mode (default) ─────────────────────
+            // All matched tests for a binary run in a single
+            // `cargo test -- --exact name1 name2 …` invocation. The
+            // per-test watchdog (boundary-line reset) guards against hangs.
+            let outcome = run_one_binary(
+                args,
+                &common,
+                d,
+                filter.include_ignored,
+                wd,
+                toolchain.as_deref(),
+                overall_timeout,
+                &phase3_arm,
+                per_test_timeout,
+                &wrapped_arm,
+                sink.as_mut(),
+            );
+            total_launches += outcome.launches;
+            if outcome.exit_code != 0 && overall_exit_code == 0 {
+                overall_exit_code = outcome.exit_code;
+            }
+            binary_bodies.extend(outcome.formatted);
+            if outcome.overall_deadline_exceeded {
+                break;
+            }
         }
     }
 

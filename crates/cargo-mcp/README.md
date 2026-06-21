@@ -305,44 +305,60 @@ logging additions, so treat it as not confidential.
 
 **Timeouts (`timeout_secs` and `per_test_timeout_secs`)**
 
-`cargo_test` has two independent timeout knobs that can be combined
-freely. Both apply only to the test **execution** phase: each clock
-arms when compilation and linking finish (cargo's `build-finished`
-record), so a slow build never trips either of them.
+`cargo_test` has two independent timeout knobs. Both apply only to the test
+**execution** phase: each clock arms when compilation and linking finish
+(cargo's `build-finished` record), so a slow build never trips either.
 
 - **`timeout_secs`** is a hard OVERALL wall-clock cap on the whole
-  execution phase. Same meaning whether or not `test_filter` is set;
-  in filter mode it bounds all per-binary launches together. Use it to
-  keep throughput going on a slow system. Defaults:
+  execution phase. Same meaning in all modes — unfiltered and
+  `test_filter` (batched or per-test). Use it to cap the whole phase.
+  Defaults:
     - Unfiltered: server default applies
-      (`cargo-mcp.test.timeoutSecs`, 30s via the VS Code extension;
+      (`cargo-mcp.test.timeoutSecs`, 30 s via the VS Code extension;
       none otherwise).
     - Filter mode: **no default** — omit to let a long matched run
       complete unbounded, pass an explicit positive value to cap it.
-    - Pass `0` to disable for this call regardless of the server
-      default.
-- **`per_test_timeout_secs`** is a per-test idle watchdog — ONLY
-  meaningful when `test_filter` is set; ignored otherwise. The clock
-  arms on each per-binary `build-finished` record and resets on every
-  libtest boundary line (`running N tests` or
-  `test <name> ... ok|FAILED|ignored`). A long suite of fast tests
-  never trips it; a single hung test does. If the watchdog fires for
-  one binary, that binary's cargo process tree is killed and the
-  orchestrator records `exit_code: -1` plus an inline
-  `cargo-mcp test_filter: per-binary run failed: TimeoutError` body,
-  then moves on to the next matched binary. Defaults to the server
-  setting (30s via the VS Code extension) so hung-test protection is
-  on by default in filter mode; when the server default is also
-  absent or set to `0`, filter mode still applies a hard-coded
-  **30-second** fallback. The only way to fully disable per-test
-  protection for a call is to pass `per_test_timeout_secs: 0`
-  explicitly.
+    - Pass `0` to disable for this call regardless of the server default.
+- **`per_test_timeout_secs`** is a per-test budget (ONLY meaningful
+  when `test_filter` is set; ignored otherwise). Its semantics depend on
+  the `cargo-mcp.test.perTestExecution` VS Code setting:
+    - **Off (batched, default):** idle watchdog — the clock arms on
+      `build-finished` and **resets on every `test … ok|FAILED|ignored`
+      completion line**. A long suite of fast tests never trips it; a
+      single hung test (which stops producing output) does. When it
+      fires, the binary's cargo process is killed and the orchestrator
+      moves on to the next matched binary. The hung test is not named
+      directly — the last `x-cargo-mcp-test-output` line before the
+      timeout is the closest indicator.
+    - **On (per-test):** simple wall-clock cap per invocation — arms
+      on the single-test invocation's `build-finished`, never resets.
+      The hung test IS named in the `x-cargo-mcp-invocation` `argv`
+      field (`--exact <name>`).
+  Default: server setting (30 s via the VS Code extension); when the
+  server default is also absent or `0`, filter mode still applies a
+  hard-coded **30-second** fallback. Pass `per_test_timeout_secs: 0`
+  to fully disable for a call.
 
-Raise either (or pass `0` to disable) for runs you know are slow —
-long integration suites, benchmark-style tests, tests that internally
-poll. Lower either when sanity-checking a fix to fail fast on an
-infinite loop. When both are set in filter mode, whichever fires
-first kills the launch.
+When both are set in filter mode, whichever fires first kills the
+affected invocation.
+
+**Per-test execution mode (`cargo-mcp.test.perTestExecution`)**
+
+When this VS Code setting is **enabled**, `cargo_test` with `test_filter`
+runs each matched test as its own `cargo test -- --exact <name>` invocation
+instead of batching all matches for a binary into a single call.
+
+| | Batched (default) | Per-test (`perTestExecution: true`) |
+|---|---|---|
+| Processes per binary | 1 (all matches) | 1 per matched test |
+| Hung test identified? | No — infer from last output line | Yes — in `x-cargo-mcp-invocation` `argv` |
+| `per_test_timeout_secs` meaning | Idle watchdog (resets on completions) | Wall-clock cap per invocation |
+| Tests run serially? | No (libtest thread pool) | Yes |
+| Overhead | Minimal | ~200–500 ms per test (cargo startup) |
+
+Recommended when you are diagnosing hangs or need unambiguous per-test
+timeout attribution. Leave disabled for broad filter runs where throughput
+matters more.
 
 **Regex-based test selection (`test_filter`)**
 
@@ -383,10 +399,13 @@ launches only when the OS argv length limit forces chunking the name list).
   `test_filter` in this revision — they are a separate cargo target with
   no libtest `--list` analogue.
 - Hung-test protection is provided by `per_test_timeout_secs` (see
-  *Timeouts* above), which defaults on under filter mode. A hard
-  overall cap is available as `timeout_secs`; in filter mode it
-  defaults off, so by default a long matched run is allowed to
-  complete as long as each individual test makes progress.
+  *Timeouts* above), which defaults on under filter mode. The behaviour
+  on a hang depends on the `cargo-mcp.test.perTestExecution` setting:
+  in batched mode the watchdog fires after the test pool goes silent;
+  in per-test mode the hung test is named directly in the invocation
+  header. A hard overall cap is available as `timeout_secs`; in filter
+  mode it defaults off, so by default a long matched run is allowed to
+  complete as long as progress is being made.
 - The response includes two filter-mode trailers in addition to the
   usual records: an `x-cargo-mcp-test-filter-discovery` record that
   reports how many tests each binary enumerated vs. matched, and an
@@ -451,9 +470,11 @@ the summary indicates failures worth drilling into.
   "test": "integration_tests",        // optional: specific integration test target name
   "no_fail_fast": true,               // optional: run all tests even if some fail
   "timeout_secs": 0,                  // optional: overall wall-clock cap; 0 disables
-  "per_test_timeout_secs": 30,        // optional: per-test idle watchdog (filter mode only); 0 disables
+  "per_test_timeout_secs": 30,        // optional: per-test budget (filter mode); 0 disables
   "env": { "RUST_BACKTRACE": "1" },   // optional: one-shot env for this call only
   // optional: regex-based selection.
+  // When cargo-mcp.test.perTestExecution is enabled, each match runs as its own
+  // cargo process so the hung test is identified in the invocation header.
   "test_filter": {
     "pattern": "tests::parser::(commas|braces)$", // required: RE2-style regex
     "include_ignored": false                        // optional, default false
