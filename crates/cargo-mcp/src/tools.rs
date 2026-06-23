@@ -3324,11 +3324,18 @@ fn call_setup(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
     let mut body = String::from(CARGO_MCP_INSTRUCTIONS);
     body.push_str(nextest_instructions_block(has_nextest_config));
 
+    // Use a 4-backtick outer fence: CARGO_MCP_INSTRUCTIONS embeds
+    // ```json blocks (and may in future embed other ``` blocks), and a
+    // 3-backtick outer fence would be closed by the first inner fence,
+    // truncating the rendered snippet in Copilot Chat / GitHub. Per
+    // CommonMark, a fenced code block ends only at a fence of *at
+    // least* the opening length, so 4 backticks safely escapes any
+    // 3-backtick content.
     let mut out = format!(
         "Add the following section to the appropriate Copilot instruction file \
          in this repository. Adapt the wording to fit the project's existing \
          conventions — the meaning matters, not the exact phrasing.\
-         \n\n```markdown\n{body}```"
+         \n\n````markdown\n{body}````"
     );
 
     if !nextest_present {
@@ -4738,5 +4745,41 @@ mod tests {
             text.contains("Recommended: cargo-nextest"),
             "expected escalation to 'Recommended' when .config/nextest.toml exists:\n{text}"
         );
+    }
+
+    #[test]
+    fn cargo_setup_outer_fence_is_longer_than_any_inner_fence() {
+        // CARGO_MCP_INSTRUCTIONS embeds ```json fenced blocks. If the
+        // outer wrapping fence were also 3 backticks, the first inner
+        // fence would close the outer one, truncating the rendered
+        // snippet in Copilot Chat / GitHub. CommonMark closes a fenced
+        // block only at a fence of at least the opening length, so the
+        // outer fence must be longer than any fence appearing inside
+        // the body. Lock that invariant in.
+        let text =
+            call_setup(&serde_json::json!({})).expect("call_setup must succeed without args");
+        let outer = "````markdown";
+        assert!(
+            text.contains(outer),
+            "outer markdown fence missing or wrong length:\n{text}"
+        );
+        // Every line strictly between the outer fences must contain at
+        // most 3 consecutive backticks at line start (the typical inner
+        // fence). Bumping a future inner fence to 4 backticks would
+        // require bumping the outer to 5 — the test below guards that.
+        let start = text.find(outer).expect("outer open fence present");
+        let after_open = start + outer.len();
+        let close_rel = text[after_open..]
+            .find("````")
+            .expect("outer close fence present");
+        let inner = &text[after_open..after_open + close_rel];
+        for line in inner.lines() {
+            let leading: String = line.chars().take_while(|c| *c == '`').collect();
+            assert!(
+                leading.len() <= 3,
+                "inner line has a {}-backtick fence; bump the outer fence too: {line:?}",
+                leading.len()
+            );
+        }
     }
 }
