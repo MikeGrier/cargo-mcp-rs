@@ -51,18 +51,20 @@ pub(crate) enum NextestProbe {
 /// (via [`invoke::resolve_cargo_binary`]), so the probe and the real run
 /// agree on which cargo's plugin search path is consulted.
 ///
+/// **Workspace-independent.** Plugin detection is PATH-based, so we do
+/// NOT inherit the caller's `working_dir`. Spawning in an invalid path
+/// would fail at the OS layer (treated as `Missing`) and we'd return
+/// install instructions for what is actually a bad-path problem.
+///
 /// **Not cached.** A user who installs nextest mid-session should be able
 /// to retry immediately without restarting the MCP server.
-pub(crate) fn probe(working_dir: Option<&str>) -> NextestProbe {
+pub(crate) fn probe() -> NextestProbe {
     let (cargo_path, _src) = invoke::resolve_cargo_binary();
     let mut cmd = Command::new(&cargo_path);
     cmd.args(["nextest", "--version"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    if let Some(wd) = working_dir {
-        cmd.current_dir(wd);
-    }
     match cmd.status() {
         Ok(s) if s.success() => NextestProbe::Installed,
         _ => NextestProbe::Missing,

@@ -3309,7 +3309,7 @@ fn call_setup(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
     let (nextest_present, has_nextest_config) = if wd.is_some() {
         (
             matches!(
-                crate::nextest::probe(wd),
+                crate::nextest::probe(),
                 crate::nextest::NextestProbe::Installed
             ),
             crate::nextest::workspace_has_nextest_config(wd),
@@ -3402,9 +3402,8 @@ fn call_nextest_run(
     args: &Value,
     on_progress: Option<&mut dyn FnMut(&str)>,
 ) -> Result<ToolResult, Box<dyn std::error::Error>> {
-    let wd = opt_str(args, "working_dir");
     if matches!(
-        crate::nextest::probe(wd),
+        crate::nextest::probe(),
         crate::nextest::NextestProbe::Missing
     ) {
         return Ok(crate::nextest::missing_install_result());
@@ -3415,9 +3414,8 @@ fn call_nextest_run(
 /// Wrapper around [`crate::nextest::call_list`] that probes for the
 /// `cargo-nextest` plugin first.
 fn call_nextest_list(args: &Value) -> Result<ToolResult, Box<dyn std::error::Error>> {
-    let wd = opt_str(args, "working_dir");
     if matches!(
-        crate::nextest::probe(wd),
+        crate::nextest::probe(),
         crate::nextest::NextestProbe::Missing
     ) {
         return Ok(crate::nextest::missing_install_result());
