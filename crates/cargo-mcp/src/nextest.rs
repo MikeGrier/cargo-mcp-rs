@@ -301,7 +301,6 @@ struct NextestOwnedOpts {
     filter_expr: Option<String>,
     filter: Option<String>,
     run_ignored: Option<String>,
-    message_format: Option<String>,
     list_type: Option<String>,
 }
 
@@ -316,7 +315,6 @@ impl NextestOwnedOpts {
             filter_expr: opt_str(args, "filter_expr").map(String::from),
             filter: opt_str(args, "filter").map(String::from),
             run_ignored: opt_str(args, "run_ignored").map(String::from),
-            message_format: opt_str(args, "message_format").map(String::from),
             list_type: opt_str(args, "list_type").map(String::from),
         }
     }
@@ -457,17 +455,15 @@ pub(crate) fn call_list(args: &Value) -> Result<ToolResult, Box<dyn std::error::
     let nx = NextestOwnedOpts::from_args(args);
     validate_list_type(nx.list_type.as_deref())?;
 
-    // Default to JSON output (the whole reason we expose this tool: a
-    // structured discovery payload the agent can consume directly). Callers
-    // may override with `message_format` if they want human / oneline /
-    // json-pretty.
-    let message_format = nx.message_format.as_deref().unwrap_or("json");
-
+    // Always emit nextest's stable JSON discovery format. The tool's
+    // contract (and its NDJSON framing) depends on a single machine-
+    // parseable payload line; exposing `--message-format human` or
+    // `json-pretty` would break that, so we don't accept the knob at all.
     let mut argv: Vec<&str> = vec![
         "nextest",
         "list",
         "--message-format",
-        message_format,
+        "json",
         "--cargo-message-format=json",
     ];
 

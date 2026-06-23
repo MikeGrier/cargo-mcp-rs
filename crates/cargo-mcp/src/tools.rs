@@ -2633,11 +2633,6 @@ pub fn list() -> Value {
                         "description":
                         "Type of listing: `full` (every test name; default) or `binaries-only` \
                          (just the test binary list, no per-test enumeration)." },
-                    "message_format": { "type": "string",
-                        "enum": ["auto", "human", "oneline", "json", "json-pretty"],
-                        "description":
-                        "Nextest output format. Defaults to `json` so the agent gets structured \
-                         discovery data; override only if you specifically need the human reporter." },
 
                     "target":              { "type": "string",  "description": TARGET_DESC },
                     "target_dir":          { "type": "string",  "description": TARGET_DIR_DESC },
