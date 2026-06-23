@@ -185,10 +185,18 @@ fn format_nextest_run_output(out: &CargoOutput, argv: &[&str], wd: Option<&str>)
 
 /// Format the output of `cargo nextest list --message-format json`.
 ///
-/// nextest's `list` emits a single JSON document on stdout. We forward it
-/// verbatim under a one-line `x-cargo-mcp-invocation` header (so the
-/// response remains framed the same way as every other tool), then append
-/// a status trailer.
+/// nextest's `list` emits JSON on stdout (plus, when
+/// `--cargo-message-format=json` is in effect, cargo's build-phase
+/// `compiler-message` / `build-finished` records ahead of it). We wrap
+/// the whole stream in a one-line `x-cargo-mcp-invocation` header and a
+/// JSON status trailer so the response is framed identically to every
+/// other cargo-mcp tool.
+///
+/// To keep the response a strict one-JSON-object-per-line stream even if
+/// upstream ever switches to pretty-printed output, every non-empty
+/// stdout line that parses as JSON is re-serialised in compact form;
+/// non-JSON lines pass through verbatim (we'd rather forward something
+/// unrecognised than drop it on the floor).
 fn format_nextest_list_output(out: &CargoOutput, argv: &[&str], wd: Option<&str>) -> String {
     let header = invocation_header(argv, wd);
     let stdout = out.stdout.trim_end_matches('\n');
@@ -200,7 +208,31 @@ fn format_nextest_list_output(out: &CargoOutput, argv: &[&str], wd: Option<&str>
     let stderr_trimmed = out.stderr.trim();
     let mut parts: Vec<String> = Vec::with_capacity(3);
     if !stdout.is_empty() {
-        parts.push(stdout.to_owned());
+        // First try the whole stdout as a single JSON document — that
+        // catches a future nextest that switches to pretty-printed
+        // output (multi-line `{ ... }`), where per-line parsing would
+        // fail on every brace line and we'd forward the pretty-print
+        // verbatim. If the whole-blob parse fails, fall back to
+        // line-by-line compaction so an NDJSON-style stream
+        // (cargo build records ahead of the list payload) still works.
+        let compacted_blob = serde_json::from_str::<Value>(stdout)
+            .ok()
+            .and_then(|v| serde_json::to_string(&v).ok());
+        if let Some(line) = compacted_blob {
+            parts.push(line);
+        } else {
+            let per_line: Vec<String> = stdout
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(|l| match serde_json::from_str::<Value>(l) {
+                    Ok(v) => serde_json::to_string(&v).unwrap_or_else(|_| l.to_owned()),
+                    Err(_) => l.to_owned(),
+                })
+                .collect();
+            if !per_line.is_empty() {
+                parts.push(per_line.join("\n"));
+            }
+        }
     }
     parts.push(trailer);
     if !stderr_trimmed.is_empty() {
@@ -592,5 +624,57 @@ mod tests {
         assert!(validate_list_type(Some("full")).is_ok());
         assert!(validate_list_type(Some("binaries-only")).is_ok());
         assert!(validate_list_type(Some("nope")).is_err());
+    }
+
+    #[test]
+    fn format_nextest_list_output_compacts_pretty_printed_json() {
+        // Defence in depth: even though `cargo_nextest_list` always
+        // requests `--message-format json`, a future nextest could
+        // start pretty-printing or interleave records. The formatter
+        // must still emit exactly one JSON object per line so the
+        // overall response (header + payload lines + trailer) parses
+        // line-by-line.
+        let pretty = "{\n  \"rust-build-meta\": {\n    \"target-directory\": \"target\"\n  },\n  \"test-count\": 1\n}\n";
+        let out = CargoOutput {
+            stdout: pretty.into(),
+            stderr: String::new(),
+            exit_code: 0,
+        };
+        let s = format_nextest_list_output(&out, &["nextest", "list"], None);
+        for line in s.lines() {
+            assert!(
+                !line.trim().is_empty(),
+                "blank line in framed output: {s:?}"
+            );
+            serde_json::from_str::<Value>(line).unwrap_or_else(|e| {
+                panic!("line is not a single JSON object: {line:?} ({e}); full output: {s}")
+            });
+        }
+        // The compacted payload preserves the original data.
+        let payload_line = s
+            .lines()
+            .find(|l| l.contains("rust-build-meta"))
+            .expect("payload line present");
+        let v: Value = serde_json::from_str(payload_line).expect("payload parses");
+        assert_eq!(v["test-count"], 1);
+        assert_eq!(v["rust-build-meta"]["target-directory"], "target");
+    }
+
+    #[test]
+    fn format_nextest_list_output_passes_non_json_lines_through() {
+        // If upstream ever emits a non-JSON warning line we'd rather
+        // forward it than silently drop it. The framing still holds
+        // because the non-JSON line is just text — the overall output
+        // stops being parseable JSON-per-line for that one record, but
+        // nothing is lost.
+        let mixed = "{\"test-count\":0}\nWARN: experimental feature\n";
+        let out = CargoOutput {
+            stdout: mixed.into(),
+            stderr: String::new(),
+            exit_code: 0,
+        };
+        let s = format_nextest_list_output(&out, &["nextest", "list"], None);
+        assert!(s.contains("\"test-count\":0"));
+        assert!(s.contains("WARN: experimental feature"));
     }
 }
