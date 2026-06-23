@@ -28,6 +28,10 @@ Install, reload, run `/cargo-mcp:setup` once per repo. That's it.
   file-indexer collisions in `target\` no longer derail multi-step tasks.
 - **Toolchain transparency** — the `cargo_diagnostic` tool reports exactly
   which `cargo` and `rustc` will be invoked, and why.
+- **[cargo-nextest](https://nexte.st/) support** — `cargo_nextest_run` and
+  `cargo_nextest_list` are wired up alongside `cargo_test` for per-test
+  process isolation, built-in retries, and filter expressions (install
+  instructions are emitted automatically when the plugin is missing).
 - **Zero MCP config** — the extension bundles the server and registers it
   with VS Code automatically. No `mcp.json` to edit.
 
@@ -86,6 +90,7 @@ Install, reload, run `/cargo-mcp:setup` once per repo. That's it.
 | `cargo_fix` | Apply machine-applicable fixes in bulk |
 | `cargo_add` / `cargo_remove` | Dependency management |
 | `cargo_publish` | Publish to crates.io (`dry_run` recommended first) |
+| `cargo_nextest_run` / `cargo_nextest_list` | Run / enumerate tests via [cargo-nextest](https://nexte.st/) (requires the `cargo-nextest` plugin) |
 | `cargo_diagnostic` | Report which `cargo`/`rustc` will be invoked |
 | `cargo_setup` | Return the canonical Copilot-instruction text |
 

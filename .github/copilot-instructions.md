@@ -39,6 +39,8 @@ Two specific things that are NOT reasons to fall back to the terminal:
 | `cargo_add` | `cargo add` |
 | `cargo_remove` | `cargo remove` |
 | `cargo_publish` | `cargo publish` |
+| `cargo_nextest_run` | `cargo nextest run` (requires cargo-nextest) |
+| `cargo_nextest_list` | `cargo nextest list` (requires cargo-nextest) |
 
 ### When to use each tool
 
@@ -55,6 +57,14 @@ Two specific things that are NOT reasons to fall back to the terminal:
   machine-applicable fixes in bulk.
 - **`cargo_publish`** — always run with `dry_run: true` first to validate;
   only publish for real when the dry-run succeeds.
+- **`cargo_nextest_run` / `cargo_nextest_list`** — prefer these over
+  `cargo_test` when the workspace contains a `.config/nextest.toml`, when
+  the user asks for nextest, or when per-test process isolation / built-in
+  retries / filter expressions are wanted. NOTE: nextest does **not**
+  support doctests — keep using `cargo_test` with `doc: true` for those.
+  If the `cargo-nextest` plugin is not installed the tool returns an
+  error result whose body contains fenced install commands; the user can
+  click **Copy** or **Run in Terminal** on the fence and re-run.
 
 ### Toolchain override (`+toolchain`)
 

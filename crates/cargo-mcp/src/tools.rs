@@ -135,6 +135,8 @@ for cargo just because a previous step used the terminal.\n\n\
 | `cargo_add` | `cargo add` |\n\
 | `cargo_remove` | `cargo remove` |\n\
 | `cargo_publish` | `cargo publish` |\n\
+| `cargo_nextest_run` | `cargo nextest run` (requires cargo-nextest) |\n\
+| `cargo_nextest_list` | `cargo nextest list` (requires cargo-nextest) |\n\
 | `cargo_setup` | *(no terminal equivalent)* |\n\
 | `cargo_diagnostic` | *(no terminal equivalent)* |\n\n\
 ### Boolean arguments\n\n\
@@ -1366,6 +1368,15 @@ fn keep_in_summary(line: &str, kind: SummaryKind) -> bool {
             let text = v.get("text").and_then(|t| t.as_str()).unwrap_or("");
             is_test_summary_line(text)
         }
+        crate::nextest::NEXTEST_OUTPUT_REASON if matches!(kind, SummaryKind::Test) => {
+            // Nextest uses its own human reporter (not libtest's), so its
+            // summary-worthy lines are matched by a different predicate.
+            // Without this branch every test-phase line would be dropped
+            // from the on-disk-redirect summary, leaving callers with
+            // just header + status and no failure context.
+            let text = v.get("text").and_then(|t| t.as_str()).unwrap_or("");
+            is_nextest_summary_line(text)
+        }
         _ => false,
     }
 }
@@ -1385,6 +1396,39 @@ fn is_test_summary_line(text: &str) -> bool {
         || trimmed.starts_with("---- ")
         || trimmed.contains("panicked at")
         || trimmed.starts_with("note: run with")
+}
+
+/// True for nextest human-reporter lines that belong in the on-disk-redirect
+/// summary. Mirrors [`is_test_summary_line`] for libtest, but the patterns
+/// are different because nextest does not use libtest's reporter format.
+///
+/// What stays: the run header (`Starting N tests across …`), the final
+/// `Summary [...]` rollup, per-test failure / flake / leak / timeout / slow
+/// markers, and the per-failure stdout/stderr section headers. What gets
+/// dropped (kept only in the redirected file): the per-test `PASS` lines
+/// and the captured stdout/stderr bodies of failing tests.
+fn is_nextest_summary_line(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    if trimmed.starts_with("Starting ")
+        || trimmed.starts_with("Summary ")
+        || trimmed.starts_with("--- STDOUT:")
+        || trimmed.starts_with("--- STDERR:")
+        || trimmed.contains("panicked at")
+    {
+        return true;
+    }
+    // Per-test result markers from nextest's human reporter. `PASS` is
+    // intentionally omitted — passing-test lines are the bulk of test
+    // output and stay in the on-disk file, not the inline summary.
+    const MARKERS: &[&str] = &["FAIL", "FLAKY", "LEAK", "TIMEOUT", "SIGABRT", "SLOW"];
+    for m in MARKERS {
+        if let Some(rest) = trimmed.strip_prefix(m)
+            && (rest.starts_with(' ') || rest.starts_with('['))
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// True for cargo's `build-finished` JSON record. With `--message-format=json`
@@ -2468,10 +2512,25 @@ pub fn list() -> Value {
                  section best fits given the project's existing conventions, and \
                  add or update it as needed. The wording does not need to match \
                  exactly — adapt it to the style of any existing instructions. \
-                 Run this once after installing cargo-mcp in a new repository.",
+                 Run this once after installing cargo-mcp in a new repository. \
+                 When `working_dir` is supplied, the tool also probes for \
+                 `cargo-nextest` and (if missing) appends install commands as \
+                 fenced shell blocks that VS Code Copilot Chat renders with \
+                 **Copy** / **Run in Terminal** buttons.",
             "inputSchema": {
                 "type": "object",
-                "properties": {},
+                "properties": {
+                    "working_dir": {
+                        "type": "string",
+                        "description":
+                            "Optional absolute path to the workspace root. When set, \
+                             the tool detects whether the workspace contains a \
+                             `.config/nextest.toml` (which escalates the cargo-nextest \
+                             section from optional to recommended) and whether the \
+                             `cargo-nextest` plugin is installed (so it can suggest \
+                             installation when missing)."
+                    }
+                },
                 "required": []
             },
             "annotations": { "readOnlyHint": true, "destructiveHint": false }
@@ -2492,6 +2551,215 @@ pub fn list() -> Value {
                         "type": "string",
                         "description": WORKING_DIR_DESC_DIAGNOSTIC
                     }
+                },
+                "required": []
+            },
+            "annotations": { "readOnlyHint": true, "destructiveHint": false }
+        },
+        {
+            "name": "cargo_nextest_run",
+            "description":
+                "Run the project's test suite via cargo-nextest (`cargo nextest run`). \
+                 Prefer this over `cargo_test` when the workspace contains a \
+                 `.config/nextest.toml`, when the user asks for nextest, or when you \
+                 want per-test process isolation, built-in flaky-test retries, or \
+                 nextest's filter expressions. NOTE: nextest does NOT support \
+                 doctests \u{2014} use `cargo_test` with `doc: true` for those. \
+                 If cargo-nextest is not installed the tool returns an error whose \
+                 body contains fenced install commands; VS Code Copilot Chat will \
+                 render those with **Copy** and **Run in Terminal** buttons. \
+                 Output is a strict NDJSON stream: cargo build diagnostics \
+                 (reason=compiler-message, reason=build-finished) followed by \
+                 nextest's human reporter output wrapped one-line-per-record \
+                 (reason=x-cargo-mcp-nextest-output, field: text) and a final \
+                 status trailer. Per-test enforcement (slow-timeout, \
+                 terminate-after) is delegated to nextest's profile config; \
+                 cargo-mcp adds only the OVERALL `timeout_secs` wall-clock cap \
+                 (deferred-armed on `build-finished`, same as `cargo_test`). \
+                 ALWAYS pass `working_dir` set to the absolute path of your \
+                 workspace root.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "working_dir": { "type": "string", "description": WORKING_DIR_DESC },
+                    "toolchain":   { "type": "string", "description": TOOLCHAIN_DESC },
+                    "env": {
+                        "type": "object",
+                        "additionalProperties": { "type": ["string", "null"] },
+                        "description": ENV_DESC
+                    },
+                    "output_path": { "type": "string", "description": OUTPUT_PATH_DESC },
+
+                    "package":   { "type": "string",  "description":
+                        "Test only the named package within the workspace. Omit to test all members." },
+                    "workspace": { "type": "boolean", "description": WORKSPACE_DESC },
+                    "exclude":   { "type": "string",  "description": EXCLUDE_DESC },
+
+                    "lib":          { "type": "boolean", "description":
+                        "If true, only run library tests (--lib). Default: false." },
+                    "bins":         { "type": "boolean", "description": BINS_DESC },
+                    "bin":          { "type": "string",  "description": BIN_DESC },
+                    "examples":     { "type": "boolean", "description": EXAMPLES_DESC },
+                    "example":      { "type": "string",  "description": EXAMPLE_DESC },
+                    "tests":        { "type": "boolean", "description": TESTS_DESC },
+                    "test":         { "type": "string",  "description":
+                        "Run only the integration test target with this name \
+                         (filename without .rs extension under tests/)." },
+                    "benches":      { "type": "boolean", "description": BENCHES_DESC },
+                    "bench":        { "type": "string",  "description": BENCH_DESC },
+                    "all_targets":  { "type": "boolean", "description": ALL_TARGETS_DESC },
+
+                    "features":             { "type": "string",  "description":
+                        "Comma-separated list of features to activate. Omit to use default features." },
+                    "all_features":         { "type": "boolean", "description":
+                        "If true, activate all features of all selected packages. Default: false." },
+                    "no_default_features":  { "type": "boolean", "description":
+                        "If true, do not activate the `default` feature. Default: false." },
+
+                    "release":         { "type": "boolean", "description":
+                        "If true, build artifacts in release mode (--release). Mutually exclusive \
+                         with `cargo_profile`; `cargo_profile` wins when both are supplied." },
+                    "cargo_profile":   { "type": "string",  "description":
+                        "Cargo build profile (passed to nextest as `--cargo-profile`). NOTE: this is \
+                         different from `nextest_profile`, which selects per-test nextest config. \
+                         Mutually exclusive with `release`; `cargo_profile` wins." },
+                    "nextest_profile": { "type": "string",  "description":
+                        "Nextest profile to use, defined in `.config/nextest.toml` (passed as \
+                         `--profile`). Selects per-test settings like slow-timeout, retries, and \
+                         JUnit emission. NOT the cargo build profile." },
+                    "build_jobs":      { "type": "integer", "minimum": 1, "description":
+                        "Number of build jobs (passed as `--build-jobs`). Cargo build parallelism." },
+                    "test_threads":    { "type": "integer", "minimum": 1, "description":
+                        "Number of test threads (passed as `--test-threads`). Test execution parallelism." },
+                    "retries":         { "type": "integer", "minimum": 0, "description":
+                        "Retry each failing test up to N times (passed as `--retries N`). \
+                         Useful for flaky tests; nextest reports the per-test retry count in its \
+                         summary." },
+                    "no_capture":      { "type": "boolean", "description":
+                        "If true, do not capture test stdout/stderr (passes `--no-capture`). \
+                         Streams test output live as the tests run. Unlike `cargo test`'s \
+                         `--nocapture`, nextest's `--no-capture` does NOT force single-threaded \
+                         execution \u{2014} use `test_threads: 1` explicitly if you also want \
+                         that. Default: false." },
+                    "run_ignored":     { "type": "string", "enum": ["default", "only", "all"],
+                        "description":
+                        "Which ignored tests to run: `default` (skip ignored), `only` (run only \
+                         ignored tests), `all` (run both ignored and non-ignored). Default: `default`." },
+
+                    "filter_expr": { "type": "string", "description":
+                        "Nextest filter expression (passed as `-E '<expr>'`). See \
+                         https://nexte.st/docs/filtersets for the DSL. STRICTLY MORE EXPRESSIVE \
+                         than `cargo_test`'s `test_name` substring or `test_filter` regex. \
+                         Examples: `test(my_test)`, `kind(lib) + binary(my-bin)`, \
+                         `test(=my::exact::name)`, `not test(slow_)`." },
+                    "filter":      { "type": "string", "description":
+                        "Bare positional test-name substring filter (cargo-test-compatible). \
+                         Combined with `filter_expr` when both are supplied (both apply)." },
+
+                    "target":              { "type": "string",  "description": TARGET_DESC },
+                    "target_dir":          { "type": "string",  "description": TARGET_DIR_DESC },
+                    "manifest_path":       { "type": "string",  "description": MANIFEST_PATH_DESC },
+                    "ignore_rust_version": { "type": "boolean", "description": IGNORE_RUST_VERSION_DESC },
+                    "offline":             { "type": "boolean", "description": OFFLINE_DESC },
+                    "frozen":              { "type": "boolean", "description": FROZEN_DESC },
+                    "locked":              { "type": "boolean", "description":
+                        "If true, require an up-to-date Cargo.lock (passes --locked). Default: false." },
+
+                    "no_fail_fast":  { "type": "boolean", "description":
+                        "If true, run all tests even if some fail (passes --no-fail-fast). Default: false." },
+                    "no_run":        { "type": "boolean", "description": NO_RUN_DESC },
+
+                    "timeout_secs":  { "type": "integer", "minimum": 0, "description":
+                        "OVERALL wall-clock cap on the execution phase (does not include the build). \
+                         Same three-state semantics as `cargo_test`: omit to use the server default, \
+                         pass 0 to disable, pass N to cap at N seconds. PER-TEST enforcement is the \
+                         job of nextest's profile config (`slow-timeout`, `terminate-after`); \
+                         cargo-mcp does NOT expose a per-test-timeout knob for nextest." }
+                },
+                "required": []
+            },
+            "annotations": { "readOnlyHint": true, "destructiveHint": false }
+        },
+        {
+            "name": "cargo_nextest_list",
+            "description":
+                "Enumerate test cases via cargo-nextest (`cargo nextest list`). \
+                 Returns nextest's stable JSON discovery output (default) so the agent \
+                 can inspect the per-binary test catalogue programmatically. \
+                 If cargo-nextest is not installed the tool returns an error whose \
+                 body contains fenced install commands. \
+                 ALWAYS pass `working_dir` set to the absolute path of your \
+                 workspace root.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "working_dir": { "type": "string", "description": WORKING_DIR_DESC },
+                    "toolchain":   { "type": "string", "description": TOOLCHAIN_DESC },
+                    "env": {
+                        "type": "object",
+                        "additionalProperties": { "type": ["string", "null"] },
+                        "description": ENV_DESC
+                    },
+
+                    "package":   { "type": "string",  "description":
+                        "List tests only for the named package. Omit to list all workspace members." },
+                    "workspace": { "type": "boolean", "description": WORKSPACE_DESC },
+                    "exclude":   { "type": "string",  "description": EXCLUDE_DESC },
+
+                    "lib":         { "type": "boolean", "description":
+                        "If true, only list library tests (--lib). Default: false." },
+                    "bins":        { "type": "boolean", "description": BINS_DESC },
+                    "bin":         { "type": "string",  "description": BIN_DESC },
+                    "examples":    { "type": "boolean", "description": EXAMPLES_DESC },
+                    "example":     { "type": "string",  "description": EXAMPLE_DESC },
+                    "tests":       { "type": "boolean", "description": TESTS_DESC },
+                    "test":        { "type": "string",  "description":
+                        "List only the integration test target with this name." },
+                    "benches":     { "type": "boolean", "description": BENCHES_DESC },
+                    "bench":       { "type": "string",  "description": BENCH_DESC },
+                    "all_targets": { "type": "boolean", "description": ALL_TARGETS_DESC },
+
+                    "features":             { "type": "string",  "description":
+                        "Comma-separated list of features to activate. Omit to use default features." },
+                    "all_features":         { "type": "boolean", "description":
+                        "If true, activate all features. Default: false." },
+                    "no_default_features":  { "type": "boolean", "description":
+                        "If true, do not activate the default feature. Default: false." },
+
+                    "release":          { "type": "boolean", "description":
+                        "If true, build artifacts in release mode. Mutually exclusive with \
+                         `cargo_profile`; `cargo_profile` wins." },
+                    "cargo_profile":    { "type": "string",  "description":
+                        "Cargo build profile (passed as `--cargo-profile`). NOT the nextest profile." },
+                    "nextest_profile":  { "type": "string",  "description":
+                        "Nextest profile to use (passed as `--profile`). Selects per-test config \
+                         from `.config/nextest.toml`. Affects which tests are enumerated when the \
+                         profile defines a default filter." },
+                    "build_jobs":       { "type": "integer", "minimum": 1, "description":
+                        "Number of build jobs (passed as `--build-jobs`)." },
+
+                    "run_ignored": { "type": "string", "enum": ["default", "only", "all"],
+                        "description":
+                        "Which ignored tests to enumerate. Default: `default`." },
+                    "filter_expr": { "type": "string", "description":
+                        "Nextest filter expression (passed as `-E '<expr>'`). See \
+                         https://nexte.st/docs/filtersets." },
+                    "filter":      { "type": "string", "description":
+                        "Bare positional test-name substring filter." },
+
+                    "list_type":      { "type": "string", "enum": ["full", "binaries-only"],
+                        "description":
+                        "Type of listing: `full` (every test name; default) or `binaries-only` \
+                         (just the test binary list, no per-test enumeration)." },
+
+                    "target":              { "type": "string",  "description": TARGET_DESC },
+                    "target_dir":          { "type": "string",  "description": TARGET_DIR_DESC },
+                    "manifest_path":       { "type": "string",  "description": MANIFEST_PATH_DESC },
+                    "ignore_rust_version": { "type": "boolean", "description": IGNORE_RUST_VERSION_DESC },
+                    "offline":             { "type": "boolean", "description": OFFLINE_DESC },
+                    "frozen":              { "type": "boolean", "description": FROZEN_DESC },
+                    "locked":              { "type": "boolean", "description":
+                        "If true, require an up-to-date Cargo.lock. Default: false." }
                 },
                 "required": []
             },
@@ -2522,6 +2790,8 @@ pub fn tool_names() -> Vec<&'static str> {
         "cargo_publish",
         "cargo_setup",
         "cargo_diagnostic",
+        "cargo_nextest_run",
+        "cargo_nextest_list",
     ]
 }
 
@@ -2577,6 +2847,8 @@ fn call_inner(
         "cargo_publish" => call_publish(args),
         "cargo_setup" => call_setup(args).map(ToolResult::text_ok),
         "cargo_diagnostic" => call_diagnostic(args).map(ToolResult::text_ok),
+        "cargo_nextest_run" => call_nextest_run(args, on_progress),
+        "cargo_nextest_list" => call_nextest_list(args),
         _ => Err(format!("unknown tool: {name}").into()),
     }
 }
@@ -3102,14 +3374,131 @@ fn call_publish(args: &Value) -> Result<ToolResult, Box<dyn std::error::Error>> 
     })
 }
 
-fn call_setup(_args: &Value) -> Result<String, Box<dyn std::error::Error>> {
-    Ok(format!(
+fn call_setup(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
+    let wd = opt_str(args, "working_dir");
+
+    // The schema promises that nextest probing and the
+    // `.config/nextest.toml` escalation only happen when the caller
+    // supplied `working_dir`. Without it we'd be probing the cargo-mcp
+    // server's own environment, which has nothing to do with the
+    // workspace the agent is setting up — that would spawn an avoidable
+    // subprocess and make the response depend on server-side state the
+    // caller never opted into.
+    let (nextest_present, has_nextest_config) = if wd.is_some() {
+        (
+            matches!(
+                crate::nextest::probe(),
+                crate::nextest::NextestProbe::Installed
+            ),
+            crate::nextest::workspace_has_nextest_config(wd),
+        )
+    } else {
+        // Treat as: installed (so we don't emit an install hint based on
+        // server-side state) and no workspace config (so the block uses
+        // the generic "Optional" phrasing).
+        (true, false)
+    };
+
+    let mut body = String::from(CARGO_MCP_INSTRUCTIONS);
+    body.push_str(nextest_instructions_block(has_nextest_config));
+
+    // Use a 4-backtick outer fence: CARGO_MCP_INSTRUCTIONS embeds
+    // ```json blocks (and may in future embed other ``` blocks), and a
+    // 3-backtick outer fence would be closed by the first inner fence,
+    // truncating the rendered snippet in Copilot Chat / GitHub. Per
+    // CommonMark, a fenced code block ends only at a fence of *at
+    // least* the opening length, so 4 backticks safely escapes any
+    // 3-backtick content.
+    let mut out = format!(
         "Add the following section to the appropriate Copilot instruction file \
          in this repository. Adapt the wording to fit the project's existing \
          conventions — the meaning matters, not the exact phrasing.\
-         \n\n```markdown\n{}```",
-        CARGO_MCP_INSTRUCTIONS
-    ))
+         \n\n````markdown\n{body}````"
+    );
+
+    if !nextest_present {
+        out.push_str("\n\n");
+        out.push_str(&nextest_install_hint(has_nextest_config));
+    }
+
+    Ok(out)
+}
+
+/// Returns the "Optional: cargo-nextest" subsection appended to
+/// [`CARGO_MCP_INSTRUCTIONS`] in the `cargo_setup` output. The intro line
+/// is escalated from "Optional" to "Recommended" when the workspace
+/// already contains a `.config/nextest.toml`.
+fn nextest_instructions_block(has_nextest_config: bool) -> &'static str {
+    if has_nextest_config {
+        "\n### Recommended: cargo-nextest\n\n\
+         This workspace contains a `.config/nextest.toml`, so prefer \
+         `cargo_nextest_run` over `cargo_test` for unit and integration \
+         tests. Use `cargo_test` only for **doctests** (nextest does not \
+         support them). `cargo_nextest_list` enumerates tests as \
+         structured JSON when you need discovery without execution.\n"
+    } else {
+        "\n### Optional: cargo-nextest\n\n\
+         When `cargo-nextest` is installed, prefer `cargo_nextest_run` \
+         over `cargo_test` for projects that opt into it (workspace has a \
+         `.config/nextest.toml`, the user asks for nextest, or the suite \
+         benefits from per-test process isolation / built-in retries / \
+         filter expressions). `cargo_test` remains the canonical tool, \
+         and is the ONLY way to run **doctests** (nextest does not \
+         support them).\n"
+    }
+}
+
+/// Markdown hint with fenced install commands, surfaced when nextest is not
+/// installed. The intro escalates from "optional" to "recommended" when the
+/// workspace already contains a `.config/nextest.toml`.
+fn nextest_install_hint(has_nextest_config: bool) -> String {
+    let lead = if has_nextest_config {
+        "This workspace is configured for cargo-nextest (`.config/nextest.toml` \
+         is present) but the `cargo-nextest` plugin is **not installed**. \
+         Install it to take advantage of the workspace's nextest configuration:"
+    } else {
+        "Optional: `cargo-nextest` is not installed. Install it to enable the \
+         `cargo_nextest_run` / `cargo_nextest_list` tools (per-test process \
+         isolation, built-in flaky-test retries, filter expressions):"
+    };
+    format!(
+        "{lead}\n\n\
+         ```pwsh\n\
+         cargo install cargo-nextest --locked\n\
+         ```\n\n\
+         Or, for a much faster install of a pre-built binary:\n\n\
+         ```pwsh\n\
+         cargo binstall cargo-nextest\n\
+         ```\n"
+    )
+}
+
+/// Wrapper around [`crate::nextest::call_run`] that probes for the
+/// `cargo-nextest` plugin first and returns the install-instructions
+/// error result when the binary is missing.
+fn call_nextest_run(
+    args: &Value,
+    on_progress: Option<&mut dyn FnMut(&str)>,
+) -> Result<ToolResult, Box<dyn std::error::Error>> {
+    if matches!(
+        crate::nextest::probe(),
+        crate::nextest::NextestProbe::Missing
+    ) {
+        return Ok(crate::nextest::missing_install_result());
+    }
+    crate::nextest::call_run(args, on_progress)
+}
+
+/// Wrapper around [`crate::nextest::call_list`] that probes for the
+/// `cargo-nextest` plugin first.
+fn call_nextest_list(args: &Value) -> Result<ToolResult, Box<dyn std::error::Error>> {
+    if matches!(
+        crate::nextest::probe(),
+        crate::nextest::NextestProbe::Missing
+    ) {
+        return Ok(crate::nextest::missing_install_result());
+    }
+    crate::nextest::call_list(args)
 }
 
 /// Build a structured diagnostic report about cargo/rustc resolution.
@@ -4067,6 +4456,56 @@ mod tests {
     }
 
     #[test]
+    fn is_nextest_summary_line_matches_expected_patterns() {
+        // Nextest uses its own human reporter, not libtest's: per-test
+        // results begin with PASS/FAIL/FLAKY/etc. inside indented lines,
+        // failure bodies are bracketed by `--- STDOUT:` / `--- STDERR:`
+        // headers, and the run is bookended by `Starting ...` / `Summary ...`.
+        for kept in [
+            "    Starting 12 tests across 3 binaries",
+            "        FAIL [   0.001s] my-crate tests::it_works",
+            "        FLAKY [   0.005s] my-crate tests::flaky",
+            "        LEAK [   0.002s] my-crate tests::leaks",
+            "        TIMEOUT [   5.000s] my-crate tests::hangs",
+            "        SIGABRT my-crate tests::aborts",
+            "        SLOW [   1.500s] my-crate tests::slow_one",
+            "--- STDOUT:              my-crate tests::it_works ---",
+            "--- STDERR:              my-crate tests::it_works ---",
+            "thread 'main' panicked at src/lib.rs:1:1:",
+            "     Summary [   0.045s] 12 tests run: 11 passed, 1 failed, 0 skipped",
+        ] {
+            assert!(is_nextest_summary_line(kept), "should keep: {kept:?}");
+        }
+        for dropped in [
+            "        PASS [   0.001s] my-crate tests::it_works",
+            "    some captured println output",
+            "",
+            "------------",
+        ] {
+            assert!(
+                !is_nextest_summary_line(dropped),
+                "should drop: {dropped:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn keep_in_summary_keeps_nextest_summary_lines_under_test_kind() {
+        // The exact regression Copilot flagged: x-cargo-mcp-nextest-output
+        // records carrying summary-worthy text used to be dropped because
+        // keep_in_summary only knew about x-cargo-mcp-test-output.
+        let fail_line = r#"{"reason":"x-cargo-mcp-nextest-output","text":"        FAIL [   0.001s] my-crate tests::it_works"}"#;
+        assert!(keep_in_summary(fail_line, SummaryKind::Test));
+        let summary_line = r#"{"reason":"x-cargo-mcp-nextest-output","text":"     Summary [   0.045s] 12 tests run: 11 passed, 1 failed, 0 skipped"}"#;
+        assert!(keep_in_summary(summary_line, SummaryKind::Test));
+        // Pass lines stay dropped (kept verbatim in the on-disk file).
+        let pass_line = r#"{"reason":"x-cargo-mcp-nextest-output","text":"        PASS [   0.001s] my-crate tests::it_works"}"#;
+        assert!(!keep_in_summary(pass_line, SummaryKind::Test));
+        // Wrong SummaryKind: nextest-output is irrelevant outside Test mode.
+        assert!(!keep_in_summary(fail_line, SummaryKind::Build));
+    }
+
+    #[test]
     fn opt_bool_accepts_native_boolean() {
         let args = serde_json::json!({ "a": true, "b": false });
         assert!(opt_bool(&args, "a"));
@@ -4257,5 +4696,166 @@ mod tests {
             preview.contains("\\n"),
             "missing escaped newline: {preview:?}"
         );
+    }
+
+    // ── cargo-nextest registration & cargo_setup wiring ────────────────────
+
+    #[test]
+    fn tool_names_includes_nextest_tools() {
+        let names = tool_names();
+        assert!(names.contains(&"cargo_nextest_run"));
+        assert!(names.contains(&"cargo_nextest_list"));
+    }
+
+    #[test]
+    fn list_includes_nextest_tool_schemas() {
+        let v = list();
+        let arr = v.as_array().expect("list() must return a JSON array");
+        let names: Vec<&str> = arr
+            .iter()
+            .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
+            .collect();
+        assert!(names.contains(&"cargo_nextest_run"), "names: {names:?}");
+        assert!(names.contains(&"cargo_nextest_list"), "names: {names:?}");
+
+        // Spot-check the cargo_nextest_run schema exposes the divergent
+        // parameter names called out in DESIGN-NOTES (cargo_profile,
+        // nextest_profile, build_jobs, test_threads, filter_expr).
+        let run = arr
+            .iter()
+            .find(|t| t.get("name").and_then(|n| n.as_str()) == Some("cargo_nextest_run"))
+            .expect("cargo_nextest_run entry");
+        let props = run
+            .pointer("/inputSchema/properties")
+            .and_then(|p| p.as_object())
+            .expect("cargo_nextest_run inputSchema.properties");
+        for key in [
+            "cargo_profile",
+            "nextest_profile",
+            "build_jobs",
+            "test_threads",
+            "filter_expr",
+            "retries",
+        ] {
+            assert!(
+                props.contains_key(key),
+                "cargo_nextest_run missing property `{key}`; have: {:?}",
+                props.keys().collect::<Vec<_>>()
+            );
+        }
+        // The plain `jobs` knob from cargo_test must NOT leak into the
+        // nextest schema: nextest splits build vs. test parallelism, so
+        // accepting a single `jobs` value would silently misroute it.
+        assert!(
+            !props.contains_key("jobs"),
+            "cargo_nextest_run must not accept a bare `jobs` knob (use build_jobs / test_threads)"
+        );
+    }
+
+    #[test]
+    fn cargo_setup_mentions_nextest_in_instructions_block() {
+        let text =
+            call_setup(&serde_json::json!({})).expect("call_setup must succeed without args");
+        // Either escalation phrase is acceptable; the markdown block must
+        // mention cargo-nextest one way or the other so the agent learns
+        // when to reach for `cargo_nextest_run`.
+        assert!(
+            text.contains("cargo-nextest"),
+            "cargo_setup output should mention cargo-nextest:\n{text}"
+        );
+        assert!(
+            text.contains("cargo_nextest_run"),
+            "cargo_setup output should mention the cargo_nextest_run tool:\n{text}"
+        );
+    }
+
+    #[test]
+    fn cargo_setup_without_working_dir_skips_probe_and_uses_optional_phrasing() {
+        // Schema contract: when `working_dir` is omitted, cargo_setup
+        // must NOT probe for cargo-nextest (avoids a subprocess spawn
+        // and avoids letting the server's environment leak into the
+        // response). The block must always use the generic "Optional"
+        // phrasing in that mode and must never emit the install hint,
+        // regardless of whether nextest happens to be installed on the
+        // build machine.
+        let text =
+            call_setup(&serde_json::json!({})).expect("call_setup must succeed without args");
+        assert!(
+            text.contains("Optional: cargo-nextest"),
+            "expected 'Optional' phrasing without working_dir:\n{text}"
+        );
+        assert!(
+            !text.contains("Recommended: cargo-nextest"),
+            "must not escalate to 'Recommended' without working_dir:\n{text}"
+        );
+        assert!(
+            !text.contains("cargo install cargo-nextest"),
+            "must not emit install hint without working_dir:\n{text}"
+        );
+        assert!(
+            !text.contains("cargo binstall cargo-nextest"),
+            "must not emit binstall hint without working_dir:\n{text}"
+        );
+    }
+
+    #[test]
+    fn cargo_setup_escalates_when_workspace_has_nextest_config() {
+        let dir = std::env::temp_dir().join(format!(
+            "cargo-mcp-nextest-setup-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(dir.join(".config")).expect("create .config dir");
+        std::fs::write(dir.join(".config").join("nextest.toml"), b"# empty\n")
+            .expect("write nextest.toml");
+
+        let args = serde_json::json!({ "working_dir": dir.to_string_lossy() });
+        let text = call_setup(&args).expect("call_setup with working_dir must succeed");
+
+        // Cleanup before asserting so a failure doesn't leak the temp dir.
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            text.contains("Recommended: cargo-nextest"),
+            "expected escalation to 'Recommended' when .config/nextest.toml exists:\n{text}"
+        );
+    }
+
+    #[test]
+    fn cargo_setup_outer_fence_is_longer_than_any_inner_fence() {
+        // CARGO_MCP_INSTRUCTIONS embeds ```json fenced blocks. If the
+        // outer wrapping fence were also 3 backticks, the first inner
+        // fence would close the outer one, truncating the rendered
+        // snippet in Copilot Chat / GitHub. CommonMark closes a fenced
+        // block only at a fence of at least the opening length, so the
+        // outer fence must be longer than any fence appearing inside
+        // the body. Lock that invariant in.
+        let text =
+            call_setup(&serde_json::json!({})).expect("call_setup must succeed without args");
+        let outer = "````markdown";
+        assert!(
+            text.contains(outer),
+            "outer markdown fence missing or wrong length:\n{text}"
+        );
+        // Every line strictly between the outer fences must contain at
+        // most 3 consecutive backticks at line start (the typical inner
+        // fence). Bumping a future inner fence to 4 backticks would
+        // require bumping the outer to 5 — the test below guards that.
+        let start = text.find(outer).expect("outer open fence present");
+        let after_open = start + outer.len();
+        let close_rel = text[after_open..]
+            .find("````")
+            .expect("outer close fence present");
+        let inner = &text[after_open..after_open + close_rel];
+        for line in inner.lines() {
+            let leading: String = line.chars().take_while(|c| *c == '`').collect();
+            assert!(
+                leading.len() <= 3,
+                "inner line has a {}-backtick fence; bump the outer fence too: {line:?}",
+                leading.len()
+            );
+        }
     }
 }
