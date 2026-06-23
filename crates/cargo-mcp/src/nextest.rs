@@ -123,10 +123,14 @@ pub(crate) fn workspace_has_nextest_config(working_dir: Option<&str>) -> bool {
 /// Filter a `cargo nextest run` stdout NDJSON stream:
 /// - Keep `compiler-message` and `build-finished` records (forwarded by
 ///   nextest from cargo via `--cargo-message-format=json`).
-/// - Wrap every non-JSON line (nextest's human reporter output, captured
-///   test stdout) in an [`NEXTEST_OUTPUT_REASON`] NDJSON record.
-/// - Drop blank lines and `compiler-artifact` / `build-script-executed`
-///   noise (already delivered via streaming progress).
+/// - Drop blank lines and the known-noise cargo records
+///   `compiler-artifact` / `build-script-executed` (already delivered
+///   via streaming progress).
+/// - Wrap every other line — non-JSON (nextest's human reporter output,
+///   captured test stdout) **and** any JSON we don't explicitly
+///   recognise (e.g. structured logs a test prints, or future
+///   nextest/cargo record types) — in an [`NEXTEST_OUTPUT_REASON`]
+///   NDJSON record so it is preserved rather than silently dropped.
 fn filter_nextest_run_ndjson(stdout: &str) -> String {
     stdout
         .lines()
@@ -136,18 +140,22 @@ fn filter_nextest_run_ndjson(stdout: &str) -> String {
             }
             if let Ok(v) = serde_json::from_str::<Value>(line) {
                 match v.get("reason").and_then(|r| r.as_str()) {
-                    Some("compiler-message") | Some("build-finished") => Some(line.to_owned()),
-                    _ => None,
+                    Some("compiler-message") | Some("build-finished") => {
+                        return Some(line.to_owned());
+                    }
+                    Some("compiler-artifact") | Some("build-script-executed") => {
+                        return None;
+                    }
+                    _ => {}
                 }
-            } else {
-                Some(
-                    serde_json::to_string(&serde_json::json!({
-                        "reason": NEXTEST_OUTPUT_REASON,
-                        "text": line,
-                    }))
-                    .unwrap_or_else(|_| "{}".into()),
-                )
             }
+            Some(
+                serde_json::to_string(&serde_json::json!({
+                    "reason": NEXTEST_OUTPUT_REASON,
+                    "text": line,
+                }))
+                .unwrap_or_else(|_| "{}".into()),
+            )
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -583,6 +591,33 @@ mod tests {
         assert!(lines[2].contains(NEXTEST_OUTPUT_REASON));
         assert!(lines[2].contains("Starting 12 tests"));
         assert!(lines[3].contains(NEXTEST_OUTPUT_REASON));
+    }
+
+    #[test]
+    fn filter_nextest_run_ndjson_wraps_unrecognised_json_lines() {
+        // A test printing a structured log line, or a future
+        // nextest/cargo record we don't yet know about, must not be
+        // silently dropped — wrap it as captured output so the caller
+        // still sees it.
+        let input = "\
+{\"level\":\"info\",\"msg\":\"a test logged this\"}\n\
+{\"reason\":\"build-script-executed\",\"package_id\":\"x\"}\n\
+{\"reason\":\"some-future-record\",\"detail\":42}\n";
+        let out = filter_nextest_run_ndjson(input);
+        let lines: Vec<&str> = out.lines().collect();
+        // structured log wrapped; build-script-executed dropped as
+        // known noise; unknown reason wrapped.
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains(NEXTEST_OUTPUT_REASON));
+        assert!(lines[0].contains("a test logged this"));
+        assert!(lines[1].contains(NEXTEST_OUTPUT_REASON));
+        assert!(lines[1].contains("some-future-record"));
+        // The wrapped payload must itself be valid JSON (the original
+        // line is carried verbatim inside the `text` field, escaped by
+        // serde_json).
+        let v: Value = serde_json::from_str(lines[0]).expect("wrapped record is JSON");
+        assert_eq!(v["reason"], NEXTEST_OUTPUT_REASON);
+        assert!(v["text"].as_str().unwrap().contains("a test logged this"));
     }
 
     #[test]
