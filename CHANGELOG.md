@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.9.0](https://github.com/MikeGrier/cargo-mcp-rs/compare/v0.8.0...v0.9.0) (2026-06-23)
+
+
+### Features
+
+* add cargo-nextest support via cargo_nextest_run / cargo_nextest_list ([0d1555e](https://github.com/MikeGrier/cargo-mcp-rs/commit/0d1555e1df6e62a6f4a9895371b30432209d7dae))
+* add cargo-nextest support via cargo_nextest_run / cargo_nextest… ([c2599d7](https://github.com/MikeGrier/cargo-mcp-rs/commit/c2599d78c64ddf90354e6ee2c13c340b41b4e3c7))
+
+
+### Bug Fixes
+
+* **nextest:** apply per-call env overrides when probing for cargo-nextest ([bf132e0](https://github.com/MikeGrier/cargo-mcp-rs/commit/bf132e09ac855209fef271bb0baef8df103a0dae))
+* **nextest:** compact cargo_nextest_list stdout to one-line-per-record ([56d0a62](https://github.com/MikeGrier/cargo-mcp-rs/commit/56d0a625c464b1d2f6ad484150a1ddd958a8b2d7))
+* **nextest:** correct no_capture schema description ([aed3d8c](https://github.com/MikeGrier/cargo-mcp-rs/commit/aed3d8ca2d2c53d95d72c3c9e4d7a1edfcae254b))
+* **nextest:** drop message_format from cargo_nextest_list ([01102db](https://github.com/MikeGrier/cargo-mcp-rs/commit/01102dbeb9b5f5d66a8b79887530597bae431320))
+* **nextest:** gate cargo_setup nextest probe on working_dir ([51ad013](https://github.com/MikeGrier/cargo-mcp-rs/commit/51ad013ba594be3abe36dc8c5e644018a8007d89))
+* **nextest:** keep nextest summary lines in on-disk-redirect responses ([309e8ef](https://github.com/MikeGrier/cargo-mcp-rs/commit/309e8ef7b690cafa481e1ff483f0d06f51d5d043))
+* **nextest:** make probe() workspace-independent ([4ff27be](https://github.com/MikeGrier/cargo-mcp-rs/commit/4ff27be87f80bf14ba15a24f3de234c9d4ed525f))
+* **nextest:** wrap non-JSON list lines and correct NDJSON tag in docs ([e4e375b](https://github.com/MikeGrier/cargo-mcp-rs/commit/e4e375bd3de292f0c7c74806a9c17530d6f007d9))
+* **nextest:** wrap unrecognised JSON stdout lines instead of dropping them ([322e6a9](https://github.com/MikeGrier/cargo-mcp-rs/commit/322e6a973cef4ac096a2ae9c15a7356d25139736))
+* **setup:** use 4-backtick outer fence for cargo_setup snippet ([e77d519](https://github.com/MikeGrier/cargo-mcp-rs/commit/e77d51963ab84809459f504675b596d9533e20b2))
+
 ## [0.8.0](https://github.com/MikeGrier/cargo-mcp-rs/compare/v0.7.2...v0.8.0) (2026-06-21)
 
 
