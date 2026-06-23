@@ -2519,7 +2519,10 @@ pub fn list() -> Value {
                          summary." },
                     "no_capture":      { "type": "boolean", "description":
                         "If true, do not capture test stdout/stderr (passes `--no-capture`). \
-                         Streams test output live; implies `--test-threads=1`. Default: false." },
+                         Streams test output live as the tests run. Unlike `cargo test`'s \
+                         `--nocapture`, nextest's `--no-capture` does NOT force single-threaded \
+                         execution \u{2014} use `test_threads: 1` explicitly if you also want \
+                         that. Default: false." },
                     "run_ignored":     { "type": "string", "enum": ["default", "only", "all"],
                         "description":
                         "Which ignored tests to run: `default` (skip ignored), `only` (run only \
