@@ -3256,11 +3256,28 @@ fn call_publish(args: &Value) -> Result<ToolResult, Box<dyn std::error::Error>> 
 
 fn call_setup(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
     let wd = opt_str(args, "working_dir");
-    let nextest_present = matches!(
-        crate::nextest::probe(wd),
-        crate::nextest::NextestProbe::Installed
-    );
-    let has_nextest_config = crate::nextest::workspace_has_nextest_config(wd);
+
+    // The schema promises that nextest probing and the
+    // `.config/nextest.toml` escalation only happen when the caller
+    // supplied `working_dir`. Without it we'd be probing the cargo-mcp
+    // server's own environment, which has nothing to do with the
+    // workspace the agent is setting up — that would spawn an avoidable
+    // subprocess and make the response depend on server-side state the
+    // caller never opted into.
+    let (nextest_present, has_nextest_config) = if wd.is_some() {
+        (
+            matches!(
+                crate::nextest::probe(wd),
+                crate::nextest::NextestProbe::Installed
+            ),
+            crate::nextest::workspace_has_nextest_config(wd),
+        )
+    } else {
+        // Treat as: installed (so we don't emit an install hint based on
+        // server-side state) and no workspace config (so the block uses
+        // the generic "Optional" phrasing).
+        (true, false)
+    };
 
     let mut body = String::from(CARGO_MCP_INSTRUCTIONS);
     body.push_str(nextest_instructions_block(has_nextest_config));
@@ -4574,6 +4591,35 @@ mod tests {
         assert!(
             text.contains("cargo_nextest_run"),
             "cargo_setup output should mention the cargo_nextest_run tool:\n{text}"
+        );
+    }
+
+    #[test]
+    fn cargo_setup_without_working_dir_skips_probe_and_uses_optional_phrasing() {
+        // Schema contract: when `working_dir` is omitted, cargo_setup
+        // must NOT probe for cargo-nextest (avoids a subprocess spawn
+        // and avoids letting the server's environment leak into the
+        // response). The block must always use the generic "Optional"
+        // phrasing in that mode and must never emit the install hint,
+        // regardless of whether nextest happens to be installed on the
+        // build machine.
+        let text =
+            call_setup(&serde_json::json!({})).expect("call_setup must succeed without args");
+        assert!(
+            text.contains("Optional: cargo-nextest"),
+            "expected 'Optional' phrasing without working_dir:\n{text}"
+        );
+        assert!(
+            !text.contains("Recommended: cargo-nextest"),
+            "must not escalate to 'Recommended' without working_dir:\n{text}"
+        );
+        assert!(
+            !text.contains("cargo install cargo-nextest"),
+            "must not emit install hint without working_dir:\n{text}"
+        );
+        assert!(
+            !text.contains("cargo binstall cargo-nextest"),
+            "must not emit binstall hint without working_dir:\n{text}"
         );
     }
 
