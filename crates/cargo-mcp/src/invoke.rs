@@ -279,6 +279,21 @@ fn build_subprocess_env() -> BTreeMap<OsString, OsString> {
     env
 }
 
+/// Install the same explicit environment block on `cmd` that
+/// [`run_cargo`] / [`run_cargo_streaming_with_timeout`] would install on
+/// the cargo child process — including the caller's per-call `env`
+/// overrides previously installed via [`set_extra_env`].
+///
+/// Use this for ad-hoc external commands (e.g. plugin probes) that
+/// should honour the same PATH / CARGO_HOME / RUSTC layering as a real
+/// cargo invocation; without it, those commands inherit the cargo-mcp
+/// server's parent env and miss per-call overrides — so a caller who
+/// added `cargo-nextest`'s install dir to `env.PATH` would still see
+/// the probe report it as missing.
+pub fn apply_subprocess_env(cmd: &mut Command) {
+    cmd.env_clear().envs(build_subprocess_env());
+}
+
 fn resolve_binary(name: &str, env_var: &str) -> (PathBuf, ResolutionSource) {
     // Step 1: explicit env var override.
     if let Some(v) = std::env::var_os(env_var)
@@ -1941,6 +1956,57 @@ mod tests {
         assert!(
             !env.contains_key(OsStr::new("NO_COLOR")),
             "extra env null must remove the built-in default"
+        );
+    }
+
+    #[test]
+    fn apply_subprocess_env_installs_explicit_block_on_external_command() {
+        // Regression: ad-hoc external commands (plugin probes etc.) that
+        // route through `apply_subprocess_env` must see the same env block
+        // we install on a real cargo child — including the caller's
+        // per-call `set_extra_env` overrides. Without it, a caller who
+        // adds the install dir to `env.PATH` would still see plugin
+        // probes report "missing".
+        let _g = ENV_LOCK.lock().unwrap();
+        let guard = EnvGuard::snapshot(&[
+            "RUSTC",
+            "CARGO_HOME",
+            "HOME",
+            "USERPROFILE",
+            "CARGO_TERM_COLOR",
+            "NO_COLOR",
+        ]);
+        let empty_home = unique_tempdir("apply_subprocess_env");
+        guard.unset("RUSTC");
+        guard.set("CARGO_HOME", &empty_home);
+        guard.unset("CARGO_TERM_COLOR");
+        guard.unset("NO_COLOR");
+
+        set_extra_env(vec![(
+            "CARGO_MCP_APPLY_PROBE_VAR".into(),
+            Some("hello".into()),
+        )]);
+        let mut cmd = Command::new("does-not-need-to-exist");
+        apply_subprocess_env(&mut cmd);
+        set_extra_env(Vec::new());
+
+        // `Command::get_envs` returns the explicit env block we installed
+        // (since `apply_subprocess_env` does `env_clear().envs(...)`).
+        let envs: BTreeMap<OsString, Option<OsString>> = cmd
+            .get_envs()
+            .map(|(k, v)| (k.to_os_string(), v.map(|s| s.to_os_string())))
+            .collect();
+        assert_eq!(
+            envs.get(OsStr::new("CARGO_TERM_COLOR"))
+                .and_then(|v| v.clone()),
+            Some(OsString::from("never")),
+            "built-in default must be installed on the external command"
+        );
+        assert_eq!(
+            envs.get(OsStr::new("CARGO_MCP_APPLY_PROBE_VAR"))
+                .and_then(|v| v.clone()),
+            Some(OsString::from("hello")),
+            "per-call extra env must reach the external command"
         );
     }
 

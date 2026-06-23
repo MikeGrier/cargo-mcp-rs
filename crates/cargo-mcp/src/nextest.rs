@@ -48,8 +48,14 @@ pub(crate) enum NextestProbe {
 /// `cargo nextest --version` with stdout/stderr suppressed.
 ///
 /// Uses the same cargo binary cargo-mcp would invoke for any other tool
-/// (via [`invoke::resolve_cargo_binary`]), so the probe and the real run
-/// agree on which cargo's plugin search path is consulted.
+/// (via [`invoke::resolve_cargo_binary`]) and the same explicit
+/// environment block (built-in defaults + RUSTC pin + the caller's
+/// per-call `env` overrides installed by the dispatcher via
+/// [`invoke::set_extra_env`], applied via
+/// [`invoke::apply_subprocess_env`]). Without that env layering a
+/// caller who passes `env.PATH` / `env.CARGO_HOME` to make the plugin
+/// discoverable for the real run/list would still see the probe report
+/// it as missing.
 ///
 /// **Workspace-independent.** Plugin detection is PATH-based, so we do
 /// NOT inherit the caller's `working_dir`. Spawning in an invalid path
@@ -61,6 +67,7 @@ pub(crate) enum NextestProbe {
 pub(crate) fn probe() -> NextestProbe {
     let (cargo_path, _src) = invoke::resolve_cargo_binary();
     let mut cmd = Command::new(&cargo_path);
+    invoke::apply_subprocess_env(&mut cmd);
     cmd.args(["nextest", "--version"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
