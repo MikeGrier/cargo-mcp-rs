@@ -387,4 +387,99 @@ first-class *and* writing down the habit, not just fixing the one command.
   proxy path, which honours the `RUSTUP_TOOLCHAIN` that `+toolchain` sets, so
   the override stays consistent across cargo and rustc.
 
+## cargo-nextest support
+
+[`cargo-nextest`](https://nexte.st/) is exposed via two tools that sit
+alongside `cargo_test` rather than replacing it: `cargo_nextest_run`
+(wraps `cargo nextest run`) and `cargo_nextest_list` (wraps
+`cargo nextest list`). Nextest cannot fully replace `cargo test`
+because it does not support doctests
+([nextest#16](https://github.com/nextest-rs/nextest/issues/16)), so
+`cargo_test` remains the canonical tool and nextest is opt-in.
+
+### Detection and install UX
+
+Nextest ships as a separate `cargo-nextest` plugin binary; it is not
+bundled with cargo or rustup. When either nextest tool is invoked and
+the binary is not on PATH (probed via `cargo nextest --version`), the
+tool returns `is_error: true` whose body is markdown containing the
+install commands inside fenced shell code blocks:
+
+```
+cargo install cargo-nextest --locked
+```
+
+VS Code Copilot Chat renders fenced shell blocks with **Copy** and
+**Run in Terminal** affordances automatically, so no additional MCP
+machinery is needed to make the instructions actionable. The
+non-existence of `cargo-nextest` is not cached across tool calls — a
+user who installs mid-session should be able to retry immediately
+without restarting the MCP server.
+
+`cargo_setup` participates in the same UX. It writes a short "Optional:
+cargo-nextest" subsection into the workspace's `copilot-instructions.md`
+explaining when to prefer `cargo_nextest_run` over `cargo_test`. When
+the binary is missing the setup tool also surfaces the same fenced
+install commands in its result. If the workspace already contains a
+`.config/nextest.toml`, the block is escalated from "optional" to
+"recommended" because the workspace was authored expecting nextest.
+
+### Output: wrap the human reporter, defer libtest-JSON
+
+Nextest's `run` subcommand has two machine-readable output modes for
+the test phase:
+
+1. The **human reporter text** (default), which can be wrapped
+   line-by-line as `x-cargo-mcp-nextest-output` NDJSON records — the
+   exact pattern `cargo_test` already uses to wrap libtest harness
+   text as `x-cargo-mcp-test-output`.
+2. `--message-format libtest-json[-plus]`, which produces structured
+   per-test events. This is gated behind
+   `NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1` and is **explicitly**
+   subject to breaking changes (tracked by
+   [nextest#1152](https://github.com/nextest-rs/nextest/issues/1152)).
+
+We ship (1) only. Coupling our parser to an unstable upstream format
+would impose a recurring maintenance tax for marginal benefit over
+wrapping the text reporter, which already conveys per-test status with
+ANSI stripped. Revisit when nextest stabilises the format. The build
+phase of `cargo nextest run` is decoupled from this choice: nextest
+forwards cargo's NDJSON when `--cargo-message-format=json` is set
+(stable since [0.9.123](https://nexte.st/changelog/#0.9.123)), so
+compiler diagnostics flow through the existing
+`compiler-message` / `build-finished` pipeline unchanged.
+
+`cargo_nextest_list` uses nextest's own `--message-format json`, which
+**is** stable — the discovery result is returned as structured JSON
+directly.
+
+### Timeout model: overall cap only
+
+Nextest has its own per-test timeout machinery via profile config
+(`slow-timeout`, `terminate-after`). To avoid two competing watchdogs
+we expose only the overall `timeout_secs` wall-clock cap (deferred-arm
+on `build-finished`, identical to `cargo_test`'s) and let nextest's
+profile do the per-test work. The tool description says so explicitly
+so callers do not expect a `per_test_timeout_secs` parameter.
+
+### Flag remapping
+
+A few nextest flags diverge from cargo test in ways that would
+silently mis-route values if we reused `cargo_test`'s schema verbatim:
+
+- `--profile <name>` selects the **nextest** profile in nextest, but
+  the **cargo build** profile in cargo test. We split them into
+  `nextest_profile` and `cargo_profile` on `cargo_nextest_run` so
+  intent is unambiguous.
+- `-j N` is build jobs in cargo test but test threads in nextest. We
+  expose `build_jobs` (`--build-jobs`) and `test_threads`
+  (`--test-threads`) as distinct parameters and never accept a bare
+  `jobs`.
+- `--doc` is not accepted (unsupported by nextest). Doctests stay on
+  `cargo_test`.
+- `test_filter` (our regex pipeline) is **not** added; nextest's
+  `-E '<filterset>'` is strictly more expressive. We expose it as
+  `filter_expr` and also accept a positional `filter` substring for
+  parity with `cargo_test`'s `test_name`.
+
 

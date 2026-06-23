@@ -18,6 +18,7 @@ mod busy_files;
 mod elicit;
 mod invoke;
 mod line_reader;
+mod nextest;
 mod rm;
 mod suggest;
 mod test_filter;

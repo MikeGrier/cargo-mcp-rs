@@ -9,6 +9,9 @@ gets back machine-readable diagnostics with exact file paths and line numbers
 it can act on immediately. Builds stream live progress, suggested fixes can be
 reviewed and applied with one click, and transient Windows file-in-use errors
 are retried automatically so they don't derail a multi-step task.
+[cargo-nextest](https://nexte.st/) is also supported as a first-class test
+runner — `cargo_nextest_run` and `cargo_nextest_list` are wired up alongside
+`cargo_test` and emit install instructions if the plugin is missing.
 
 It's a [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server
 under the hood — the protocol that lets editors and agents share tools — but
@@ -214,6 +217,8 @@ list.
 | `cargo_add` | Add a dependency to Cargo.toml |
 | `cargo_remove` | Remove a dependency from Cargo.toml |
 | `cargo_publish` | Package and upload to crates.io (irreversible — use `dry_run: true` first) |
+| `cargo_nextest_run` | Run tests via [cargo-nextest](https://nexte.st/) (NDJSON + wrapped reporter text). Requires the `cargo-nextest` plugin. Does not support doctests. |
+| `cargo_nextest_list` | Enumerate tests via `cargo nextest list` with stable JSON output. |
 | `cargo_setup` | Return the canonical cargo-mcp instruction text for Copilot setup |
 | `cargo_diagnostic` | Report which cargo/rustc binary will be invoked, plus toolchain-file and env state |
 
