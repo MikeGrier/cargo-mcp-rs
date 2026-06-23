@@ -209,11 +209,17 @@ fn format_nextest_run_output(out: &CargoOutput, argv: &[&str], wd: Option<&str>)
 /// JSON status trailer so the response is framed identically to every
 /// other cargo-mcp tool.
 ///
-/// To keep the response a strict one-JSON-object-per-line stream even if
-/// upstream ever switches to pretty-printed output, every non-empty
-/// stdout line that parses as JSON is re-serialised in compact form;
-/// non-JSON lines pass through verbatim (we'd rather forward something
-/// unrecognised than drop it on the floor).
+/// The response is a **strict one-JSON-object-per-line stream**:
+/// - The whole-blob path: when all of stdout parses as a single JSON
+///   document (today's normal case, plus a future nextest that ever
+///   pretty-prints), it is re-serialised in compact form so it occupies
+///   exactly one line.
+/// - The per-line fallback: when the whole-blob parse fails, each
+///   non-empty stdout line is handled individually — lines that parse
+///   as JSON are compacted verbatim, lines that do NOT parse as JSON
+///   (e.g. a warning nextest prints alongside the discovery payload)
+///   are wrapped in an [`NEXTEST_OUTPUT_REASON`] record so the line is
+///   preserved without breaking the NDJSON contract.
 fn format_nextest_list_output(out: &CargoOutput, argv: &[&str], wd: Option<&str>) -> String {
     let header = invocation_header(argv, wd);
     let stdout = out.stdout.trim_end_matches('\n');
@@ -228,10 +234,10 @@ fn format_nextest_list_output(out: &CargoOutput, argv: &[&str], wd: Option<&str>
         // First try the whole stdout as a single JSON document — that
         // catches a future nextest that switches to pretty-printed
         // output (multi-line `{ ... }`), where per-line parsing would
-        // fail on every brace line and we'd forward the pretty-print
-        // verbatim. If the whole-blob parse fails, fall back to
-        // line-by-line compaction so an NDJSON-style stream
-        // (cargo build records ahead of the list payload) still works.
+        // fail on every brace line. If the whole-blob parse fails,
+        // fall back to line-by-line compaction so an NDJSON-style
+        // stream (cargo build records ahead of the list payload)
+        // still works.
         let compacted_blob = serde_json::from_str::<Value>(stdout)
             .ok()
             .and_then(|v| serde_json::to_string(&v).ok());
@@ -243,7 +249,14 @@ fn format_nextest_list_output(out: &CargoOutput, argv: &[&str], wd: Option<&str>
                 .filter(|l| !l.trim().is_empty())
                 .map(|l| match serde_json::from_str::<Value>(l) {
                     Ok(v) => serde_json::to_string(&v).unwrap_or_else(|_| l.to_owned()),
-                    Err(_) => l.to_owned(),
+                    // Non-JSON line (e.g. an upstream warning printed
+                    // alongside the discovery payload). Wrap so the
+                    // overall response stays a strict NDJSON stream.
+                    Err(_) => serde_json::to_string(&serde_json::json!({
+                        "reason": NEXTEST_OUTPUT_REASON,
+                        "text": l,
+                    }))
+                    .unwrap_or_else(|_| "{}".into()),
                 })
                 .collect();
             if !per_line.is_empty() {
@@ -705,12 +718,13 @@ mod tests {
     }
 
     #[test]
-    fn format_nextest_list_output_passes_non_json_lines_through() {
-        // If upstream ever emits a non-JSON warning line we'd rather
-        // forward it than silently drop it. The framing still holds
-        // because the non-JSON line is just text — the overall output
-        // stops being parseable JSON-per-line for that one record, but
-        // nothing is lost.
+    fn format_nextest_list_output_wraps_non_json_lines_in_nextest_output_records() {
+        // Regression: if upstream ever emits a non-JSON warning line
+        // alongside the discovery payload, we must wrap it in an
+        // NEXTEST_OUTPUT_REASON record rather than forwarding it
+        // verbatim — otherwise a single warning breaks the tool's
+        // "one JSON object per line" framing contract for every
+        // downstream consumer doing line-by-line JSON parsing.
         let mixed = "{\"test-count\":0}\nWARN: experimental feature\n";
         let out = CargoOutput {
             stdout: mixed.into(),
@@ -718,7 +732,31 @@ mod tests {
             exit_code: 0,
         };
         let s = format_nextest_list_output(&out, &["nextest", "list"], None);
+
+        // Every emitted line must be valid JSON — this is the
+        // load-bearing assertion this regression test exists to lock
+        // in.
+        for line in s.lines() {
+            assert!(
+                !line.trim().is_empty(),
+                "blank line in framed output: {s:?}"
+            );
+            serde_json::from_str::<Value>(line).unwrap_or_else(|e| {
+                panic!("line is not a single JSON object: {line:?} ({e}); full output: {s}")
+            });
+        }
+
+        // The compacted payload is preserved.
         assert!(s.contains("\"test-count\":0"));
-        assert!(s.contains("WARN: experimental feature"));
+
+        // The warning is preserved, but as the `text` field of a
+        // wrapped NEXTEST_OUTPUT_REASON record (not as raw text).
+        let warn_line = s
+            .lines()
+            .find(|l| l.contains("experimental feature"))
+            .expect("warning line present");
+        let v: Value = serde_json::from_str(warn_line).expect("warning line parses as JSON");
+        assert_eq!(v["reason"], NEXTEST_OUTPUT_REASON);
+        assert_eq!(v["text"], "WARN: experimental feature");
     }
 }

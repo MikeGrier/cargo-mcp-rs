@@ -218,7 +218,7 @@ list.
 | `cargo_remove` | Remove a dependency from Cargo.toml |
 | `cargo_publish` | Package and upload to crates.io (irreversible — use `dry_run: true` first) |
 | `cargo_nextest_run` | Run tests via [cargo-nextest](https://nexte.st/) (NDJSON + wrapped reporter text). Requires the `cargo-nextest` plugin. Does not support doctests. |
-| `cargo_nextest_list` | Enumerate tests via `cargo nextest list` with stable JSON output. |
+| `cargo_nextest_list` | Enumerate tests via `cargo nextest list --message-format json` (framed as NDJSON: invocation header + compacted JSON payload line(s) + status trailer). |
 | `cargo_setup` | Return the canonical cargo-mcp instruction text for Copilot setup |
 | `cargo_diagnostic` | Report which cargo/rustc binary will be invoked, plus toolchain-file and env state |
 

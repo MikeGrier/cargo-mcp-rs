@@ -154,7 +154,7 @@ per line). Tools without a stable JSON mode return plain text.
 | `cargo_remove` | text | yes | Remove a dependency from Cargo.toml |
 | `cargo_publish` | text | yes | Package and upload to crates.io (irreversible — use `dry_run: true` first) |
 | `cargo_nextest_run` | NDJSON+text | no | Run tests via [cargo-nextest](https://nexte.st/) — per-test process isolation, built-in retries, filter expressions. Requires the `cargo-nextest` plugin; the tool emits install instructions when missing. Does **not** support doctests — use `cargo_test` with `doc: true` for those. |
-| `cargo_nextest_list` | JSON | no | Enumerate tests via `cargo nextest list` (stable JSON output). |
+| `cargo_nextest_list` | NDJSON | no | Enumerate tests via `cargo nextest list --message-format json`. Framed as cargo-mcp's standard NDJSON stream: invocation header + compacted JSON payload line(s) + status trailer. |
 | `cargo_setup` | text | no | Return the canonical cargo-mcp instruction text for Copilot setup |
 | `cargo_diagnostic` | JSON | no | Report which `cargo` / `rustc` binary will be invoked, the active `rust-toolchain.toml` (if any), and relevant env (`PATH`, `CARGO`, `RUSTC`, `RUSTUP_TOOLCHAIN`, `RUSTUP_HOME`, `CARGO_HOME`) |
 
