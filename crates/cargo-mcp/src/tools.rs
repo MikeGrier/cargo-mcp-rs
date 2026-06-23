@@ -1292,6 +1292,15 @@ fn keep_in_summary(line: &str, kind: SummaryKind) -> bool {
             let text = v.get("text").and_then(|t| t.as_str()).unwrap_or("");
             is_test_summary_line(text)
         }
+        crate::nextest::NEXTEST_OUTPUT_REASON if matches!(kind, SummaryKind::Test) => {
+            // Nextest uses its own human reporter (not libtest's), so its
+            // summary-worthy lines are matched by a different predicate.
+            // Without this branch every test-phase line would be dropped
+            // from the on-disk-redirect summary, leaving callers with
+            // just header + status and no failure context.
+            let text = v.get("text").and_then(|t| t.as_str()).unwrap_or("");
+            is_nextest_summary_line(text)
+        }
         _ => false,
     }
 }
@@ -1311,6 +1320,39 @@ fn is_test_summary_line(text: &str) -> bool {
         || trimmed.starts_with("---- ")
         || trimmed.contains("panicked at")
         || trimmed.starts_with("note: run with")
+}
+
+/// True for nextest human-reporter lines that belong in the on-disk-redirect
+/// summary. Mirrors [`is_test_summary_line`] for libtest, but the patterns
+/// are different because nextest does not use libtest's reporter format.
+///
+/// What stays: the run header (`Starting N tests across …`), the final
+/// `Summary [...]` rollup, per-test failure / flake / leak / timeout / slow
+/// markers, and the per-failure stdout/stderr section headers. What gets
+/// dropped (kept only in the redirected file): the per-test `PASS` lines
+/// and the captured stdout/stderr bodies of failing tests.
+fn is_nextest_summary_line(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    if trimmed.starts_with("Starting ")
+        || trimmed.starts_with("Summary ")
+        || trimmed.starts_with("--- STDOUT:")
+        || trimmed.starts_with("--- STDERR:")
+        || trimmed.contains("panicked at")
+    {
+        return true;
+    }
+    // Per-test result markers from nextest's human reporter. `PASS` is
+    // intentionally omitted — passing-test lines are the bulk of test
+    // output and stay in the on-disk file, not the inline summary.
+    const MARKERS: &[&str] = &["FAIL", "FLAKY", "LEAK", "TIMEOUT", "SIGABRT", "SLOW"];
+    for m in MARKERS {
+        if let Some(rest) = trimmed.strip_prefix(m)
+            && (rest.starts_with(' ') || rest.starts_with('['))
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// True for cargo's `build-finished` JSON record. With `--message-format=json`
@@ -4328,6 +4370,56 @@ mod tests {
         ] {
             assert!(!is_test_summary_line(dropped), "should drop: {dropped:?}");
         }
+    }
+
+    #[test]
+    fn is_nextest_summary_line_matches_expected_patterns() {
+        // Nextest uses its own human reporter, not libtest's: per-test
+        // results begin with PASS/FAIL/FLAKY/etc. inside indented lines,
+        // failure bodies are bracketed by `--- STDOUT:` / `--- STDERR:`
+        // headers, and the run is bookended by `Starting ...` / `Summary ...`.
+        for kept in [
+            "    Starting 12 tests across 3 binaries",
+            "        FAIL [   0.001s] my-crate tests::it_works",
+            "        FLAKY [   0.005s] my-crate tests::flaky",
+            "        LEAK [   0.002s] my-crate tests::leaks",
+            "        TIMEOUT [   5.000s] my-crate tests::hangs",
+            "        SIGABRT my-crate tests::aborts",
+            "        SLOW [   1.500s] my-crate tests::slow_one",
+            "--- STDOUT:              my-crate tests::it_works ---",
+            "--- STDERR:              my-crate tests::it_works ---",
+            "thread 'main' panicked at src/lib.rs:1:1:",
+            "     Summary [   0.045s] 12 tests run: 11 passed, 1 failed, 0 skipped",
+        ] {
+            assert!(is_nextest_summary_line(kept), "should keep: {kept:?}");
+        }
+        for dropped in [
+            "        PASS [   0.001s] my-crate tests::it_works",
+            "    some captured println output",
+            "",
+            "------------",
+        ] {
+            assert!(
+                !is_nextest_summary_line(dropped),
+                "should drop: {dropped:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn keep_in_summary_keeps_nextest_summary_lines_under_test_kind() {
+        // The exact regression Copilot flagged: x-cargo-mcp-nextest-output
+        // records carrying summary-worthy text used to be dropped because
+        // keep_in_summary only knew about x-cargo-mcp-test-output.
+        let fail_line = r#"{"reason":"x-cargo-mcp-nextest-output","text":"        FAIL [   0.001s] my-crate tests::it_works"}"#;
+        assert!(keep_in_summary(fail_line, SummaryKind::Test));
+        let summary_line = r#"{"reason":"x-cargo-mcp-nextest-output","text":"     Summary [   0.045s] 12 tests run: 11 passed, 1 failed, 0 skipped"}"#;
+        assert!(keep_in_summary(summary_line, SummaryKind::Test));
+        // Pass lines stay dropped (kept verbatim in the on-disk file).
+        let pass_line = r#"{"reason":"x-cargo-mcp-nextest-output","text":"        PASS [   0.001s] my-crate tests::it_works"}"#;
+        assert!(!keep_in_summary(pass_line, SummaryKind::Test));
+        // Wrong SummaryKind: nextest-output is irrelevant outside Test mode.
+        assert!(!keep_in_summary(fail_line, SummaryKind::Build));
     }
 
     #[test]
