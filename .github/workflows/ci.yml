@@ -65,14 +65,36 @@ jobs:
         run: cargo test --workspace --locked --no-fail-fast
 
   msrv:
-    name: MSRV check (1.93)
+    name: MSRV check (1.95)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       # Pin to the exact MSRV declared in [workspace.package].rust-version
       # so a stray use of a newer-stable feature fails CI rather than
       # silently raising the floor for downstream consumers.
-      - uses: dtolnay/rust-toolchain@1.93.0
+      - uses: dtolnay/rust-toolchain@1.95.0
       - uses: Swatinem/rust-cache@v2
       - name: cargo check (MSRV)
         run: cargo check --workspace --all-targets --locked
+
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # Pull in rustfmt + clippy components explicitly; the base stable
+      # toolchain image does not always carry them.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      # Formatting gate: fails if any committed source deviates from rustfmt's
+      # output. Without this, formatting drift accumulates silently because no
+      # other job runs rustfmt.
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+      # Lint gate: `-D warnings` promotes every clippy (and rustc) warning to
+      # an error so lints cannot slip into committed code. `--locked` keeps the
+      # dependency graph identical to what was committed.
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings

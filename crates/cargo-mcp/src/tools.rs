@@ -110,6 +110,70 @@ pub(crate) fn per_test_execution_enabled() -> bool {
     PER_TEST_EXECUTION.load(Ordering::Relaxed)
 }
 
+/// Whether cargo's harmless "error finalizing incremental compilation session
+/// directory" notes are shown in tool output. Off by default (the notes are
+/// suppressed) because they are idempotent Windows file-locking noise; set to
+/// `true` via [`set_show_incremental_notes`] to surface them anyway.
+static SHOW_INCREMENTAL_NOTES: AtomicBool = AtomicBool::new(false);
+
+/// Configure whether incremental-compilation notes are shown. Called once from
+/// `main` after CLI parse. `false` (default) suppresses them.
+pub fn set_show_incremental_notes(enabled: bool) {
+    SHOW_INCREMENTAL_NOTES.store(enabled, Ordering::Relaxed);
+}
+
+/// Returns `true` when incremental-compilation notes should be shown verbatim.
+pub(crate) fn show_incremental_notes_enabled() -> bool {
+    SHOW_INCREMENTAL_NOTES.load(Ordering::Relaxed)
+}
+
+/// Substring identifying rustc's "error finalizing incremental compilation
+/// session directory" note. On Windows an antivirus/indexer/prior process can
+/// still hold a handle to a `target\…\incremental\…-working` directory when
+/// rustc tries to finalize it, so rustc emits this note and simply skips
+/// reusing that one incremental cache entry. The build is unaffected and
+/// re-running is idempotent, so the note is pure noise. Matched as a substring
+/// (not anchored) because rustc prefixes it with `note: ` and appends the
+/// offending path and `Access is denied. (os error 5)`.
+const INCREMENTAL_NOTE_MARKER: &str = "error finalizing incremental compilation session directory";
+
+/// Remove rustc's harmless incremental-compilation-session notes (and the
+/// single blank separator line that trails each one) from `stderr`.
+///
+/// Only lines containing [`INCREMENTAL_NOTE_MARKER`] are dropped; every other
+/// line — including genuine errors and the Restart Manager holder report — is
+/// preserved verbatim. The result is not trimmed; callers trim as needed.
+pub(crate) fn strip_incremental_notes(stderr: &str) -> String {
+    let mut kept: Vec<&str> = Vec::new();
+    let mut just_removed = false;
+    for line in stderr.lines() {
+        if line.contains(INCREMENTAL_NOTE_MARKER) {
+            just_removed = true;
+            continue;
+        }
+        // Swallow the single blank separator line rustc prints after each note
+        // so suppression does not leave a run of empty lines behind.
+        if just_removed && line.trim().is_empty() {
+            just_removed = false;
+            continue;
+        }
+        just_removed = false;
+        kept.push(line);
+    }
+    kept.join("\n")
+}
+
+/// Produce the trimmed stderr text to surface in tool output, honouring the
+/// [`show_incremental_notes_enabled`] toggle. When the toggle is off (default)
+/// the harmless incremental-compilation notes are stripped first.
+pub(crate) fn stderr_for_display(raw: &str) -> String {
+    if show_incremental_notes_enabled() {
+        raw.trim().to_owned()
+    } else {
+        strip_incremental_notes(raw).trim().to_owned()
+    }
+}
+
 /// The section appended to (or used to create) `.github/copilot-instructions.md`
 /// during `cargo_setup`. Kept here so the tool description and the written
 /// content stay in sync.
@@ -118,6 +182,14 @@ When working in this Rust/Cargo project, ALWAYS use the `cargo_*` MCP tools\n\
 instead of running `cargo` commands in a PowerShell or bash terminal.\n\
 This applies even inside a larger workflow \u{2014} do not switch to the terminal\n\
 for cargo just because a previous step used the terminal.\n\n\
+**Always set `working_dir` to the workspace root.** Every cargo-running tool\n\
+accepts a `working_dir` parameter. If you omit it, the call defaults to the\n\
+cargo-mcp server's own working directory (typically the user's home folder),\n\
+which is almost never your project \u{2014} the call then fails to find a\n\
+`Cargo.toml`/toolchain, or operates on the wrong manifest. Pass the absolute\n\
+path of the workspace root on every call. The server rejects a `working_dir`\n\
+from which no `Cargo.toml` can be found by walking upward, returning an\n\
+actionable error instead of running in the wrong place.\n\n\
 | MCP tool | Replaces |\n\
 |---|---|\n\
 | `cargo_metadata` | `cargo metadata` |\n\
@@ -156,7 +228,32 @@ MCP `notifications/message` naming the field. **If the CLI flag you\n\
 expected (`--all-targets`, `--release`, …) is missing from the echoed\n\
 `x-cargo-mcp-invocation` argv, look for a warning notification — you\n\
 almost certainly sent the boolean in an unrecognised shape.**\n\n\
-### cargo_test — timeouts\n\n\
+### Test selection \u{2014} which knobs belong to which tool\n\n\
+`cargo_test` and `cargo_nextest_run` have **separate, non-interchangeable**\n\
+selection parameters. The server **rejects unknown arguments** with an\n\
+actionable error (including a \"did you mean\" hint), so a mismatched knob\n\
+fails fast instead of silently running the entire suite. Use the right set:\n\n\
+- **`cargo_test` only:** `test_name` (substring, or `exact: true`),\n\
+  `test_filter` (`{ \"pattern\": \"<regex>\", \"include_ignored\": <bool> }`),\n\
+  `per_test_timeout_secs` (only meaningful with `test_filter`), and\n\
+  `doc: true` (doctests \u{2014} nextest cannot run these).\n\
+- **`cargo_nextest_run` only:** `filter` (substring over test names) and\n\
+  `filter_expr` (the nextest `-E '<expr>'` filterset DSL).\n\n\
+Do NOT pass `test_filter`, `test_name`, `per_test_timeout_secs`, or `doc`\n\
+to `cargo_nextest_run`, and do NOT pass `filter`/`filter_expr` to\n\
+`cargo_test` \u{2014} the call now errors rather than running unfiltered.\n\n\
+For a workspace with thousands of tests across hundreds of binaries, a full\n\
+run can exceed any reasonable wall-clock cap. Narrow it with the correct\n\
+tool's filter, or run intentionally unbounded with `timeout_secs: 0`.\n\n\
+### cargo_test — phases & timeouts\n\n\
+Every `cargo_test` and `cargo_nextest_run` call runs in TWO independently\n\
+timed phases: a **build** phase (`cargo test --no-run`) followed by a **test\n\
+execution** phase. `timeout_secs` is applied to each phase on its own clock,\n\
+so build time is NEVER counted against the execution budget. A `TimeoutError`\n\
+names the phase that fired (e.g. \"... during the build phase\" vs \"... during\n\
+the test execution phase\"), so you can tell a slow compile apart from a hung\n\
+test. Build-phase compiler warnings are preserved in the combined output even\n\
+though the execution phase reuses the cached build.\n\n\
 `cargo_test` has two independent timeout knobs. Both apply only to the test\n\
 **execution** phase: the clock arms when compilation and linking finish\n\
 (cargo's `build-finished` record), so a slow build never trips either.\n\n\
@@ -267,6 +364,38 @@ artifact line, etc.).\n\n\
 ```json\n\
 { \"output_path\": \"target/cargo-mcp/test-run.ndjson\" }\n\
 ```\n\n\
+### Hang / slow-test bisection (`bisect`)\n\n\
+`cargo_test` and `cargo_nextest_run` accept an optional `bisect` object that\n\
+switches the call into a bisection engine for **finding which test hangs or\n\
+runs long**. It builds once, enumerates every test, then runs groups of tests\n\
+under a short kill-deadline (always single-threaded). Any group that times out\n\
+(hangs) or exceeds the slow threshold is recursively subdivided until the\n\
+culprit test(s) are isolated. It works identically on both tools (it runs the\n\
+compiled libtest binaries directly).\n\n\
+Only `group_timeout_secs` is required:\n\n\
+```json\n\
+{ \"bisect\": { \"group_timeout_secs\": 10 } }\n\
+```\n\n\
+Knobs (all optional except `group_timeout_secs`):\n\n\
+- `group_timeout_secs` (REQUIRED) \u{2014} per-group kill-deadline in seconds;\n\
+  a group that exceeds it is treated as hung.\n\
+- `slow_threshold_secs` \u{2014} must be < `group_timeout_secs`; a group that\n\
+  finishes but takes longer than this is `slow` and gets subdivided. Omit to\n\
+  detect hangs only.\n\
+- `split_factor` (default 2) \u{2014} sub-groups per subdivision (binary search).\n\
+- `split_percent` \u{2014} alternative to `split_factor`: yields ceil(100/p)\n\
+  sub-groups (mutually exclusive with `split_factor`).\n\
+- `min_group_size` (default 1) \u{2014} stop subdividing at this size and report\n\
+  the members as culprits.\n\
+- `initial_group_size` / `initial_groups` \u{2014} shape the first-level groups\n\
+  (mutually exclusive); default is one group of all tests.\n\
+- `max_rounds` (default 32) \u{2014} cap on subdivision depth.\n\
+- `pattern` \u{2014} RE2 regex; only matching `module::path::test_name` tests\n\
+  participate. `include_ignored` \u{2014} also bisect `#[ignore]` tests.\n\n\
+The result is an NDJSON stream of `x-cargo-mcp-bisect-config`,\n\
+`x-cargo-mcp-bisect-group`, `x-cargo-mcp-bisect-culprit`, and\n\
+`x-cargo-mcp-bisect-summary` records; `output_path` is honoured (full body to\n\
+file, compact summary inline). The call is an error when any culprit is found.\n\n\
 ### Reading cargo_test output\n\n\
 `cargo_test` returns a strict NDJSON stream. Parse it line-by-line; every\n\
 non-blank line is a JSON object. The `reason` field identifies the record type:\n\n\
@@ -1074,7 +1203,7 @@ fn format_json_output(out: &CargoOutput, argv: &[&str], wd: Option<&str>) -> Str
         let filtered = filter_build_ndjson(&out.stdout);
         let filtered = filtered.trim_end();
         let trailer = format!(r#"{{"status":"error","exit_code":{}}}"#, out.exit_code);
-        let stderr_trimmed = out.stderr.trim();
+        let stderr_trimmed = stderr_for_display(&out.stderr);
         let mut parts: Vec<String> = Vec::with_capacity(3);
         if !filtered.is_empty() {
             parts.push(filtered.to_owned());
@@ -1119,7 +1248,7 @@ pub(crate) fn format_test_output(out: &CargoOutput, argv: &[&str], wd: Option<&s
     } else {
         format!(r#"{{"status":"error","exit_code":{}}}"#, out.exit_code)
     };
-    let stderr_trimmed = out.stderr.trim();
+    let stderr_trimmed = stderr_for_display(&out.stderr);
     let mut parts: Vec<String> = Vec::with_capacity(3);
     if !filtered.is_empty() {
         parts.push(filtered.to_owned());
@@ -1203,6 +1332,31 @@ fn run_cargo_maybe_streaming(
     }
 }
 
+/// Run one phase of a split build/test invocation, reborrowing `on_progress`
+/// for just this call and tagging any [`invoke::TimeoutError`] with `phase`.
+///
+/// Taking `on_progress` by `&mut` (rather than by value) lets the caller drive
+/// several phases from a single optional callback: each call here creates a
+/// fresh, short-lived reborrow, sidestepping the `&mut`-invariance that would
+/// otherwise make `Option::as_deref_mut` borrow the callback for the whole
+/// function body.
+pub(crate) fn run_phase(
+    argv: &[&str],
+    wd: Option<&str>,
+    timeout: Option<std::time::Duration>,
+    arm_deadline: Option<invoke::ArmDeadline<'_>>,
+    on_progress: &mut Option<&mut dyn FnMut(&str)>,
+    phase: &'static str,
+) -> Result<CargoOutput, Box<dyn std::error::Error>> {
+    let result = match on_progress {
+        Some(cb) => {
+            invoke::run_cargo_streaming_with_timeout(argv, wd, timeout, arm_deadline, &mut **cb)
+        }
+        None => invoke::run_cargo_with_timeout(argv, wd, timeout, arm_deadline),
+    };
+    result.map_err(|e| invoke::label_timeout_phase(e, phase))
+}
+
 // ── output_path: write full NDJSON to disk, return summary ────────────────────
 
 /// Which summarisation rules to apply when an `output_path` was supplied.
@@ -1227,7 +1381,7 @@ pub(crate) const OUTPUT_FILE_REASON: &str = "x-cargo-mcp-output-file";
 /// When `wd` is `None`, resolution falls back to the cargo-mcp server
 /// process's CWD (i.e. the path is returned unchanged), which is also the
 /// effective working directory cargo would inherit.
-fn resolve_output_path(path: &str, wd: Option<&str>) -> std::path::PathBuf {
+pub(crate) fn resolve_output_path(path: &str, wd: Option<&str>) -> std::path::PathBuf {
     let p = std::path::Path::new(path);
     match wd {
         Some(w) => std::path::Path::new(w).join(p),
@@ -1439,7 +1593,149 @@ pub(crate) fn is_build_finished_line(line: &str) -> bool {
     line.contains(r#""reason":"build-finished""#)
 }
 
+/// True when `line` is a cargo `compiler-message` JSON record (a rustc
+/// diagnostic: warning or error). Used to carry build-phase diagnostics into
+/// the combined two-phase output so warnings emitted during the `--no-run`
+/// build are not lost when the (cached) execution phase re-checks the build.
+pub(crate) fn is_compiler_message_line(line: &str) -> bool {
+    line.contains(r#""reason":"compiler-message""#)
+}
+
+/// Combine the output of a `--no-run` build phase with a subsequent execution
+/// phase into a single [`CargoOutput`] for formatting.
+///
+/// The execution phase re-checks the (already-built) test binaries, so its
+/// build is a cache hit and emits no `compiler-message` records. To preserve
+/// any warnings rustc reported during the build phase, this prepends the
+/// build phase's `compiler-message` lines to the execution phase's stdout.
+/// The combined exit code and the bulk of stderr come from the execution
+/// phase; the build phase's stderr (rendered diagnostics) is included first.
+pub(crate) fn combine_build_and_exec_output(
+    build_out: &CargoOutput,
+    exec_out: &CargoOutput,
+) -> CargoOutput {
+    let mut stdout = String::new();
+    for line in build_out.stdout.lines() {
+        if is_compiler_message_line(line) {
+            stdout.push_str(line);
+            stdout.push('\n');
+        }
+    }
+    stdout.push_str(&exec_out.stdout);
+
+    let mut stderr = String::new();
+    if !build_out.stderr.trim().is_empty() {
+        stderr.push_str(&build_out.stderr);
+        if !stderr.ends_with('\n') {
+            stderr.push('\n');
+        }
+    }
+    stderr.push_str(&exec_out.stderr);
+
+    CargoOutput {
+        stdout,
+        stderr,
+        exit_code: exec_out.exit_code,
+    }
+}
+
 // ── tool list ─────────────────────────────────────────────────────────────────
+
+/// JSON schema for the `bisect` object shared by `cargo_test` and
+/// `cargo_nextest_run`. Presence of this object switches the tool into the
+/// hang/slow-test bisection engine (see [`crate::bisect`]).
+fn bisect_schema() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "description":
+            "Enable hang/slow-test BISECTION. When present, the tool ignores the normal \
+             execution path and instead builds once, enumerates every test, then runs \
+             groups of tests under a short `group_timeout_secs` kill-deadline (always with \
+             --test-threads 1). Groups that time out (hang) or exceed `slow_threshold_secs` \
+             (slow) are recursively split into `split_factor` sub-groups until isolated to \
+             `min_group_size` test(s) or `max_rounds` of subdivision. Reports culprit tests \
+             classified `hung` (exceeded the kill deadline) or `slow` (completed but over \
+             the threshold). Works identically on cargo_test and cargo_nextest_run (it runs \
+             the compiled libtest binaries directly). Standard selectors (package, target, \
+             features, manifest_path, release, profile, toolchain) scope the build.",
+        "properties": {
+            "group_timeout_secs": {
+                "type": "number",
+                "exclusiveMinimum": 0,
+                "description":
+                    "REQUIRED. Wall-clock kill-deadline (seconds) for each group run. A \
+                     group exceeding it is terminated and treated as hung. Pick a value \
+                     large enough that a legitimately long-but-finite test still completes \
+                     (so it is classified `slow`, not `hung`)."
+            },
+            "slow_threshold_secs": {
+                "type": "number",
+                "exclusiveMinimum": 0,
+                "description":
+                    "Optional. Must be < group_timeout_secs. A group that completes but \
+                     takes longer than this is `slow` and gets subdivided. Omit to detect \
+                     only hangs (groups that hit the kill-deadline)."
+            },
+            "split_factor": {
+                "type": "integer",
+                "minimum": 2,
+                "description":
+                    "Number of sub-groups to split an interesting group into. Default 2 \
+                     (binary bisection). Mutually exclusive with split_percent."
+            },
+            "split_percent": {
+                "type": "number",
+                "exclusiveMinimum": 0,
+                "maximum": 100,
+                "description":
+                    "Alternative to split_factor: each subdivision yields ceil(100/percent) \
+                     sub-groups (e.g. 25 -> 4, 50 -> 2). Mutually exclusive with split_factor."
+            },
+            "min_group_size": {
+                "type": "integer",
+                "minimum": 1,
+                "description":
+                    "Stop subdividing when an interesting group is this small; its members \
+                     are reported as culprits. Default 1 (isolate a single test)."
+            },
+            "initial_group_size": {
+                "type": "integer",
+                "minimum": 1,
+                "description":
+                    "Form the first-level groups with this many tests each (chunking). Use \
+                     to start bisection from reasonably-sized groups on a large suite. \
+                     Mutually exclusive with initial_groups."
+            },
+            "initial_groups": {
+                "type": "integer",
+                "minimum": 1,
+                "description":
+                    "Form this many roughly-equal first-level groups. Mutually exclusive \
+                     with initial_group_size. Default (neither set): one group of all tests."
+            },
+            "max_rounds": {
+                "type": "integer",
+                "minimum": 1,
+                "description":
+                    "Safety cap on subdivision depth. When reached, the current group's \
+                     members are reported as culprits without further splitting. Default 32."
+            },
+            "pattern": {
+                "type": "string",
+                "description":
+                    "Optional RE2-style regex (the `regex` crate). Only tests whose \
+                     `module::path::test_name` matches participate in bisection."
+            },
+            "include_ignored": {
+                "type": "boolean",
+                "description":
+                    "If true, `#[ignore]` tests are enumerated and run during bisection \
+                     (via --include-ignored). Default false."
+            }
+        },
+        "required": ["group_timeout_secs"]
+    })
+}
 
 /// Return the MCP `tools/list` payload (an array of tool descriptors).
 pub fn list() -> Value {
@@ -1908,7 +2204,8 @@ pub fn list() -> Value {
                              always on in filter mode. Pass 0 to fully disable for this \
                              call. May be combined with `timeout_secs`; whichever fires \
                              first terminates the affected invocation."
-                    }
+                    },
+                    "bisect": bisect_schema()
                 },
                 "required": []
             },
@@ -2674,7 +2971,9 @@ pub fn list() -> Value {
                          Same three-state semantics as `cargo_test`: omit to use the server default, \
                          pass 0 to disable, pass N to cap at N seconds. PER-TEST enforcement is the \
                          job of nextest's profile config (`slow-timeout`, `terminate-after`); \
-                         cargo-mcp does NOT expose a per-test-timeout knob for nextest." }
+                         cargo-mcp does NOT expose a per-test-timeout knob for nextest." },
+
+                    "bisect": bisect_schema()
                 },
                 "required": []
             },
@@ -2768,6 +3067,315 @@ pub fn list() -> Value {
     ])
 }
 
+// ── argument validation ───────────────────────────────────────────────────────
+
+/// Per-tool set of accepted argument keys, derived once from each tool's
+/// published `inputSchema.properties` in [`list`] and cached. Building the
+/// allowlist from the very schema we advertise guarantees it never drifts out
+/// of sync with the documented contract.
+fn tool_arg_schema() -> &'static std::collections::HashMap<String, std::collections::HashSet<String>>
+{
+    static SCHEMA: std::sync::OnceLock<
+        std::collections::HashMap<String, std::collections::HashSet<String>>,
+    > = std::sync::OnceLock::new();
+    SCHEMA.get_or_init(|| {
+        let mut map = std::collections::HashMap::new();
+        if let Value::Array(tools) = list() {
+            for tool in tools {
+                let Some(name) = tool.get("name").and_then(|n| n.as_str()) else {
+                    continue;
+                };
+                let mut keys = std::collections::HashSet::new();
+                if let Some(props) = tool
+                    .get("inputSchema")
+                    .and_then(|s| s.get("properties"))
+                    .and_then(|p| p.as_object())
+                {
+                    for k in props.keys() {
+                        keys.insert(k.clone());
+                    }
+                }
+                map.insert(name.to_owned(), keys);
+            }
+        }
+        map
+    })
+}
+
+/// Curated guidance for well-known cross-tool argument confusions — keys an
+/// LLM commonly sends to the wrong tool. Returning a precise hint here is far
+/// more useful than a generic "did you mean" suggestion, because these are
+/// not typos but valid-elsewhere parameters that would otherwise be silently
+/// dropped and cause a runaway run (e.g. a `test_filter` meant for
+/// `cargo_test` passed to `cargo_nextest_run`, which then runs the entire
+/// suite).
+fn cross_tool_hint(tool: &str, key: &str) -> Option<&'static str> {
+    match (tool, key) {
+        ("cargo_nextest_run" | "cargo_nextest_list", "test_filter") => Some(
+            "`test_filter` is a `cargo_test`-only regex parameter and is NOT honoured by \
+             nextest. For nextest use `filter` (a plain substring) or `filter_expr` (the \
+             nextest `-E` filterset DSL).",
+        ),
+        ("cargo_nextest_run" | "cargo_nextest_list", "per_test_timeout_secs") => Some(
+            "nextest has no per-test-timeout parameter here \u{2014} configure `slow-timeout` / \
+             `terminate-after` in `.config/nextest.toml`, and use `timeout_secs` for an \
+             overall wall-clock cap.",
+        ),
+        ("cargo_nextest_run" | "cargo_nextest_list", "test_name") => Some(
+            "use `filter` (substring) or `filter_expr` (nextest `-E` expression) instead of \
+             `test_name`.",
+        ),
+        ("cargo_nextest_run" | "cargo_nextest_list", "jobs") => Some(
+            "nextest splits cargo-test's `jobs`: use `build_jobs` for build parallelism or \
+             `test_threads` for test parallelism.",
+        ),
+        ("cargo_nextest_run" | "cargo_nextest_list", "profile") => Some(
+            "`profile` is ambiguous for nextest: use `cargo_profile` for the cargo build \
+             profile, or `nextest_profile` for the nextest config profile.",
+        ),
+        ("cargo_nextest_run", "doc") => {
+            Some("nextest cannot run doctests; use `cargo_test` with `doc: true` for those.")
+        }
+        ("cargo_test", "filter") | ("cargo_test", "filter_expr") => Some(
+            "`filter`/`filter_expr` are nextest parameters. For `cargo_test` use `test_name` \
+             (substring) or `test_filter` (regex selection).",
+        ),
+        _ => None,
+    }
+}
+
+/// Reject any top-level argument key the named tool's schema does not declare.
+///
+/// Unknown keys would otherwise be silently ignored by the per-tool
+/// implementation. That has caused real timeouts: a `test_filter` (a
+/// `cargo_test` parameter) passed to `cargo_nextest_run` was dropped, so the
+/// "filtered" call ran the *entire* suite. Failing fast turns a 30-minute
+/// runaway into an immediate, actionable error.
+fn validate_known_args(name: &str, args: &Value) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(obj) = args.as_object() else {
+        // Non-object args (or none) carry no keys to validate; the per-tool
+        // code and dispatch handle those shapes.
+        return Ok(());
+    };
+    let Some(allowed) = tool_arg_schema().get(name) else {
+        // Unknown tool name — let dispatch produce the "unknown tool" error.
+        return Ok(());
+    };
+    let mut unknown: Vec<&str> = obj
+        .keys()
+        .map(String::as_str)
+        .filter(|k| !allowed.contains(*k))
+        .collect();
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    unknown.sort_unstable();
+    let mut msg = format!(
+        "{name}: unknown parameter{} {}.",
+        if unknown.len() == 1 { "" } else { "s" },
+        unknown
+            .iter()
+            .map(|k| format!("`{k}`"))
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
+    for k in &unknown {
+        if let Some(hint) = cross_tool_hint(name, k) {
+            msg.push_str(&format!("\n  - `{k}`: {hint}"));
+        } else if let Some(s) = closest_key(k, allowed) {
+            msg.push_str(&format!("\n  - `{k}`: did you mean `{s}`?"));
+        }
+    }
+    let mut valid: Vec<&str> = allowed.iter().map(String::as_str).collect();
+    valid.sort_unstable();
+    msg.push_str(&format!("\n  Valid parameters: {}.", valid.join(", ")));
+    Err(msg.into())
+}
+
+/// Return the allowed key closest to `key` by Levenshtein distance, when a
+/// reasonably close match exists (distance within a small bound relative to
+/// the key length). Used to suggest a correction for plain typos.
+fn closest_key<'a>(key: &str, allowed: &'a std::collections::HashSet<String>) -> Option<&'a str> {
+    let key_l = key.to_ascii_lowercase();
+    let mut best: Option<(usize, &str)> = None;
+    for cand in allowed {
+        let d = levenshtein(&key_l, &cand.to_ascii_lowercase());
+        if best.is_none_or(|(bd, _)| d < bd) {
+            best = Some((d, cand.as_str()));
+        }
+    }
+    best.and_then(|(d, c)| {
+        // Cap the distance so unrelated keys are not "suggested": at most 3
+        // edits, and never more than half the typed key's length.
+        let threshold = 3.min((key.len() / 2).max(1));
+        if d <= threshold { Some(c) } else { None }
+    })
+}
+
+/// Classic two-row Levenshtein edit distance over Unicode scalar values.
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    if a.is_empty() {
+        return b.len();
+    }
+    if b.is_empty() {
+        return a.len();
+    }
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for (i, &ca) in a.iter().enumerate() {
+        cur[0] = i + 1;
+        for (j, &cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            cur[j + 1] = (prev[j + 1] + 1).min(cur[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
+/// True for tools that operate on a Cargo manifest and therefore need a
+/// discoverable `Cargo.toml`. `cargo_setup` and `cargo_diagnostic` are
+/// excluded — they intentionally work without a workspace.
+fn tool_requires_manifest(name: &str) -> bool {
+    matches!(
+        name,
+        "cargo_metadata"
+            | "cargo_check"
+            | "cargo_build"
+            | "cargo_test"
+            | "cargo_clippy"
+            | "cargo_fmt_check"
+            | "cargo_fmt"
+            | "cargo_tree"
+            | "cargo_doc"
+            | "cargo_clean"
+            | "cargo_update"
+            | "cargo_fix"
+            | "cargo_add"
+            | "cargo_remove"
+            | "cargo_publish"
+            | "cargo_nextest_run"
+            | "cargo_nextest_list"
+    )
+}
+
+/// Verify that a `Cargo.toml` is discoverable for a manifest-requiring tool,
+/// returning an actionable error otherwise.
+///
+/// The default working directory is the cargo-mcp **server's** own cwd (often
+/// the user's home), not the project. Relying on that default is the single
+/// most common setup mistake — it makes cargo run in the wrong place. Catching
+/// it here turns a confusing cargo error (or, worse, an operation against the
+/// wrong directory) into an immediate, clear instruction to pass `working_dir`.
+fn ensure_manifest_discoverable(
+    name: &str,
+    args: &Value,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !tool_requires_manifest(name) {
+        return Ok(());
+    }
+    // An explicit manifest path bypasses working-dir discovery entirely.
+    if opt_str(args, "manifest_path").is_some() {
+        return Ok(());
+    }
+    let wd = opt_str(args, "working_dir");
+    let base = match wd {
+        Some(w) => std::path::PathBuf::from(w),
+        None => std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+    };
+    // Walk up from base looking for Cargo.toml — the same upward search cargo
+    // itself performs to locate the manifest.
+    let mut dir: &std::path::Path = base.as_path();
+    loop {
+        if dir.join("Cargo.toml").is_file() {
+            return Ok(());
+        }
+        match dir.parent() {
+            Some(p) => dir = p,
+            None => break,
+        }
+    }
+    let shown = base.display();
+    let cause = if wd.is_none() {
+        " `working_dir` was not provided, so it defaulted to the cargo-mcp server's own \
+         working directory (typically not your project)."
+    } else {
+        ""
+    };
+    Err(format!(
+        "{name}: no `Cargo.toml` found in `{shown}` or any parent directory.{cause} \
+         Pass `working_dir` set to the absolute path of your workspace root (the directory \
+         containing Cargo.toml), or pass `manifest_path`."
+    )
+    .into())
+}
+
+// ── build-progress denominator ────────────────────────────────────────────────
+
+/// NDJSON `reason` for the control record cargo-mcp injects ahead of a build
+/// so the progress tracker learns the total crate count up front. Never
+/// emitted by cargo itself (the `x-` prefix guarantees no collision).
+pub(crate) const PROGRESS_TOTAL_REASON: &str = "x-cargo-mcp-progress-total";
+
+/// Best-effort count of packages in the resolved dependency graph, used as an
+/// up-front denominator for build progress so notifications show real progress
+/// (e.g. `(3/120)`) instead of a lower bound that starts at `1/1`.
+///
+/// Runs `cargo metadata` once per working directory and caches the result for
+/// the process lifetime — the denominator is a display hint, so slight
+/// staleness if dependencies change mid-session is harmless. Any failure
+/// returns `None` and the tracker falls back to the streamed running total.
+fn resolved_package_count(wd: Option<&str>) -> Option<u32> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, Option<u32>>>,
+    > = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let key = wd.unwrap_or_default().to_owned();
+    if let Ok(c) = cache.lock()
+        && let Some(v) = c.get(&key)
+    {
+        return *v;
+    }
+    let count = compute_resolved_package_count(wd);
+    if let Ok(mut c) = cache.lock() {
+        c.insert(key, count);
+    }
+    count
+}
+
+/// Run `cargo metadata` and count the packages in the resolved dependency
+/// graph (the node count reflects what will actually be compiled more closely
+/// than the bare `packages` list). Falls back to the `packages` length when
+/// no `resolve` section is present (e.g. `--frozen` edge cases).
+fn compute_resolved_package_count(wd: Option<&str>) -> Option<u32> {
+    let out = invoke::run_cargo(&["metadata", "--format-version=1"], wd).ok()?;
+    if out.exit_code != 0 {
+        return None;
+    }
+    let v: Value = serde_json::from_str(&out.stdout).ok()?;
+    if let Some(nodes) = v.pointer("/resolve/nodes").and_then(|n| n.as_array()) {
+        return u32::try_from(nodes.len()).ok();
+    }
+    let pkgs = v.get("packages").and_then(|p| p.as_array())?;
+    u32::try_from(pkgs.len()).ok()
+}
+
+/// Emit the up-front progress-total control record to the streaming callback,
+/// so the tracker can render an accurate denominator. Best-effort and only
+/// meaningful when a progress callback is active; no-op when metadata cannot
+/// be resolved.
+fn emit_progress_total(on_progress: &mut Option<&mut dyn FnMut(&str)>, wd: Option<&str>) {
+    if let Some(cb) = on_progress.as_deref_mut()
+        && let Some(total) = resolved_package_count(wd)
+    {
+        cb(&format!(
+            "{{\"reason\":\"{PROGRESS_TOTAL_REASON}\",\"total_units\":{total}}}"
+        ));
+    }
+}
+
 // ── dispatch ──────────────────────────────────────────────────────────────────
 
 /// Return the names of all registered tools, in the same order as [`list`].
@@ -2809,6 +3417,21 @@ pub fn call(
     // Install the cancel token for the duration of the tool call so that the
     // invoke functions can kill the child process if the client cancels.
     invoke::set_cancel_token(cancel);
+    // Reject unknown arguments up front, before any subprocess spawn, so a
+    // misrouted parameter (e.g. a `cargo_test`-only `test_filter` sent to
+    // `cargo_nextest_run`) fails immediately instead of being silently
+    // dropped and running the entire suite.
+    if let Err(e) = validate_known_args(name, args) {
+        invoke::set_cancel_token(None);
+        return Err(e);
+    }
+    // Fail fast when a manifest-requiring tool has no discoverable Cargo.toml
+    // (almost always a missing `working_dir`), rather than letting cargo run
+    // in the wrong directory.
+    if let Err(e) = ensure_manifest_discoverable(name, args) {
+        invoke::set_cancel_token(None);
+        return Err(e);
+    }
     // Parse the per-call env map before any subprocess spawn so a malformed
     // request fails cleanly without ever installing partial state.
     let result = match opt_env(args) {
@@ -2947,6 +3570,8 @@ fn call_check(
     if let Some(ref t) = tc {
         argv.insert(0, t);
     }
+    let mut on_progress = on_progress;
+    emit_progress_total(&mut on_progress, wd);
     let out = run_cargo_maybe_streaming(&argv, wd, opt_timeout(args)?, None, on_progress)?;
     let is_error = out.exit_code != 0;
     let body = format_json_output(&out, &argv, wd);
@@ -2979,6 +3604,8 @@ fn call_build(
     if let Some(ref t) = tc {
         argv.insert(0, t);
     }
+    let mut on_progress = on_progress;
+    emit_progress_total(&mut on_progress, wd);
     let out = run_cargo_maybe_streaming(&argv, wd, opt_timeout(args)?, None, on_progress)?;
     let is_error = out.exit_code != 0;
     let body = format_json_output(&out, &argv, wd);
@@ -2990,6 +3617,15 @@ fn call_test(
     args: &Value,
     on_progress: Option<&mut dyn FnMut(&str)>,
 ) -> Result<ToolResult, Box<dyn std::error::Error>> {
+    // Bisection mode takes precedence: when the caller supplies a `bisect`
+    // object, hand control to the hang/slow-test bisection engine.
+    if crate::bisect::is_bisect_requested(args) {
+        return crate::bisect::run(args, on_progress)?.ok_or_else(
+            || -> Box<dyn std::error::Error> {
+                "bisect requested but the bisection engine returned no result".into()
+            },
+        );
+    }
     // When the caller supplies `test_filter`, hand control to the regex-
     // based selection pipeline (build with --no-run, enumerate per binary
     // via --list, match, then launch each binary with `--exact <names...>`
@@ -3019,65 +3655,101 @@ fn call_test_unfiltered(
         validate_relative_output_path(p, wd)?;
     }
     let tc = toolchain_arg(args);
-    let mut argv: Vec<&str> = vec!["test", "--message-format=json"];
     let o = CommonOpts::from_args(args);
     let test_name = opt_str(args, "test_name").map(String::from);
-    push_package_selection(&mut argv, args, &o);
+
+    // Build the selector set shared by both phases (everything except the
+    // `--no-run` build flag and the `--` test-harness arguments, which differ
+    // per phase).
+    let mut base: Vec<&str> = vec!["test", "--message-format=json"];
+    push_package_selection(&mut base, args, &o);
     // `cargo test` supports the full target-selection set (including --test,
     // handled by push_target_selection) plus --doc for doctests.
-    push_target_selection(&mut argv, args, &o);
+    push_target_selection(&mut base, args, &o);
     if opt_bool(args, "doc") {
-        argv.push("--doc");
-    }
-    if opt_bool(args, "no_run") {
-        argv.push("--no-run");
+        base.push("--doc");
     }
     if opt_bool(args, "no_fail_fast") {
-        argv.push("--no-fail-fast");
+        base.push("--no-fail-fast");
     }
-    push_feature_flags(&mut argv, args, &o);
+    push_feature_flags(&mut base, args, &o);
     // `cargo test` accepts every compilation flag except --keep-going.
-    push_compilation_options(&mut argv, args, &o, false);
-    push_manifest_options(&mut argv, args, &o, true);
-    // Test name filter goes after `--` to the test harness.
-    if test_name.is_some() || opt_bool(args, "exact") {
-        argv.push("--");
-        if let Some(ref name) = test_name {
-            argv.push(name);
-        }
-        if opt_bool(args, "exact") {
-            argv.push("--exact");
-        }
-    }
+    push_compilation_options(&mut base, args, &o, false);
+    push_manifest_options(&mut base, args, &o, true);
     if let Some(ref t) = tc {
-        argv.insert(0, t);
+        base.insert(0, t);
     }
+
     // Caller-supplied timeout wins; fall back to the server-configured default
     // (cargo-mcp.test.timeoutSecs VS Code setting, default 30s).
     // opt_timeout_explicit distinguishes three cases:
     //   None         → key absent: apply server default
     //   Some(None)   → explicit 0: disable timeout for this run
     //   Some(Some(d))→ explicit positive: use caller's budget
+    // The budget is applied INDEPENDENTLY to each phase below, so a slow build
+    // never consumes the test-execution budget.
     let timeout = match opt_timeout_explicit(args)? {
         None => default_test_timeout(), // use server default
         Some(explicit) => explicit,     // caller wins (including None=disable)
     };
-    // Arm the timeout only once compilation/linking finishes (cargo emits the
-    // `build-finished` record), so the budget bounds test *execution* and not
-    // the build phase.
-    let out = run_cargo_maybe_streaming(
-        &argv,
+
+    let mut on_progress = on_progress;
+    emit_progress_total(&mut on_progress, wd);
+
+    // ── Phase 1: build (`--no-run`) ──────────────────────────────────────────
+    // Compile the test binaries up front so the build time is excluded from the
+    // test-execution budget. The timeout here arms immediately (arm_deadline =
+    // None) so it bounds the whole build; a timeout is labelled "build".
+    let mut build_argv = base.clone();
+    build_argv.push("--no-run");
+    let build_out = run_phase(&build_argv, wd, timeout, None, &mut on_progress, "build")?;
+
+    // If the build failed (compile error) or the caller only wanted a build
+    // (`no_run`), return the build output directly without an execution phase.
+    let build_failed = build_out.exit_code != 0;
+    if build_failed || opt_bool(args, "no_run") {
+        let body = format_test_output(&build_out, &build_argv, wd);
+        let text = write_output_path_and_summarize(body, output_path, wd, SummaryKind::Test)?;
+        return Ok(ToolResult::Text {
+            text,
+            is_error: build_failed,
+        });
+    }
+
+    // ── Phase 2: test execution ──────────────────────────────────────────────
+    // Re-run `cargo test` without `--no-run`; the build is now a cache hit, so
+    // cargo emits `build-finished` almost immediately and the timeout (armed on
+    // that record) bounds test execution only. A timeout is labelled
+    // "test execution".
+    let mut exec_argv = base.clone();
+    // Test name filter goes after `--` to the test harness.
+    if test_name.is_some() || opt_bool(args, "exact") {
+        exec_argv.push("--");
+        if let Some(ref name) = test_name {
+            exec_argv.push(name);
+        }
+        if opt_bool(args, "exact") {
+            exec_argv.push("--exact");
+        }
+    }
+    let exec_out = run_phase(
+        &exec_argv,
         wd,
         timeout,
         Some(&is_build_finished_line),
-        on_progress,
+        &mut on_progress,
+        "test execution",
     )?;
+
     // Test output is a mix: JSON from compilation, text from the test harness.
     // Use format_test_output so that non-JSON lines (libtest harness text,
     // captured println! replays) are preserved as x-cargo-mcp-test-output
     // records, and stderr (eprintln! from test code) is always included.
-    let is_error = out.exit_code != 0;
-    let body = format_test_output(&out, &argv, wd);
+    // Merge in the build phase's compiler-message records so warnings emitted
+    // during the (now-cached) build are not lost.
+    let combined = combine_build_and_exec_output(&build_out, &exec_out);
+    let is_error = exec_out.exit_code != 0;
+    let body = format_test_output(&combined, &exec_argv, wd);
     let text = write_output_path_and_summarize(body, output_path, wd, SummaryKind::Test)?;
     Ok(ToolResult::Text { text, is_error })
 }
@@ -3102,6 +3774,8 @@ fn call_clippy(
     if let Some(ref t) = tc {
         argv.insert(0, t);
     }
+    let mut on_progress = on_progress;
+    emit_progress_total(&mut on_progress, wd);
     let out = run_cargo_maybe_streaming(&argv, wd, opt_timeout(args)?, None, on_progress)?;
     let is_error = out.exit_code != 0;
     let body = format_json_output(&out, &argv, wd);
@@ -3114,44 +3788,179 @@ fn call_clippy(
     })
 }
 
-fn call_fmt_check(args: &Value) -> Result<ToolResult, Box<dyn std::error::Error>> {
-    let wd = opt_str(args, "working_dir");
-    let tc = toolchain_arg(args);
-    let mut argv: Vec<&str> = vec!["fmt", "--check"];
-    let pkg = opt_str(args, "package").map(String::from);
-    if let Some(ref p) = pkg {
-        argv.push("--package");
-        argv.push(p);
+/// Heuristic: does this cargo/rustfmt output indicate the invocation failed
+/// because the spawned command line exceeded the OS length limit?
+///
+/// `cargo fmt` gathers every target across the whole workspace and launches
+/// rustfmt with all of their root paths on one command line. In a large
+/// workspace that can blow past the OS limit before any file is formatted.
+/// The symptom differs per platform:
+/// - Windows: `CreateProcess` fails with "The filename or extension is too
+///   long. (os error 206)".
+/// - Unix: `execve` fails with `E2BIG` — "Argument list too long (os error 7)".
+fn looks_like_command_too_long(text: &str) -> bool {
+    let t = text.to_ascii_lowercase();
+    t.contains("os error 206")
+        || t.contains("filename or extension is too long")
+        || t.contains("argument list too long")
+}
+
+/// Enumerate the names of every workspace member via `cargo metadata`.
+///
+/// Returns the member package names (the set `cargo fmt` would format when no
+/// `--package` is given) so the caller can drive a per-crate formatting pass.
+/// Returns `None` when metadata cannot be resolved.
+fn workspace_member_names(wd: Option<&str>) -> Option<Vec<String>> {
+    let out = invoke::run_cargo(&["metadata", "--format-version=1", "--no-deps"], wd).ok()?;
+    if out.exit_code != 0 {
+        return None;
     }
-    if let Some(ref t) = tc {
-        argv.insert(0, t);
+    let v: Value = serde_json::from_str(&out.stdout).ok()?;
+    let members: std::collections::HashSet<&str> = v
+        .get("workspace_members")
+        .and_then(|m| m.as_array())
+        .map(|a| a.iter().filter_map(|i| i.as_str()).collect())
+        .unwrap_or_default();
+    let pkgs = v.get("packages").and_then(|p| p.as_array())?;
+    let mut names: Vec<String> = pkgs
+        .iter()
+        .filter(|p| {
+            p.get("id")
+                .and_then(|i| i.as_str())
+                .is_some_and(|id| members.contains(id))
+        })
+        .filter_map(|p| p.get("name").and_then(|n| n.as_str()).map(String::from))
+        .collect();
+    names.sort();
+    names.dedup();
+    if names.is_empty() { None } else { Some(names) }
+}
+
+/// Run a single `cargo fmt` invocation (optionally `--check`, optionally scoped
+/// to one `--package`), returning the raw output alongside the argv used so the
+/// caller can render it.
+fn run_fmt_invocation(
+    wd: Option<&str>,
+    tc: Option<&str>,
+    package: Option<&str>,
+    check: bool,
+) -> Result<(CargoOutput, Vec<String>), Box<dyn std::error::Error>> {
+    let mut argv: Vec<String> = vec!["fmt".to_owned()];
+    if check {
+        argv.push("--check".to_owned());
     }
-    let out = invoke::run_cargo(&argv, wd)?;
-    let is_error = out.exit_code != 0;
+    if let Some(p) = package {
+        argv.push("--package".to_owned());
+        argv.push(p.to_owned());
+    }
+    if let Some(t) = tc {
+        argv.insert(0, t.to_owned());
+    }
+    let argv_ref: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let out = invoke::run_cargo(&argv_ref, wd)?;
+    Ok((out, argv))
+}
+
+/// Render a single fmt invocation's output as the tool result text.
+fn render_fmt_text(out: &CargoOutput, argv: &[String], wd: Option<&str>, check: bool) -> String {
+    let argv_ref: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let body = format_text_output(out, &argv_ref, wd);
+    if check { strip_ansi(&body) } else { body }
+}
+
+/// Format the workspace one crate at a time via `cargo fmt --package <member>`,
+/// aggregating the per-crate output. Used as a fallback when the single
+/// workspace-wide pass cannot be launched (command line too long).
+fn per_crate_fmt_result(
+    wd: Option<&str>,
+    tc: Option<&str>,
+    members: &[String],
+    check: bool,
+) -> Result<ToolResult, Box<dyn std::error::Error>> {
+    let mut sections: Vec<String> = Vec::new();
+    let mut any_error = false;
+    for name in members {
+        let (out, argv) = run_fmt_invocation(wd, tc, Some(name), check)?;
+        if out.exit_code != 0 {
+            any_error = true;
+        }
+        let body = render_fmt_text(&out, &argv, wd, check);
+        if !body.trim().is_empty() {
+            sections.push(format!("cargo-mcp fmt [{name}]:\n{body}"));
+        }
+    }
+    let verb = if check {
+        "cargo fmt --check"
+    } else {
+        "cargo fmt"
+    };
+    let text = if sections.is_empty() {
+        format!(
+            "cargo-mcp: ran {verb} per-crate across {} workspace members (the \
+             single workspace-wide pass exceeded the OS command-line length \
+             limit); all members are correctly formatted.",
+            members.len()
+        )
+    } else {
+        let header = format!(
+            "cargo-mcp: the single workspace-wide {verb} pass exceeded the OS \
+             command-line length limit, so it was re-run per-crate across {} \
+             workspace members.\n",
+            members.len()
+        );
+        format!("{header}\n{}", sections.join("\n\n"))
+    };
     Ok(ToolResult::Text {
-        text: strip_ansi(&format_text_output(&out, &argv, wd)),
-        is_error,
+        text,
+        is_error: any_error,
     })
 }
 
-fn call_fmt(args: &Value) -> Result<ToolResult, Box<dyn std::error::Error>> {
+/// Shared implementation for `cargo_fmt` and `cargo_fmt_check`.
+///
+/// Runs the normal single invocation first (the fast path, and the only path
+/// when the caller pinned a `package`). If that single pass fails *because the
+/// command line was too long*, it transparently falls back to a per-crate pass
+/// driven by `cargo metadata` and suppresses the original length-limit error.
+/// In apply mode (`check == false`) any other failure also triggers the
+/// per-crate fallback, since a non-zero exit there always denotes a real error
+/// worth isolating to the offending crate. In check mode a non-zero exit is the
+/// normal "needs formatting" diff signal, so only the detected length-limit
+/// case falls back.
+fn run_fmt(args: &Value, check: bool) -> Result<ToolResult, Box<dyn std::error::Error>> {
     let wd = opt_str(args, "working_dir");
     let tc = toolchain_arg(args);
-    let mut argv: Vec<&str> = vec!["fmt"];
     let pkg = opt_str(args, "package").map(String::from);
-    if let Some(ref p) = pkg {
-        argv.push("--package");
-        argv.push(p);
+
+    let (out, argv) = run_fmt_invocation(wd, tc.as_deref(), pkg.as_deref(), check)?;
+
+    if pkg.is_none() && out.exit_code != 0 {
+        let long_cmd =
+            looks_like_command_too_long(&out.stdout) || looks_like_command_too_long(&out.stderr);
+        // Apply mode (`!check`): any non-zero exit is a real failure, so fall
+        // back. Check mode: a non-zero exit is the normal "needs formatting"
+        // diff signal, so only fall back when we can attribute the failure to
+        // the command-line length limit.
+        if (long_cmd || !check)
+            && let Some(members) = workspace_member_names(wd)
+            && members.len() > 1
+        {
+            return per_crate_fmt_result(wd, tc.as_deref(), &members, check);
+        }
     }
-    if let Some(ref t) = tc {
-        argv.insert(0, t);
-    }
-    let out = invoke::run_cargo(&argv, wd)?;
-    let is_error = out.exit_code != 0;
+
     Ok(ToolResult::Text {
-        text: format_text_output(&out, &argv, wd),
-        is_error,
+        text: render_fmt_text(&out, &argv, wd, check),
+        is_error: out.exit_code != 0,
     })
+}
+
+fn call_fmt_check(args: &Value) -> Result<ToolResult, Box<dyn std::error::Error>> {
+    run_fmt(args, true)
+}
+
+fn call_fmt(args: &Value) -> Result<ToolResult, Box<dyn std::error::Error>> {
+    run_fmt(args, false)
 }
 
 fn call_tree(args: &Value) -> Result<ToolResult, Box<dyn std::error::Error>> {
@@ -3220,6 +4029,8 @@ fn call_doc(
     if let Some(ref t) = tc {
         argv.insert(0, t);
     }
+    let mut on_progress = on_progress;
+    emit_progress_total(&mut on_progress, wd);
     let out = run_cargo_maybe_streaming(&argv, wd, None, None, on_progress)?;
     let is_error = out.exit_code != 0;
     let body = format_json_output(&out, &argv, wd);
@@ -4008,6 +4819,134 @@ mod tests {
     }
 
     #[test]
+    fn validate_known_args_accepts_declared_keys() {
+        let args = serde_json::json!({
+            "working_dir": "/ws",
+            "package": "foo",
+            "filter": "bar",
+            "filter_expr": "test(x)",
+            "timeout_secs": 60,
+        });
+        assert!(validate_known_args("cargo_nextest_run", &args).is_ok());
+    }
+
+    #[test]
+    fn validate_known_args_rejects_cross_tool_test_filter_on_nextest() {
+        // The exact mistake that caused full-suite timeouts: a cargo_test
+        // parameter routed to cargo_nextest_run.
+        let args = serde_json::json!({ "test_filter": { "pattern": "x" } });
+        let err = validate_known_args("cargo_nextest_run", &args).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("test_filter"));
+        // The curated cross-tool hint must name the correct nextest knobs.
+        assert!(msg.contains("filter_expr"));
+        assert!(msg.contains("Valid parameters"));
+    }
+
+    #[test]
+    fn validate_known_args_rejects_per_test_timeout_on_nextest() {
+        let args = serde_json::json!({ "per_test_timeout_secs": 5 });
+        let err = validate_known_args("cargo_nextest_run", &args).unwrap_err();
+        assert!(err.to_string().contains("nextest"));
+    }
+
+    #[test]
+    fn validate_known_args_suggests_closest_for_typo() {
+        let args = serde_json::json!({ "packge": "foo" });
+        let err = validate_known_args("cargo_build", &args).unwrap_err();
+        assert!(err.to_string().contains("did you mean `package`"));
+    }
+
+    #[test]
+    fn validate_known_args_ignores_unknown_tool() {
+        // Dispatch reports the unknown-tool error; validation must not.
+        let args = serde_json::json!({ "anything": true });
+        assert!(validate_known_args("not_a_tool", &args).is_ok());
+    }
+
+    #[test]
+    fn ensure_manifest_discoverable_skips_non_manifest_tools() {
+        let args = serde_json::json!({ "working_dir": "/definitely/not/a/crate" });
+        assert!(ensure_manifest_discoverable("cargo_setup", &args).is_ok());
+        assert!(ensure_manifest_discoverable("cargo_diagnostic", &args).is_ok());
+    }
+
+    #[test]
+    fn ensure_manifest_discoverable_skips_when_manifest_path_given() {
+        let args = serde_json::json!({ "manifest_path": "/some/Cargo.toml" });
+        assert!(ensure_manifest_discoverable("cargo_build", &args).is_ok());
+    }
+
+    #[test]
+    fn ensure_manifest_discoverable_errors_without_cargo_toml() {
+        let dir = std::env::temp_dir().join(format!(
+            "cargo-mcp-no-manifest-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let args = serde_json::json!({ "working_dir": dir.to_string_lossy() });
+        let err = ensure_manifest_discoverable("cargo_build", &args).unwrap_err();
+        assert!(err.to_string().contains("no `Cargo.toml` found"));
+        assert!(err.to_string().contains("working_dir"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_manifest_discoverable_accepts_dir_with_cargo_toml() {
+        let dir = std::env::temp_dir().join(format!(
+            "cargo-mcp-has-manifest-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
+        let args = serde_json::json!({ "working_dir": dir.to_string_lossy() });
+        assert!(ensure_manifest_discoverable("cargo_build", &args).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn looks_like_command_too_long_detects_platform_markers() {
+        // Windows CreateProcess failure.
+        assert!(looks_like_command_too_long(
+            "error: The filename or extension is too long. (os error 206)"
+        ));
+        // Unix execve E2BIG.
+        assert!(looks_like_command_too_long(
+            "failed to spawn: Argument list too long (os error 7)"
+        ));
+        // Case-insensitive.
+        assert!(looks_like_command_too_long("OS ERROR 206"));
+        // Unrelated rustfmt failure must not match.
+        assert!(!looks_like_command_too_long(
+            "error: expected one of `;` or `}`, found `)`"
+        ));
+        assert!(!looks_like_command_too_long(""));
+    }
+
+    #[test]
+    fn workspace_member_names_lists_repo_members() {
+        // Unit tests run with the crate directory as cwd; `cargo metadata`
+        // there resolves this workspace, which has exactly two members.
+        let members = workspace_member_names(None).expect("metadata should resolve");
+        assert!(
+            members.iter().any(|m| m == "cargo-mcp"),
+            "expected cargo-mcp in {members:?}"
+        );
+        assert!(
+            members.iter().any(|m| m == "rm-test-helpers"),
+            "expected rm-test-helpers in {members:?}"
+        );
+    }
+
+    #[test]
     fn push_target_selection_emits_all_flags() {
         let args = serde_json::json!({
             "lib": true,
@@ -4194,6 +5133,64 @@ mod tests {
         assert!(opt_env(&bad_key).is_err());
         let bad_val = serde_json::json!({ "env": { "K": "x\u{0000}y" } });
         assert!(opt_env(&bad_val).is_err());
+    }
+
+    // ── output_path: path validation ─────────────────────────────────────────
+
+    /// Serializes tests that read/write the process-global SHOW_INCREMENTAL_NOTES flag.
+    static SHOW_INCREMENTAL_NOTES_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn strip_incremental_notes_removes_note_and_blank_separator() {
+        let stderr = "before\n\
+             note: error finalizing incremental compilation session directory \
+             `\\\\?\\C:\\proj\\target\\debug\\incremental\\foo-abc\\s-xyz-working`: \
+             Access is denied. (os error 5)\n\
+             \n\
+             after";
+        let stripped = strip_incremental_notes(stderr);
+        assert_eq!(stripped, "before\nafter");
+    }
+
+    #[test]
+    fn strip_incremental_notes_preserves_other_lines() {
+        let stderr = "error: aborting due to previous error\nsome other note";
+        assert_eq!(strip_incremental_notes(stderr), stderr);
+    }
+
+    #[test]
+    fn strip_incremental_notes_removes_multiple_occurrences() {
+        let stderr = "a\n\
+             note: error finalizing incremental compilation session directory `x`: \
+             Access is denied. (os error 5)\n\
+             \n\
+             b\n\
+             note: error finalizing incremental compilation session directory `y`: \
+             Access is denied. (os error 5)\n\
+             \n\
+             c";
+        assert_eq!(strip_incremental_notes(stderr), "a\nb\nc");
+    }
+
+    #[test]
+    fn stderr_for_display_suppresses_by_default() {
+        let _g = SHOW_INCREMENTAL_NOTES_TEST_LOCK.lock().unwrap();
+        set_show_incremental_notes(false);
+        let stderr = "note: error finalizing incremental compilation session directory `x`: \
+             Access is denied. (os error 5)\n\nreal error";
+        assert_eq!(stderr_for_display(stderr), "real error");
+    }
+
+    #[test]
+    fn stderr_for_display_shows_when_enabled() {
+        let _g = SHOW_INCREMENTAL_NOTES_TEST_LOCK.lock().unwrap();
+        set_show_incremental_notes(true);
+        let stderr = "note: error finalizing incremental compilation session directory `x`: \
+             Access is denied. (os error 5)\n\nreal error";
+        let shown = stderr_for_display(stderr);
+        set_show_incremental_notes(false); // restore default for other tests
+        assert!(shown.contains("error finalizing incremental compilation session directory"));
+        assert!(shown.contains("real error"));
     }
 
     // ── output_path: path validation ─────────────────────────────────────────

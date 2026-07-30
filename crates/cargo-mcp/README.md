@@ -310,6 +310,15 @@ logging additions, so treat it as not confidential.
 
 **Timeouts (`timeout_secs` and `per_test_timeout_secs`)**
 
+Every `cargo_test` and `cargo_nextest_run` call runs in two independently
+timed phases: a **build** phase (`cargo test --no-run`) followed by a **test
+execution** phase. `timeout_secs` is applied to each phase on its own clock,
+so build time is never counted against the execution budget. A `TimeoutError`
+names the phase that fired — `… during the build phase` vs `… during the test
+execution phase` — so a slow compile is distinguishable from a hung test.
+Build-phase compiler warnings are preserved in the combined output even though
+the execution phase reuses the cached build.
+
 `cargo_test` has two independent timeout knobs. Both apply only to the test
 **execution** phase: each clock arms when compilation and linking finish
 (cargo's `build-finished` record), so a slow build never trips either.
@@ -423,6 +432,56 @@ run a regex-defined slice of a suite (e.g. "all tests under one
 module"). Don't use it for first-time runs of an unfamiliar suite
 (plain `cargo_test` is faster when you want everything) or for
 doctests.
+
+**Hang / slow-test bisection (`bisect`)**
+
+`cargo_test` and `cargo_nextest_run` accept an optional `bisect` object that
+switches the call into a bisection engine for finding *which* test hangs or
+runs long. It builds once, enumerates every test, then runs groups of tests
+under a short kill-deadline (always single-threaded). Any group that times out
+(hangs) or exceeds the slow threshold is recursively subdivided until the
+culprit test(s) are isolated. It works identically on both tools — bisection
+runs the compiled libtest binaries directly, bypassing the cargo/nextest
+runner — so the same `bisect` request behaves the same whichever tool you call.
+
+```jsonc
+{
+  "bisect": {
+    "group_timeout_secs": 10,    // REQUIRED: per-group kill-deadline (seconds)
+    "slow_threshold_secs": 3,    // optional: groups slower than this are "slow"
+    "split_factor": 2,           // optional: sub-groups per subdivision (default 2)
+    "split_percent": 25,         // optional: alt to split_factor -> ceil(100/p) groups
+    "min_group_size": 1,         // optional: stop subdividing at this size (default 1)
+    "initial_group_size": 50,    // optional: tests per first-level group
+    "initial_groups": 8,         // optional: number of first-level groups (alt)
+    "max_rounds": 32,            // optional: cap on subdivision depth (default 32)
+    "pattern": "tests::slow::",  // optional: RE2 regex; only matching tests participate
+    "include_ignored": false      // optional: also bisect #[ignore] tests
+  }
+}
+```
+
+- Only `group_timeout_secs` is required. A group that exceeds it is treated as
+  **hung**; a group that finishes but exceeds `slow_threshold_secs` (which must
+  be less than `group_timeout_secs`) is **slow**. Omit `slow_threshold_secs` to
+  detect hangs only.
+- Subdivision uses `split_factor` (binary search by default) or, alternatively,
+  `split_percent` (each split yields `ceil(100/p)` sub-groups). The two are
+  mutually exclusive. Subdivision stops at `min_group_size` (whose members are
+  reported as culprits) or `max_rounds` of depth.
+- `initial_group_size` and `initial_groups` (mutually exclusive) shape the
+  first-level groups; the default is one group of all tests. Use them to start
+  bisection from reasonably-sized chunks on a large suite.
+- The response is an NDJSON stream of `x-cargo-mcp-bisect-config`,
+  `x-cargo-mcp-bisect-group` (one per group run, with timing and outcome),
+  `x-cargo-mcp-bisect-culprit` (each isolated hung/slow test), and a final
+  `x-cargo-mcp-bisect-summary`. `output_path` is honoured: the full body goes
+  to the file and a compact summary (config, culprits, summary) is returned
+  inline. The call is reported as an error when any culprit is found.
+
+Use it to localise a hang or a pathologically slow test in a suite where you
+don't yet know the offender. For re-running a known slice, prefer `test_filter`
+(or nextest's `filter`/`filter_expr`) instead.
 
 **Redirecting full output to a file (`output_path`)**
 
@@ -764,6 +823,19 @@ AI agent sees a coherent "build succeeded" picture.
 
 This advisory is fixed natively in rustc 1.96.0: the diagnostic was changed
 from `warn` to `note`, which is unaffected by `-D warnings`.
+
+**Stderr suppression (`--show-incremental-notes`)** — the same advisory can
+also reach cargo-mcp as plain text on the cargo child's **stderr** rather than
+as a structured JSON diagnostic (this happens, for example, when an
+antivirus or indexer briefly holds a handle to the `-working` directory on a
+non-ReFS Windows volume). By default cargo-mcp strips these
+`note: error finalizing incremental compilation session directory ...`
+lines out of the `x-cargo-mcp-stderr` record before returning it, because
+they are harmless and the build is idempotent — re-running just redoes the
+one affected crate's incremental cache. Pass `--show-incremental-notes=true`
+on the command line, or enable
+`cargo-mcp.showIncrementalCompilationNotes` in VS Code settings, to see them
+verbatim for diagnostic purposes.
 
 ---
 

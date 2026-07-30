@@ -21,6 +21,17 @@ Two specific things that are NOT reasons to fall back to the terminal:
 - **A toolchain override** (e.g. `cargo +nightly test`, `cargo +ms-prod build`).
   Pass the `toolchain` parameter instead — see below.
 
+**Always set `working_dir` to the workspace root.** Every cargo-running tool
+accepts a `working_dir` parameter. If you omit it, the call defaults to the
+**cargo-mcp server's own working directory** (typically the user's home
+folder), which is almost never your project — the call then fails to find a
+`Cargo.toml`/toolchain, or worse, operates on the wrong manifest. Pass the
+absolute path of the workspace root (the folder containing the top-level
+`Cargo.toml`, e.g. `c:\GitHub\cargo-mcp-rs`) on every cargo tool call. As a
+safeguard the server now rejects a `working_dir` from which no `Cargo.toml`
+can be found by walking upward, returning an actionable error instead of
+running in the wrong place.
+
 
 | MCP tool | Replaces |
 |---|---|
@@ -49,7 +60,11 @@ Two specific things that are NOT reasons to fall back to the terminal:
 - **`cargo_clean`** — use before a clean rebuild; do not run `cargo clean` in
   the terminal.
 - **`cargo_fmt` / `cargo_fmt_check`** — use for formatting checks in CI-like
-  workflows inside the editor.
+  workflows inside the editor. When no `package` is given they format the whole
+  workspace; if the workspace is large enough that the single rustfmt command
+  line would exceed the OS limit, the server automatically falls back to a
+  per-crate pass (driven by `cargo metadata`) and aggregates the results, so
+  you never need to scope formatting manually to dodge "command line too long".
 - **`cargo_add` / `cargo_remove` / `cargo_update`** — always use for
   dependency management; never manually edit Cargo.toml for dependency version
   changes when these tools are available.
@@ -65,6 +80,45 @@ Two specific things that are NOT reasons to fall back to the terminal:
   If the `cargo-nextest` plugin is not installed the tool returns an
   error result whose body contains fenced install commands; the user can
   click **Copy** or **Run in Terminal** on the fence and re-run.
+
+### Test selection — which knobs belong to which tool
+
+`cargo_test` and `cargo_nextest_run` have **separate, non-interchangeable**
+selection parameters. The server now **rejects unknown arguments** with an
+actionable error (including a "did you mean" hint), so a mismatched knob fails
+fast instead of silently running the entire suite. Use the right set:
+
+- **`cargo_test` only:**
+  - `test_name` — substring (or `exact: true`) positional filter.
+  - `test_filter` — `{ "pattern": "<regex>", "include_ignored": <bool> }`,
+    a regex matched against full `module::path::test_name` strings.
+  - `per_test_timeout_secs` — per-test idle watchdog; **only** meaningful
+    together with `test_filter`.
+  - `doc: true` — run doctests (nextest cannot).
+- **`cargo_nextest_run` only:**
+  - `filter` — substring filter over test names.
+  - `filter_expr` — nextest filterset DSL (the `-E '<expr>'` expression
+    language, e.g. `test(/parser::/)`).
+
+Do NOT pass `test_filter`, `test_name`, `per_test_timeout_secs`, or `doc` to
+`cargo_nextest_run`, and do NOT pass `filter`/`filter_expr` to `cargo_test` —
+the call will now error rather than run unfiltered.
+
+### Very large test suites — avoid runaway full runs
+
+A workspace with thousands of tests across hundreds of binaries can blow past
+any reasonable wall-clock cap on a full run. When spot-checking such a suite:
+
+- **Narrow it.** Use `cargo_test`'s `test_filter`/`test_name`, or
+  `cargo_nextest_run`'s `filter`/`filter_expr`, to run only the relevant
+  slice.
+- **Or run it intentionally unbounded.** For a deliberate full run, raise or
+  disable the overall cap with `timeout_secs: 0` (see the timeout sections
+  below) rather than fighting a spurious `TimeoutError`.
+
+Picking the wrong knob (e.g. a `cargo_test`-style `test_filter` on
+`cargo_nextest_run`) used to silently run everything; it now errors, but the
+fix is still to supply the correct tool's filter parameter.
 
 ### Toolchain override (`+toolchain`)
 
@@ -153,7 +207,17 @@ artifact line, etc.).
 { "output_path": "target/cargo-mcp/test-run.ndjson" }
 ```
 
-### cargo_test — timeouts
+### cargo_test — phases & timeouts
+
+Every `cargo_test` and `cargo_nextest_run` call runs in two independently
+timed phases: a **build** phase (`cargo test --no-run`) followed by a **test
+execution** phase. `timeout_secs` is applied to each phase on its own clock, so
+build time is never counted against the execution budget. A `TimeoutError`
+names the phase that fired — `… during the build phase` vs `… during the test
+execution phase` — so a slow compile is distinguishable from a hung test.
+Build-phase compiler warnings are preserved in the combined output even though
+the execution phase reuses the cached build. If a build fails, the build output
+(compile errors) is returned and the execution phase is skipped.
 
 `cargo_test` has two independent timeout knobs that can be combined freely.
 Both apply only to the test **execution** phase: each clock arms when
@@ -274,6 +338,51 @@ When **not** to use `test_filter`:
 - Targeting doctests — not supported in this revision.
 - When you'd be matching every test anyway (`.*`) — that's just the
   unfiltered path with extra overhead.
+
+### Hang / slow-test bisection (`bisect`)
+
+`cargo_test` and `cargo_nextest_run` accept an optional `bisect` object that
+switches the call into a bisection engine for finding **which** test hangs or
+runs long. It builds once, enumerates every test, then runs groups of tests
+single-threaded under a short `group_timeout_secs` kill-deadline. Any group
+that hangs (hits the deadline) or — when `slow_threshold_secs` is set —
+exceeds that threshold is recursively subdivided until the culprit test(s) are
+isolated. It works identically on both tools (it runs the compiled libtest
+binaries directly, bypassing the cargo/nextest runner).
+
+```json
+{ "bisect": { "group_timeout_secs": 10, "slow_threshold_secs": 3 } }
+```
+
+Knobs (only `group_timeout_secs` is required):
+
+- `group_timeout_secs` (REQUIRED, > 0) — per-group kill-deadline; a group
+  exceeding it is `hung`.
+- `slow_threshold_secs` (< `group_timeout_secs`) — a group that finishes but
+  takes longer is `slow` and gets subdivided. Omit to detect hangs only.
+- `split_factor` (default 2) — sub-groups per subdivision. `split_percent`
+  (alt, mutually exclusive) — `ceil(100/p)` sub-groups.
+- `min_group_size` (default 1) — stop subdividing at this size; members become
+  culprits.
+- `initial_group_size` / `initial_groups` (mutually exclusive) — shape the
+  first-level groups; default is one group of all tests.
+- `max_rounds` (default 32) — cap on subdivision depth.
+- `pattern` (RE2 regex over `module::path::test_name`) and `include_ignored`
+  scope which tests participate.
+
+The response is an NDJSON stream of `x-cargo-mcp-bisect-{config,group,culprit,
+summary}` records; `output_path` is honoured (full body to file, compact
+summary inline). The call is reported as an error when any culprit is found.
+
+When to use `bisect`:
+
+- Localising a hang or a pathologically slow test in a suite where you don't
+  yet know the offender.
+
+When **not** to use `bisect`:
+
+- Re-running a known slice — use `test_filter` (cargo_test) or
+  `filter`/`filter_expr` (nextest) instead.
 
 ### Reading cargo_test output
 

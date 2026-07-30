@@ -123,26 +123,26 @@ impl FilterArgs {
 /// A compiled test binary discovered from cargo's `compiler-artifact`
 /// records during the `--no-run` build phase.
 #[derive(Debug, Clone)]
-struct TestBinary {
+pub(crate) struct TestBinary {
     /// Absolute path to the compiled test binary on disk. Used both for the
     /// `--list` enumeration call and (indirectly, via the cargo
     /// re-invocation) for execution.
-    executable: PathBuf,
+    pub(crate) executable: PathBuf,
     /// The cargo target's `name`, as it appears in `compiler-artifact.target.name`.
-    target_name: String,
+    pub(crate) target_name: String,
     /// The cargo target's `kind`, used to derive the right cargo selector flag
     /// (`--lib`, `--test <name>`, `--bin <name>`, `--example <name>`,
     /// `--bench <name>`).
-    target_kind: TargetKind,
+    pub(crate) target_kind: TargetKind,
     /// The owning package's name (extracted from `compiler-artifact.package_id`).
     /// Passed back to cargo as `--package <name>` so a workspace member is
     /// unambiguously selected even when the workspace contains multiple
     /// packages with similarly-named targets.
-    package_name: String,
+    pub(crate) package_name: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TargetKind {
+pub(crate) enum TargetKind {
     Lib,
     Test,
     Bin,
@@ -206,7 +206,7 @@ impl TargetKind {
 /// a cargo target selector, are skipped silently rather than failing the run:
 /// the user-visible failure mode would be "build succeeded but nothing was
 /// selected", which the empty-discovery path already handles gracefully.
-fn parse_no_run_artifacts(stdout: &str) -> Vec<TestBinary> {
+pub(crate) fn parse_no_run_artifacts(stdout: &str) -> Vec<TestBinary> {
     let mut out = Vec::new();
     for line in stdout.lines() {
         let Ok(v) = serde_json::from_str::<Value>(line) else {
@@ -312,7 +312,7 @@ const ENUMERATION_TIMEOUT: Duration = Duration::from_secs(60);
 /// the build (phase 1). Without this, enumeration would run with whatever
 /// cwd the MCP server process happens to hold, which can produce different
 /// initialization behaviour than the execution launches.
-fn enumerate_tests(
+pub(crate) fn enumerate_tests(
     binary: &Path,
     include_ignored: bool,
     working_dir: Option<&str>,
@@ -1009,16 +1009,15 @@ pub fn run(
         // body (with the skipped test name in the x-cargo-mcp-invocation argv)
         // before returning overall_deadline_exceeded = true, so the caller can
         // always identify the first skipped test from the response body.
-        if !per_test_execution {
-            if let (Some(arm_t), Some(budget)) = (phase3_arm.get(), overall_timeout)
-                && let Some(d_abs) = arm_t.checked_add(budget)
-                && Instant::now() >= d_abs
-            {
-                if overall_exit_code == 0 {
-                    overall_exit_code = -1;
-                }
-                break;
+        if !per_test_execution
+            && let (Some(arm_t), Some(budget)) = (phase3_arm.get(), overall_timeout)
+            && let Some(d_abs) = arm_t.checked_add(budget)
+            && Instant::now() >= d_abs
+        {
+            if overall_exit_code == 0 {
+                overall_exit_code = -1;
             }
+            break;
         }
         if per_test_execution {
             // ── per-test execution mode ───────────────────────────────
@@ -1396,9 +1395,18 @@ mod tests {
             &mut |_| {},
         );
 
-        assert_eq!(outcome.exit_code, -1, "timed-out invocation must report exit_code -1");
-        assert!(outcome.overall_deadline_exceeded, "must signal deadline exceeded");
-        assert_eq!(outcome.launches, 1, "must count one launch even for the short-circuit path");
+        assert_eq!(
+            outcome.exit_code, -1,
+            "timed-out invocation must report exit_code -1"
+        );
+        assert!(
+            outcome.overall_deadline_exceeded,
+            "must signal deadline exceeded"
+        );
+        assert_eq!(
+            outcome.launches, 1,
+            "must count one launch even for the short-circuit path"
+        );
         assert_eq!(outcome.formatted.len(), 1);
         // The x-cargo-mcp-invocation header must name the test so callers can
         // identify the first skipped test from the response body alone.
@@ -1415,13 +1423,16 @@ mod tests {
     #[test]
     fn per_test_launch_count_is_one_per_matched_test() {
         // Two binaries: one with 2 matched tests, one with 1.
-        let binaries = vec![
+        let binaries = [
             make_discovered("pkg", "lib1", vec!["a::t1", "a::t2"]),
             make_discovered("pkg", "lib2", vec!["b::t1"]),
         ];
 
         let total_matched: usize = binaries.iter().map(|d| d.matched.len()).sum();
-        assert_eq!(total_matched, 3, "per-test mode: 3 matched → 3 planned launches");
+        assert_eq!(
+            total_matched, 3,
+            "per-test mode: 3 matched → 3 planned launches"
+        );
 
         // Contrast with batched mode: chunk_test_names produces one chunk per
         // binary for small name sets (all names fit in a single argv).
@@ -1430,7 +1441,10 @@ mod tests {
             .filter(|d| !d.matched.is_empty())
             .map(|d| chunk_test_names(&d.matched).len())
             .sum();
-        assert_eq!(batched_launches, 2, "batched mode: one chunk per binary → 2 launches");
+        assert_eq!(
+            batched_launches, 2,
+            "batched mode: one chunk per binary → 2 launches"
+        );
 
         // Per-test always produces more (or equal) launches for the same input.
         assert!(

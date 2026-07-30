@@ -1,0 +1,10 @@
+# Copyright (c) Michael Grier. All rights reserved.
+#
+# Pins the toolchain used to build, test, format, and lint this workspace so
+# every contributor and CI run uses the same Rust release. Keep `channel` in
+# sync with `[workspace.package].rust-version` (the declared MSRV) in the
+# top-level Cargo.toml. `clippy` and `rustfmt` are listed so the components
+# the CI `lint` job depends on are installed automatically by rustup.
+[toolchain]
+channel    = "1.95"
+components = ["clippy", "rustfmt"]
