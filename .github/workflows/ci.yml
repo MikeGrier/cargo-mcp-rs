@@ -43,7 +43,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      # Installs (and caches) whatever toolchain rust-toolchain.toml pins;
+      # `rustup show` forces the auto-install rather than deferring it to
+      # the first `cargo` invocation.
+      - name: Install pinned Rust toolchain (rust-toolchain.toml)
+        run: rustup show
       - uses: Swatinem/rust-cache@v2
       # `--locked` makes CI fail if Cargo would need to update Cargo.lock.
       # CI must build the exact dependency graph that was committed; any
@@ -69,10 +73,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      # Pin to the exact MSRV declared in [workspace.package].rust-version
-      # so a stray use of a newer-stable feature fails CI rather than
-      # silently raising the floor for downstream consumers.
-      - uses: dtolnay/rust-toolchain@1.95.0
+      # rust-toolchain.toml pins the exact MSRV declared in
+      # [workspace.package].rust-version, so a stray use of a newer-stable
+      # feature fails CI rather than silently raising the floor for
+      # downstream consumers.
+      - name: Install pinned Rust toolchain (rust-toolchain.toml)
+        run: rustup show
       - uses: Swatinem/rust-cache@v2
       - name: cargo check (MSRV)
         run: cargo check --workspace --all-targets --locked
@@ -82,11 +88,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      # Pull in rustfmt + clippy components explicitly; the base stable
-      # toolchain image does not always carry them.
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      # rust-toolchain.toml lists rustfmt + clippy under [toolchain].components,
+      # so installing the pinned toolchain also installs both components.
+      - name: Install pinned Rust toolchain (rust-toolchain.toml)
+        run: rustup show
       - uses: Swatinem/rust-cache@v2
       # Formatting gate: fails if any committed source deviates from rustfmt's
       # output. Without this, formatting drift accumulates silently because no
