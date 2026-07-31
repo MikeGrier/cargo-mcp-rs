@@ -3323,22 +3323,25 @@ pub(crate) const PROGRESS_TOTAL_REASON: &str = "x-cargo-mcp-progress-total";
 /// up-front denominator for build progress so notifications show real progress
 /// (e.g. `(3/120)`) instead of a lower bound that starts at `1/1`.
 ///
-/// Runs `cargo metadata` once per working directory and caches the result for
-/// the process lifetime — the denominator is a display hint, so slight
-/// staleness if dependencies change mid-session is harmless. Any failure
-/// returns `None` and the tracker falls back to the streamed running total.
-fn resolved_package_count(wd: Option<&str>) -> Option<u32> {
-    static CACHE: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<String, Option<u32>>>,
-    > = std::sync::OnceLock::new();
+/// Runs `cargo metadata` once per (working directory, toolchain) pair and
+/// caches the result for the process lifetime — the denominator is a display
+/// hint, so slight staleness if dependencies change mid-session is harmless.
+/// Any failure returns `None` and the tracker falls back to the streamed
+/// running total.
+fn resolved_package_count(wd: Option<&str>, tc: Option<&str>) -> Option<u32> {
+    type Cache = std::sync::Mutex<std::collections::HashMap<(String, String), Option<u32>>>;
+    static CACHE: std::sync::OnceLock<Cache> = std::sync::OnceLock::new();
     let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-    let key = wd.unwrap_or_default().to_owned();
+    let key = (
+        wd.unwrap_or_default().to_owned(),
+        tc.unwrap_or_default().to_owned(),
+    );
     if let Ok(c) = cache.lock()
         && let Some(v) = c.get(&key)
     {
         return *v;
     }
-    let count = compute_resolved_package_count(wd);
+    let count = compute_resolved_package_count(wd, tc);
     if let Ok(mut c) = cache.lock() {
         c.insert(key, count);
     }
@@ -3348,9 +3351,17 @@ fn resolved_package_count(wd: Option<&str>) -> Option<u32> {
 /// Run `cargo metadata` and count the packages in the resolved dependency
 /// graph (the node count reflects what will actually be compiled more closely
 /// than the bare `packages` list). Falls back to the `packages` length when
-/// no `resolve` section is present (e.g. `--frozen` edge cases).
-fn compute_resolved_package_count(wd: Option<&str>) -> Option<u32> {
-    let out = invoke::run_cargo(&["metadata", "--format-version=1"], wd).ok()?;
+/// no `resolve` section is present (e.g. `--frozen` edge cases). Honours the
+/// caller's `toolchain` override so the denominator reflects the same
+/// toolchain the actual build/check/test/etc. invocation will use — a plain
+/// `cargo metadata` could otherwise resolve a different (e.g. default)
+/// toolchain's dependency graph for a manifest that requires a specific one.
+fn compute_resolved_package_count(wd: Option<&str>, tc: Option<&str>) -> Option<u32> {
+    let mut argv: Vec<&str> = vec!["metadata", "--format-version=1"];
+    if let Some(t) = tc {
+        argv.insert(0, t);
+    }
+    let out = invoke::run_cargo(&argv, wd).ok()?;
     if out.exit_code != 0 {
         return None;
     }
@@ -3366,9 +3377,13 @@ fn compute_resolved_package_count(wd: Option<&str>) -> Option<u32> {
 /// so the tracker can render an accurate denominator. Best-effort and only
 /// meaningful when a progress callback is active; no-op when metadata cannot
 /// be resolved.
-fn emit_progress_total(on_progress: &mut Option<&mut dyn FnMut(&str)>, wd: Option<&str>) {
+fn emit_progress_total(
+    on_progress: &mut Option<&mut dyn FnMut(&str)>,
+    wd: Option<&str>,
+    tc: Option<&str>,
+) {
     if let Some(cb) = on_progress.as_deref_mut()
-        && let Some(total) = resolved_package_count(wd)
+        && let Some(total) = resolved_package_count(wd, tc)
     {
         cb(&format!(
             "{{\"reason\":\"{PROGRESS_TOTAL_REASON}\",\"total_units\":{total}}}"
@@ -3571,7 +3586,7 @@ fn call_check(
         argv.insert(0, t);
     }
     let mut on_progress = on_progress;
-    emit_progress_total(&mut on_progress, wd);
+    emit_progress_total(&mut on_progress, wd, tc.as_deref());
     let out = run_cargo_maybe_streaming(&argv, wd, opt_timeout(args)?, None, on_progress)?;
     let is_error = out.exit_code != 0;
     let body = format_json_output(&out, &argv, wd);
@@ -3605,7 +3620,7 @@ fn call_build(
         argv.insert(0, t);
     }
     let mut on_progress = on_progress;
-    emit_progress_total(&mut on_progress, wd);
+    emit_progress_total(&mut on_progress, wd, tc.as_deref());
     let out = run_cargo_maybe_streaming(&argv, wd, opt_timeout(args)?, None, on_progress)?;
     let is_error = out.exit_code != 0;
     let body = format_json_output(&out, &argv, wd);
@@ -3694,7 +3709,7 @@ fn call_test_unfiltered(
     };
 
     let mut on_progress = on_progress;
-    emit_progress_total(&mut on_progress, wd);
+    emit_progress_total(&mut on_progress, wd, tc.as_deref());
 
     // ── Phase 1: build (`--no-run`) ──────────────────────────────────────────
     // Compile the test binaries up front so the build time is excluded from the
@@ -3775,7 +3790,7 @@ fn call_clippy(
         argv.insert(0, t);
     }
     let mut on_progress = on_progress;
-    emit_progress_total(&mut on_progress, wd);
+    emit_progress_total(&mut on_progress, wd, tc.as_deref());
     let out = run_cargo_maybe_streaming(&argv, wd, opt_timeout(args)?, None, on_progress)?;
     let is_error = out.exit_code != 0;
     let body = format_json_output(&out, &argv, wd);
@@ -3809,9 +3824,16 @@ fn looks_like_command_too_long(text: &str) -> bool {
 ///
 /// Returns the member package names (the set `cargo fmt` would format when no
 /// `--package` is given) so the caller can drive a per-crate formatting pass.
-/// Returns `None` when metadata cannot be resolved.
-fn workspace_member_names(wd: Option<&str>) -> Option<Vec<String>> {
-    let out = invoke::run_cargo(&["metadata", "--format-version=1", "--no-deps"], wd).ok()?;
+/// Returns `None` when metadata cannot be resolved. Honours the caller's
+/// `toolchain` override (e.g. a workspace whose manifest requires nightly)
+/// so the fallback enumeration uses the same toolchain as the original
+/// `cargo fmt` invocation it is recovering from.
+fn workspace_member_names(wd: Option<&str>, tc: Option<&str>) -> Option<Vec<String>> {
+    let mut argv: Vec<&str> = vec!["metadata", "--format-version=1", "--no-deps"];
+    if let Some(t) = tc {
+        argv.insert(0, t);
+    }
+    let out = invoke::run_cargo(&argv, wd).ok()?;
     if out.exit_code != 0 {
         return None;
     }
@@ -3894,11 +3916,22 @@ fn per_crate_fmt_result(
     } else {
         "cargo fmt"
     };
-    let text = if sections.is_empty() {
+    let text = if sections.is_empty() && !any_error {
         format!(
             "cargo-mcp: ran {verb} per-crate across {} workspace members (the \
              single workspace-wide pass exceeded the OS command-line length \
              limit); all members are correctly formatted.",
+            members.len()
+        )
+    } else if sections.is_empty() {
+        // A per-crate invocation failed but produced no stdout/stderr to show
+        // (e.g. killed before it could write anything). Report the failure
+        // rather than falling through to the "all formatted" message, which
+        // would contradict `is_error`.
+        format!(
+            "cargo-mcp: ran {verb} per-crate across {} workspace members (the \
+             single workspace-wide pass exceeded the OS command-line length \
+             limit); at least one member failed with no captured output.",
             members.len()
         )
     } else {
@@ -3942,7 +3975,7 @@ fn run_fmt(args: &Value, check: bool) -> Result<ToolResult, Box<dyn std::error::
         // diff signal, so only fall back when we can attribute the failure to
         // the command-line length limit.
         if (long_cmd || !check)
-            && let Some(members) = workspace_member_names(wd)
+            && let Some(members) = workspace_member_names(wd, tc.as_deref())
             && members.len() > 1
         {
             return per_crate_fmt_result(wd, tc.as_deref(), &members, check);
@@ -4030,7 +4063,7 @@ fn call_doc(
         argv.insert(0, t);
     }
     let mut on_progress = on_progress;
-    emit_progress_total(&mut on_progress, wd);
+    emit_progress_total(&mut on_progress, wd, tc.as_deref());
     let out = run_cargo_maybe_streaming(&argv, wd, None, None, on_progress)?;
     let is_error = out.exit_code != 0;
     let body = format_json_output(&out, &argv, wd);
@@ -4935,7 +4968,7 @@ mod tests {
     fn workspace_member_names_lists_repo_members() {
         // Unit tests run with the crate directory as cwd; `cargo metadata`
         // there resolves this workspace, which has exactly two members.
-        let members = workspace_member_names(None).expect("metadata should resolve");
+        let members = workspace_member_names(None, None).expect("metadata should resolve");
         assert!(
             members.iter().any(|m| m == "cargo-mcp"),
             "expected cargo-mcp in {members:?}"

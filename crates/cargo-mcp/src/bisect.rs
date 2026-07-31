@@ -216,6 +216,8 @@ struct Culprit {
 struct GroupRun {
     elapsed: Duration,
     timed_out: bool,
+    /// The test binary exited non-zero (a real test failure, not a hang).
+    failed: bool,
 }
 
 /// Per-group reporting payload passed to [`emit_group_record`].
@@ -335,7 +337,11 @@ pub fn run(
         .iter()
         .filter(|c| c.classification == "hung")
         .count();
-    let slow = culprits.len() - hung;
+    let failed = culprits
+        .iter()
+        .filter(|c| c.classification == "failed")
+        .count();
+    let slow = culprits.len() - hung - failed;
     let summary = serde_json::json!({
         "reason": SUMMARY_REASON,
         "binaries_built": binaries.len(),
@@ -345,6 +351,7 @@ pub fn run(
         "groups_run": groups_run,
         "culprits": culprits.len(),
         "hung": hung,
+        "failed": failed,
         "slow": slow,
         "wall_secs": round3(start.elapsed().as_secs_f64()),
         "enumeration_errors": enumeration_errors,
@@ -397,10 +404,12 @@ fn bisect_binary(
 
         let slow = opts
             .slow_threshold
-            .is_some_and(|t| !run.timed_out && run.elapsed > t);
-        let interesting = run.timed_out || slow;
+            .is_some_and(|t| !run.timed_out && !run.failed && run.elapsed > t);
+        let interesting = run.timed_out || run.failed || slow;
         let outcome = if run.timed_out {
             "hung"
+        } else if run.failed {
+            "failed"
         } else if slow {
             "slow"
         } else {
@@ -424,7 +433,13 @@ fn bisect_binary(
         }
         if group.len() <= opts.min_group_size || depth >= opts.max_rounds {
             // Leaf: every surviving test is a culprit.
-            let classification = if run.timed_out { "hung" } else { "slow" };
+            let classification = if run.timed_out {
+                "hung"
+            } else if run.failed {
+                "failed"
+            } else {
+                "slow"
+            };
             // Approximate per-test elapsed when several tests share a leaf.
             let per = run.elapsed / (group.len() as u32).max(1);
             for name in &group {
@@ -498,16 +513,22 @@ fn run_group(
     for chunk in chunk_names(names) {
         let run = run_one(binary, &chunk, include_ignored, group_timeout, wd)?;
         total += run.elapsed;
-        if run.timed_out {
+        // Short-circuit on a hang or a real test failure: with
+        // `--test-threads 1` either one wedges/poisons the rest of the
+        // group's meaning, so there is nothing more useful to learn from
+        // running the remaining chunks.
+        if run.timed_out || run.failed {
             return Ok(GroupRun {
                 elapsed: total,
-                timed_out: true,
+                timed_out: run.timed_out,
+                failed: run.failed,
             });
         }
     }
     Ok(GroupRun {
         elapsed: total,
         timed_out: false,
+        failed: false,
     })
 }
 
@@ -532,13 +553,18 @@ fn run_one(
     }
     let start = Instant::now();
     match invoke::run_subprocess_capture(cmd, wd, Some(timeout)) {
-        Ok(_) => Ok(GroupRun {
+        // A non-zero exit means a real test failure (not a hang) — surface it
+        // as `failed` rather than reporting the group as `clean`, which would
+        // otherwise silently mask a failing test that finished quickly.
+        Ok(out) => Ok(GroupRun {
             elapsed: start.elapsed(),
             timed_out: false,
+            failed: out.exit_code != 0,
         }),
         Err(e) if e.is::<invoke::TimeoutError>() => Ok(GroupRun {
             elapsed: start.elapsed(),
             timed_out: true,
+            failed: false,
         }),
         Err(e) => Err(e),
     }
