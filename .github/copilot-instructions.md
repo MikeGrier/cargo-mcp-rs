@@ -219,14 +219,16 @@ Build-phase compiler warnings are preserved in the combined output even though
 the execution phase reuses the cached build. If a build fails, the build output
 (compile errors) is returned and the execution phase is skipped.
 
-`cargo_test` has two independent timeout knobs that can be combined freely.
-Both apply only to the test **execution** phase: each clock arms when
-compilation and linking finish (cargo's `build-finished` record), so a slow
-build never trips either of them.
+`cargo_test` has two independent timeout knobs with different scopes.
+`timeout_secs` bounds BOTH phases (build and execution), each on its own
+independent clock (see above). `per_test_timeout_secs` applies only to the
+test **execution** phase (and only when `test_filter` is set): its clock
+arms when compilation and linking finish (cargo's `build-finished` record),
+so a slow build never trips it.
 
 **`timeout_secs` — hard OVERALL wall-clock cap.** Same meaning whether or
-not `test_filter` is set. Bounds the whole execution phase (in filter mode:
-across all per-binary launches together). When it elapses, cargo's entire
+not `test_filter` is set. Bounds each phase independently — build, then
+execution (in filter mode: across all per-binary launches together). When it elapses, cargo's entire
 process tree is terminated and a `TimeoutError` is returned with whatever
 NDJSON was already streamed. Use this knob to keep throughput going on a
 slow system.

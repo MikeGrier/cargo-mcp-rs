@@ -319,13 +319,17 @@ execution phase` — so a slow compile is distinguishable from a hung test.
 Build-phase compiler warnings are preserved in the combined output even though
 the execution phase reuses the cached build.
 
-`cargo_test` has two independent timeout knobs. Both apply only to the test
-**execution** phase: each clock arms when compilation and linking finish
-(cargo's `build-finished` record), so a slow build never trips either.
+`cargo_test` has two independent timeout knobs with different scopes:
+`timeout_secs` bounds both phases (build and execution), each on its own
+independent clock (see above); `per_test_timeout_secs` applies only to the
+test **execution** phase (and only in `test_filter` mode) — its clock arms
+when compilation and linking finish (cargo's `build-finished` record), so a
+slow build never trips it.
 
-- **`timeout_secs`** is a hard OVERALL wall-clock cap on the whole
-  execution phase. Same meaning in all modes — unfiltered and
-  `test_filter` (batched or per-test). Use it to cap the whole phase.
+- **`timeout_secs`** is a hard OVERALL wall-clock cap, applied
+  independently to each phase (build, then execution). Same meaning in
+  all modes — unfiltered and `test_filter` (batched or per-test). Use it
+  to cap the whole phase.
   Defaults:
     - Unfiltered: server default applies
       (`cargo-mcp.test.timeoutSecs`, 30 s via the VS Code extension;

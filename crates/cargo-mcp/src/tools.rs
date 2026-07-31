@@ -254,12 +254,15 @@ names the phase that fired (e.g. \"... during the build phase\" vs \"... during\
 the test execution phase\"), so you can tell a slow compile apart from a hung\n\
 test. Build-phase compiler warnings are preserved in the combined output even\n\
 though the execution phase reuses the cached build.\n\n\
-`cargo_test` has two independent timeout knobs. Both apply only to the test\n\
-**execution** phase: the clock arms when compilation and linking finish\n\
-(cargo's `build-finished` record), so a slow build never trips either.\n\n\
+`cargo_test` has two independent timeout knobs with different scopes:\n\
+`timeout_secs` bounds BOTH phases (build and execution), each on its own\n\
+independent clock (see above); `per_test_timeout_secs` applies only to the\n\
+test **execution** phase (and only in `test_filter` mode) \u{2014} its clock\n\
+arms when compilation and linking finish (cargo's `build-finished` record),\n\
+so a slow build never trips it.\n\n\
 **`timeout_secs` — hard OVERALL wall-clock cap.**\n\
 Same meaning in all modes — unfiltered and `test_filter` (batched or\n\
-per-test). Bounds the whole execution phase. Defaults:\n\
+per-test). Bounds each phase independently (build, then execution). Defaults:\n\
 - Unfiltered: server default from `cargo-mcp.test.timeoutSecs` (**30 s**\n\
   via the VS Code extension; none otherwise).\n\
 - Filter mode: **no default** — omit to let a long matched run complete;\n\
@@ -2169,16 +2172,18 @@ pub fn list() -> Value {
                         "type": "integer",
                         "minimum": 0,
                         "description":
-                            "Hard OVERALL wall-clock budget in seconds for the test \
-                             execution phase. Arms when compilation finishes (cargo's \
-                             build-finished record) so the build phase is never counted. \
-                             When the budget elapses, cargo and the entire subprocess tree \
-                             are terminated. Same meaning in all modes (unfiltered, batched \
-                             filter, per-test filter). Defaults: unfiltered — server setting \
-                             (30 s via the VS Code extension; none otherwise); filter mode — \
-                             no default, omit to let a long matched run complete, or pass an \
-                             explicit value to cap the whole phase. Pass 0 to disable for \
-                             this call regardless of the server default."
+                            "Hard OVERALL wall-clock budget in seconds, applied \
+                             independently to each phase: first the build (--no-run), \
+                             then test execution. Each phase gets its own clock, so a slow \
+                             build never eats into the execution budget (and vice versa). \
+                             When either phase's budget elapses, cargo and the entire \
+                             subprocess tree are terminated. Same meaning in all modes \
+                             (unfiltered, batched filter, per-test filter). Defaults: \
+                             unfiltered — server setting (30 s via the VS Code extension; \
+                             none otherwise); filter mode — no default, omit to let a long \
+                             matched run complete, or pass an explicit value to cap each \
+                             phase. Pass 0 to disable for this call regardless of the \
+                             server default."
                     },
                     "per_test_timeout_secs": {
                         "type": "integer",

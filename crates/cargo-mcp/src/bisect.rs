@@ -511,7 +511,20 @@ fn run_group(
 ) -> Result<GroupRun, Box<dyn std::error::Error>> {
     let mut total = Duration::ZERO;
     for chunk in chunk_names(names) {
-        let run = run_one(binary, &chunk, include_ignored, group_timeout, wd)?;
+        // Enforce a single group-level deadline across all argv-length
+        // chunks: each chunk gets only the time remaining in the group's
+        // budget, not a fresh `group_timeout`, otherwise a group split into
+        // N chunks could run for up to N * group_timeout before a hang in a
+        // later chunk is detected.
+        let remaining = group_timeout.saturating_sub(total);
+        if remaining.is_zero() {
+            return Ok(GroupRun {
+                elapsed: total,
+                timed_out: true,
+                failed: false,
+            });
+        }
+        let run = run_one(binary, &chunk, include_ignored, remaining, wd)?;
         total += run.elapsed;
         // Short-circuit on a hang or a real test failure: with
         // `--test-threads 1` either one wedges/poisons the rest of the
