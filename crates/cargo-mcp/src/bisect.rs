@@ -93,7 +93,9 @@ fn opt_pos_secs(o: &Value, key: &str) -> Result<Option<Duration>, Box<dyn std::e
             if !(secs.is_finite() && secs > 0.0) {
                 return Err(format!("bisect.{key} must be a positive number of seconds").into());
             }
-            Ok(Some(Duration::from_secs_f64(secs)))
+            let duration = Duration::try_from_secs_f64(secs)
+                .map_err(|_| format!("bisect.{key} exceeds the maximum supported duration"))?;
+            Ok(Some(duration))
         }
     }
 }
@@ -113,7 +115,9 @@ fn opt_usize_min(
             if n < min {
                 return Err(format!("bisect.{key} must be at least {min}").into());
             }
-            Ok(Some(n as usize))
+            let n = usize::try_from(n)
+                .map_err(|_| format!("bisect.{key} exceeds the maximum supported integer"))?;
+            Ok(Some(n))
         }
     }
 }
@@ -833,6 +837,37 @@ mod tests {
     fn group_timeout_required() {
         let args = serde_json::json!({ "bisect": { "split_factor": 2 } });
         assert!(BisectOpts::from_args(&args).is_err());
+    }
+
+    #[test]
+    fn duration_larger_than_supported_returns_error() {
+        let args = serde_json::json!({
+            "bisect": { "group_timeout_secs": f64::MAX }
+        });
+        let err = match BisectOpts::from_args(&args) {
+            Err(err) => err,
+            Ok(_) => panic!("oversized duration should be rejected"),
+        };
+        assert!(
+            err.to_string()
+                .contains("exceeds the maximum supported duration")
+        );
+    }
+
+    #[test]
+    fn integer_options_reject_values_larger_than_usize() {
+        let args = serde_json::json!({ "split_factor": u64::MAX });
+        let parsed = opt_usize_min(&args, "split_factor", 2);
+
+        match usize::try_from(u64::MAX) {
+            Ok(expected) => assert_eq!(parsed.unwrap(), Some(expected)),
+            Err(_) => assert!(
+                parsed
+                    .unwrap_err()
+                    .to_string()
+                    .contains("exceeds the maximum supported integer")
+            ),
+        }
     }
 
     #[test]

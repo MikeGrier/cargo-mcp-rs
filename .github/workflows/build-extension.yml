@@ -57,13 +57,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
-      # Installs whatever toolchain rust-toolchain.toml pins (`rustup show`
-      # forces the auto-install), then adds the cross-compile target to that
+      # Invoking a rustup-managed tool installs whatever toolchain
+      # rust-toolchain.toml pins, then the next step adds the target to that
       # same toolchain. Adding the target to a differently-named toolchain
       # (e.g. "stable") would silently miss the one actually selected by the
       # rust-toolchain.toml override, breaking core/std lookup for that target.
       - name: Install pinned Rust toolchain (rust-toolchain.toml)
-        run: rustup show
+        run: cargo --version
 
       - name: Add Rust target ${{ matrix.rust_target }}
         run: rustup target add ${{ matrix.rust_target }}
