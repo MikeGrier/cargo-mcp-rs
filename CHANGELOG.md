@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.10.0](https://github.com/MikeGrier/cargo-mcp-rs/compare/v0.9.0...v0.10.0) (2026-08-01)
+
+
+### Features
+
+* add test bisection engine and incremental-notes toggle ([9413c55](https://github.com/MikeGrier/cargo-mcp-rs/commit/9413c55e2fa235df7985679b443170e625f80f56))
+* add test bisection engine and incremental-notes toggle ([c99e76f](https://github.com/MikeGrier/cargo-mcp-rs/commit/c99e76fb7d054d8b217beb6196add91e1a56e362))
+
+
+### Bug Fixes
+
+* address additional Copilot suppressed review comments on PR [#60](https://github.com/MikeGrier/cargo-mcp-rs/issues/60) ([b5bc7c9](https://github.com/MikeGrier/cargo-mcp-rs/commit/b5bc7c9a8b8795f7ce6922836005e735ecec2c2c))
+* address PR [#60](https://github.com/MikeGrier/cargo-mcp-rs/issues/60) Copilot review feedback ([e2f14cf](https://github.com/MikeGrier/cargo-mcp-rs/commit/e2f14cff7a9109db85d52da9f98662b6102738d1))
+* address remaining Copilot review findings on PR [#60](https://github.com/MikeGrier/cargo-mcp-rs/issues/60) ([30e608f](https://github.com/MikeGrier/cargo-mcp-rs/commit/30e608f2009546b027b57c132353e50278878b6a))
+* **ci:** drop dtolnay/rust-toolchain, use rustup + rust-toolchain.toml ([8a0845b](https://github.com/MikeGrier/cargo-mcp-rs/commit/8a0845b472dcc1a5d47dc4426431444401841c16))
+
 ## [0.9.0](https://github.com/MikeGrier/cargo-mcp-rs/compare/v0.8.0...v0.9.0) (2026-06-23)
 
 
