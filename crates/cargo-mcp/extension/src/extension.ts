@@ -108,6 +108,14 @@ function buildArgs(): string[] {
         args.push("--per-test-execution=true");
     }
 
+    // Show cargo's harmless "error finalizing incremental compilation session
+    // directory" notes. Suppressed by default; only emit the flag when the
+    // user has opted in to seeing them.
+    const showIncrementalNotes = config.get<boolean>("showIncrementalCompilationNotes", false) ?? false;
+    if (showIncrementalNotes) {
+        args.push("--show-incremental-notes=true");
+    }
+
     const extraArgs = config.get<string[]>("extraArgs", []) ?? [];
     for (const a of extraArgs) {
         if (typeof a === "string" && a.length > 0) {

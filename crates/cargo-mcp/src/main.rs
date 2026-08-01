@@ -14,6 +14,7 @@
 // to expand it once every subcommand advertises its full option set.
 #![recursion_limit = "512"]
 
+mod bisect;
 mod busy_files;
 mod elicit;
 mod invoke;
@@ -71,6 +72,11 @@ struct StartupConfig {
     /// Whether to proactively delete stale `*-working` incremental-session
     /// directories under `target/` before each cargo invocation.
     clear_incr_working: bool,
+    /// Whether to show cargo's harmless "error finalizing incremental
+    /// compilation session directory" notes. Off by default (they are
+    /// suppressed) because the underlying failure is idempotent Windows
+    /// file-locking noise.
+    show_incremental_notes: bool,
     warnings: Vec<String>,
 }
 
@@ -93,6 +99,7 @@ fn parse_config() -> StartupConfig {
         test_timeout_secs: None,
         per_test_execution: false,
         clear_incr_working: false,
+        show_incremental_notes: false,
         warnings: Vec::new(),
     };
     for arg in std::env::args_os().skip(1) {
@@ -188,6 +195,16 @@ fn parse_config() -> StartupConfig {
                     ));
                 }
             }
+        } else if let Some(rest) = s.strip_prefix("--show-incremental-notes=") {
+            match parse_bool_flag(rest) {
+                Some(b) => cfg.show_incremental_notes = b,
+                None => {
+                    cfg.warnings.push(format!(
+                        "ignoring invalid --show-incremental-notes value: {rest:?} \
+                         (expected one of: true/false, 1/0, yes/no, on/off)"
+                    ));
+                }
+            }
         }
     }
     cfg
@@ -252,6 +269,7 @@ fn main() {
     invoke::set_clear_incr_working(cfg.clear_incr_working);
     tools::set_default_test_timeout(cfg.test_timeout_secs);
     tools::set_per_test_execution(cfg.per_test_execution);
+    tools::set_show_incremental_notes(cfg.show_incremental_notes);
 
     let stdin = io::stdin();
     let stdout = io::stdout();
@@ -320,6 +338,15 @@ fn main() {
             &mut out,
             "incremental -working cleanup: ENABLED (stale *-working dirs removed before \
              each cargo invocation)"
+                .to_string(),
+        );
+    }
+    if cfg.show_incremental_notes {
+        log_info(
+            &mut out,
+            "incremental compilation session notes: SHOWN (rustc's \"error finalizing \
+             incremental compilation session directory\" notes are harmless and the \
+             build is idempotent; suppressed by default)"
                 .to_string(),
         );
     }
@@ -713,9 +740,14 @@ fn handle_tool_call(
 
 /// Tracks per-invocation build progress so notifications can include counters.
 ///
-/// - `compile_count` — crates actually being compiled (non-fresh artifacts).
-/// - `total_count`   — all artifacts seen so far (fresh + non-fresh); a
-///   running lower bound on the total number of crates in the build graph.
+/// - `total_count`   — all artifacts seen so far (fresh + non-fresh); the
+///   numerator of the progress counter, i.e. how many crates of the build
+///   graph have been processed.
+/// - `known_total`   — the up-front crate-graph size resolved via
+///   `cargo metadata` (delivered as an `x-cargo-mcp-progress-total` control
+///   record before the build starts). When present it is used as the
+///   progress denominator so notifications show real progress (`(3/120)`)
+///   from the first crate instead of a lower bound that begins at `1/1`.
 /// - `verb` / `target` — included in the terminal `build-finished` /
 ///   `build-failed` message so the chat-history summary line is unambiguous
 ///   (e.g. `Cargo check (x86_64-pc-windows-msvc) finished` instead of just
@@ -725,8 +757,8 @@ fn handle_tool_call(
 ///   profile), so the progress line shows at a glance whether this is a
 ///   debug or optimized build.
 struct BuildTracker {
-    compile_count: u32,
     total_count: u32,
+    known_total: Option<u32>,
     verb: String,
     target: Option<String>,
     profile_tag: String,
@@ -735,8 +767,8 @@ struct BuildTracker {
 impl BuildTracker {
     fn new(verb: String, target: Option<String>, profile_tag: String) -> Self {
         Self {
-            compile_count: 0,
             total_count: 0,
+            known_total: None,
             verb,
             target,
             profile_tag,
@@ -769,6 +801,14 @@ impl BuildTracker {
             }
         };
         match v.get("reason").and_then(|r| r.as_str()) {
+            Some(reason) if reason == tools::PROGRESS_TOTAL_REASON => {
+                // Up-front crate-graph size from `cargo metadata`. Record it as
+                // the progress denominator; emits no user-visible notification.
+                if let Some(n) = v.get("total_units").and_then(|n| n.as_u64()) {
+                    self.known_total = u32::try_from(n).ok();
+                }
+                String::new()
+            }
             Some("compiler-artifact") => {
                 let fresh = v.get("fresh").and_then(|f| f.as_bool()).unwrap_or(true);
                 self.total_count += 1;
@@ -776,13 +816,21 @@ impl BuildTracker {
                     // Cached — counts toward the total but no notification.
                     return String::new();
                 }
-                self.compile_count += 1;
 
                 let pkg_id = v.get("package_id").and_then(|p| p.as_str()).unwrap_or("");
                 let registry_name = registry_label(pkg_id);
                 let (name, version) = parse_package_id(pkg_id, &v);
 
-                let counter = format!("({}/{})", self.compile_count, self.total_count);
+                // Denominator: prefer the up-front crate-graph size from
+                // `cargo metadata`, clamped to never fall below what we've
+                // already streamed (defensive — the resolved graph should be a
+                // superset of the compiled units). Falls back to the running
+                // lower bound when metadata was unavailable.
+                let denom = match self.known_total {
+                    Some(total) => total.max(self.total_count),
+                    None => self.total_count,
+                };
+                let counter = format!("({}/{})", self.total_count, denom);
                 let verb = &self.verb;
                 let profile = &self.profile_tag;
                 if let Some(reg) = registry_name {
@@ -1044,6 +1092,38 @@ mod tests {
         let line = r#"{"reason":"compiler-artifact","fresh":false,"package_id":"registry+https://github.com/rust-lang/crates.io-index#serde@1.0.228","target":{"name":"serde"}}"#;
         let msg = t.process_line(line);
         assert_eq!(msg, "Cargo check: serde v1.0.228 (1/1) [D] [crates.io]");
+    }
+
+    #[test]
+    fn process_line_uses_known_total_as_denominator() {
+        let mut t = BuildTracker::new("build".to_owned(), None, "[D]".to_owned());
+        // The control record sets the denominator and emits nothing visible.
+        let ctrl = format!(
+            r#"{{"reason":"{}","total_units":120}}"#,
+            tools::PROGRESS_TOTAL_REASON
+        );
+        assert_eq!(t.process_line(&ctrl), "");
+        let line = r#"{"reason":"compiler-artifact","fresh":false,"package_id":"registry+https://github.com/rust-lang/crates.io-index#serde@1.0.228","target":{"name":"serde"}}"#;
+        let msg = t.process_line(line);
+        // First processed crate against the up-front total of 120.
+        assert_eq!(msg, "Cargo build: serde v1.0.228 (1/120) [D] [crates.io]");
+    }
+
+    #[test]
+    fn process_line_known_total_clamps_to_streamed_count() {
+        let mut t = BuildTracker::new("build".to_owned(), None, "[D]".to_owned());
+        let ctrl = format!(
+            r#"{{"reason":"{}","total_units":1}}"#,
+            tools::PROGRESS_TOTAL_REASON
+        );
+        let _ = t.process_line(&ctrl);
+        // Two non-fresh artifacts; the denominator must never drop below the
+        // streamed count even if metadata under-reported.
+        let a = r#"{"reason":"compiler-artifact","fresh":false,"package_id":"path+file:///x#a@0.1.0","target":{"name":"a"}}"#;
+        let b = r#"{"reason":"compiler-artifact","fresh":false,"package_id":"path+file:///x#b@0.1.0","target":{"name":"b"}}"#;
+        let _ = t.process_line(a);
+        let msg = t.process_line(b);
+        assert!(msg.ends_with("(2/2) [D]"), "got: {msg}");
     }
 
     #[test]

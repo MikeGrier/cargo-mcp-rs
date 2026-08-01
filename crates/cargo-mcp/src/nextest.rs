@@ -20,10 +20,10 @@ use serde_json::Value;
 
 use crate::invoke::{self, CargoOutput};
 use crate::tools::{
-    self, CommonOpts, STDERR_REASON, SummaryKind, ToolResult, invocation_header,
-    is_build_finished_line, opt_bool, opt_int_str, opt_str, opt_timeout_explicit,
-    push_feature_flags, push_manifest_options, push_package_selection, toolchain_arg,
-    validate_relative_output_path, write_output_path_and_summarize,
+    self, CommonOpts, STDERR_REASON, SummaryKind, ToolResult, combine_build_and_exec_output,
+    invocation_header, is_build_finished_line, opt_bool, opt_int_str, opt_str,
+    opt_timeout_explicit, push_feature_flags, push_manifest_options, push_package_selection,
+    run_phase, toolchain_arg, validate_relative_output_path, write_output_path_and_summarize,
 };
 
 /// Discriminator for the NDJSON record that wraps one line of nextest's
@@ -182,7 +182,7 @@ fn format_nextest_run_output(out: &CargoOutput, argv: &[&str], wd: Option<&str>)
     } else {
         format!(r#"{{"status":"error","exit_code":{}}}"#, out.exit_code)
     };
-    let stderr_trimmed = out.stderr.trim();
+    let stderr_trimmed = tools::stderr_for_display(&out.stderr);
     let mut parts: Vec<String> = Vec::with_capacity(3);
     if !filtered.is_empty() {
         parts.push(filtered.to_owned());
@@ -412,6 +412,16 @@ pub(crate) fn call_run(
     args: &Value,
     on_progress: Option<&mut dyn FnMut(&str)>,
 ) -> Result<ToolResult, Box<dyn std::error::Error>> {
+    // Bisection mode takes precedence and uses the shared engine (which runs
+    // the compiled libtest binaries directly), so `bisect` behaves identically
+    // whether requested via cargo_test or cargo_nextest_run.
+    if crate::bisect::is_bisect_requested(args) {
+        return crate::bisect::run(args, on_progress)?.ok_or_else(
+            || -> Box<dyn std::error::Error> {
+                "bisect requested but the bisection engine returned no result".into()
+            },
+        );
+    }
     let wd = opt_str(args, "working_dir");
     let output_path = opt_str(args, "output_path");
     if let Some(p) = output_path {
@@ -425,20 +435,23 @@ pub(crate) fn call_run(
     // nextest's `run` subcommand. We always ask cargo to emit JSON build
     // messages so the existing compiler-message / build-finished pipeline
     // works unchanged for the build phase.
-    let mut argv: Vec<&str> = vec!["nextest", "run", "--cargo-message-format=json"];
+    //
+    // `base` holds the selectors shared by the build (`--no-run`) and the
+    // execution phase; the per-phase argv is derived from it below.
+    let mut base: Vec<&str> = vec!["nextest", "run", "--cargo-message-format=json"];
 
     // Nextest profile (selects per-test config from .config/nextest.toml).
     if let Some(p) = &nx.nextest_profile {
-        argv.push("--profile");
-        argv.push(p);
+        base.push("--profile");
+        base.push(p);
     }
 
     // Standard cargo selectors.
-    push_package_selection(&mut argv, args, &o);
-    push_nextest_target_selection(&mut argv, args, &o);
-    push_feature_flags(&mut argv, args, &o);
+    push_package_selection(&mut base, args, &o);
+    push_nextest_target_selection(&mut base, args, &o);
+    push_feature_flags(&mut base, args, &o);
     push_nextest_compilation_options(
-        &mut argv,
+        &mut base,
         args,
         nx.cargo_profile.as_ref(),
         nx.build_jobs.as_ref(),
@@ -446,14 +459,51 @@ pub(crate) fn call_run(
         o.target_dir.as_ref(),
     );
     // `ignore_rust_version` is supported by nextest (it forwards to cargo).
-    push_manifest_options(&mut argv, args, &o, true);
+    push_manifest_options(&mut base, args, &o, true);
+    if let Some(ref t) = tc {
+        base.insert(0, t);
+    }
 
+    // Same three-state timeout selection as cargo_test: caller wins; missing
+    // falls back to the server-wide default. The budget is applied
+    // INDEPENDENTLY to each phase below, so a slow build never consumes the
+    // test-execution budget. Per-test enforcement is left to nextest's profile
+    // (slow-timeout / terminate-after).
+    let timeout = match opt_timeout_explicit(args)? {
+        None => tools::default_test_timeout(),
+        Some(explicit) => explicit,
+    };
+
+    let mut on_progress = on_progress;
+
+    // ── Phase 1: build (`--no-run`) ──────────────────────────────────────────
+    // Compile the test binaries up front so the build time is excluded from the
+    // test-execution budget. The timeout arms immediately so it bounds the
+    // whole build; a timeout here is labelled "build".
+    let mut build_argv = base.clone();
+    build_argv.push("--no-run");
+    let build_out = run_phase(&build_argv, wd, timeout, None, &mut on_progress, "build")?;
+
+    // If the build failed, or the caller only wanted a build (`no_run`), return
+    // the build output directly without an execution phase.
+    let build_failed = build_out.exit_code != 0;
+    if build_failed || opt_bool(args, "no_run") {
+        let body = format_nextest_run_output(&build_out, &build_argv, wd);
+        let text = write_output_path_and_summarize(body, output_path, wd, SummaryKind::Test)?;
+        return Ok(ToolResult::Text {
+            text,
+            is_error: build_failed,
+        });
+    }
+
+    // ── Phase 2: test execution ──────────────────────────────────────────────
+    // Re-run with the full set of run flags; the build is now a cache hit, so
+    // the timeout (armed on build-finished) bounds test execution only. A
+    // timeout here is labelled "test execution".
+    let mut argv = base.clone();
     // Nextest-specific run flags.
     if opt_bool(args, "no_fail_fast") {
         argv.push("--no-fail-fast");
-    }
-    if opt_bool(args, "no_run") {
-        argv.push("--no-run");
     }
     if opt_bool(args, "no_capture") {
         argv.push("--no-capture");
@@ -480,31 +530,21 @@ pub(crate) fn call_run(
     if let Some(f) = &nx.filter {
         argv.push(f);
     }
-    if let Some(ref t) = tc {
-        argv.insert(0, t);
-    }
 
-    // Same three-state timeout selection as cargo_test: caller wins; missing
-    // falls back to the server-wide default. Per-test enforcement is left to
-    // nextest's profile (slow-timeout / terminate-after).
-    let timeout = match opt_timeout_explicit(args)? {
-        None => tools::default_test_timeout(),
-        Some(explicit) => explicit,
-    };
+    let exec_out = run_phase(
+        &argv,
+        wd,
+        timeout,
+        Some(&is_build_finished_line),
+        &mut on_progress,
+        "test execution",
+    )?;
 
-    let out = match on_progress {
-        Some(cb) => invoke::run_cargo_streaming_with_timeout(
-            &argv,
-            wd,
-            timeout,
-            Some(&is_build_finished_line),
-            cb,
-        ),
-        None => invoke::run_cargo_with_timeout(&argv, wd, timeout, Some(&is_build_finished_line)),
-    }?;
-
-    let is_error = out.exit_code != 0;
-    let body = format_nextest_run_output(&out, &argv, wd);
+    // Merge the build phase's compiler-message records (warnings emitted during
+    // the now-cached build) into the execution output before formatting.
+    let combined = combine_build_and_exec_output(&build_out, &exec_out);
+    let is_error = exec_out.exit_code != 0;
+    let body = format_nextest_run_output(&combined, &argv, wd);
     let text = write_output_path_and_summarize(body, output_path, wd, SummaryKind::Test)?;
     Ok(ToolResult::Text { text, is_error })
 }

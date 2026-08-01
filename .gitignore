@@ -26,3 +26,6 @@ crates/cargo-mcp/extension/out/
 crates/cargo-mcp/extension/bin/*.exe
 crates/cargo-mcp/extension/bin/VERSION
 crates/cargo-mcp/extension/*.vsix
+
+.vs
+.vscode

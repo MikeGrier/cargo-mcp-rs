@@ -78,7 +78,11 @@ jobs:
           # with the non-bot identity, ensuring CI triggers on the new commit.
           token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Installs whatever toolchain rust-toolchain.toml pins; `rustup show`
+      # forces the auto-install rather than deferring it to the first `cargo`
+      # invocation.
+      - name: Install pinned Rust toolchain (rust-toolchain.toml)
+        run: rustup show
 
       - uses: Swatinem/rust-cache@v2
 

@@ -219,7 +219,11 @@ fn maybe_demote_incr_finalize(line: &str) -> Option<String> {
     if level != "warning" && level != "error" {
         return None;
     }
-    let original_prefix = if level == "error" { "error: " } else { "warning: " };
+    let original_prefix = if level == "error" {
+        "error: "
+    } else {
+        "warning: "
+    };
     let msg_text = v
         .pointer("/message/message")
         .and_then(|m| m.as_str())
@@ -593,6 +597,59 @@ impl std::fmt::Display for TimeoutError {
 }
 
 impl std::error::Error for TimeoutError {}
+
+/// Error returned when a cargo operation exceeds its `timeout_secs` budget,
+/// annotated with the *phase* that was running when the deadline fired.
+///
+/// `cargo_test` and `cargo_nextest_run` split each run into a **build** phase
+/// (`--no-run`) and a **test execution** phase, applying `timeout_secs`
+/// independently to each (so build time never counts against the execution
+/// budget). When either phase's clock fires, the tool layer maps the inner
+/// [`TimeoutError`] into this type via [`label_timeout_phase`] so the surfaced
+/// message names the phase unambiguously.
+#[derive(Debug)]
+pub struct PhaseTimeoutError {
+    /// Wall-clock duration measured for the phase that timed out.
+    pub elapsed: Duration,
+    /// Human-readable phase name, e.g. `"build"` or `"test execution"`.
+    pub phase: &'static str,
+}
+
+impl std::fmt::Display for PhaseTimeoutError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Operation timed out after {:.3} seconds during the {} phase; \
+             cargo subprocess and all of its descendants were terminated. \
+             The {} phase exceeded its timeout_secs budget (each phase is \
+             timed independently, so build time is excluded from the test \
+             execution budget).",
+            self.elapsed.as_secs_f64(),
+            self.phase,
+            self.phase,
+        )
+    }
+}
+
+impl std::error::Error for PhaseTimeoutError {}
+
+/// If `e` is a [`TimeoutError`], re-wrap it as a [`PhaseTimeoutError`] tagged
+/// with `phase`; otherwise return `e` unchanged.
+///
+/// Used by the tool layer at each phase boundary so a timeout surfaces a
+/// message that names which phase (build vs test execution) was running.
+pub fn label_timeout_phase(
+    e: Box<dyn std::error::Error>,
+    phase: &'static str,
+) -> Box<dyn std::error::Error> {
+    if let Some(t) = e.downcast_ref::<TimeoutError>() {
+        return Box::new(PhaseTimeoutError {
+            elapsed: t.elapsed,
+            phase,
+        });
+    }
+    e
+}
 
 thread_local! {
     /// The cancel token for the cargo operation currently running on this thread.

@@ -144,6 +144,11 @@
                     "type": "boolean",
                     "default": false,
                     "markdownDescription": "**Memory-unsafe feature — disabled by default.** Enable the Windows **Restart Manager** \"who has this file open?\" diagnostic. When a `cargo` step fails with a transient file-locking error (e.g. an antivirus or indexer briefly holds a file in `target\\`), the server can identify and report the offending process. This is the only feature in the production binary that exercises `unsafe` Win32 FFI; it is encapsulated in [`src/rm/`](https://github.com/MikeGrier/cargo-mcp-rs/tree/main/crates/cargo-mcp/src/rm) and uses Microsoft's typed [`windows-sys`](https://crates.io/crates/windows-sys) bindings, but if you'd rather no `unsafe` code run at all, leave this off. No effect on non-Windows hosts."
+                },
+                "cargo-mcp.showIncrementalCompilationNotes": {
+                    "type": "boolean",
+                    "default": false,
+                    "markdownDescription": "Show rustc's \"error finalizing incremental compilation session directory\" notes in tool output. **These notes are harmless** — they mean rustc could not reuse one incremental-compilation cache entry (typically because another process, such as an antivirus or indexer on Windows, briefly held a handle to the `target\\…\\incremental\\…-working` directory); the build itself succeeds and is idempotent, so re-running is always safe. Suppressed by default to reduce noise; enable this only if you want to see them for diagnostic purposes."
                 }
             }
         }

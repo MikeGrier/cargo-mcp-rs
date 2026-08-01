@@ -482,4 +482,287 @@ silently mis-route values if we reused `cargo_test`'s schema verbatim:
   `filter_expr` and also accept a positional `filter` substring for
   parity with `cargo_test`'s `test_name`.
 
+## Strict argument validation (unknown-key rejection)
+
+### Context
+
+A real session showed Copilot calling `cargo_nextest_run` with `test_filter`
+and `per_test_timeout_secs` — parameters that belong to `cargo_test`, not the
+nextest tool. Cargo's argument plumbing ignored the unknown keys, so each
+"filtered" call silently ran the **entire** suite. On a ~10k-test workspace
+that turned a spot-check into a multi-minute runaway that then tripped the
+wall-clock cap with a confusing `TimeoutError`.
+
+### Decision
+
+`tools::call` validates arguments against the advertised schema **before**
+dispatch, via `validate_known_args`:
+
+- The allow-list is **derived from `list()`** (the same JSON the server
+  advertises), cached in a `OnceLock<HashMap<tool, HashSet<key>>>`. Because the
+  schemas are closed (no top-level `additionalProperties`), any key a
+  conforming MCP client sends is already declared — only hallucinated /
+  cross-tool keys are rejected, so strict validation is safe for real clients.
+- An unknown key produces an actionable error listing the valid parameters,
+  plus a curated **cross-tool hint** (`cross_tool_hint`) for the common
+  confusions (`test_filter`/`per_test_timeout_secs`/`test_name`/`doc` →
+  "that's a `cargo_test` parameter; nextest uses `filter`/`filter_expr`", and
+  the reverse), and a Levenshtein "did you mean `<closest>`?" suggestion for
+  typos.
+- Validation is centralised in the dispatcher rather than per-tool so it stays
+  in lock-step with the schema automatically and cannot drift. Unit tests
+  call the `call_*` functions directly, which is below the validation layer,
+  so they are unaffected.
+
+The failure mode this fixes is specifically "wrong knob silently runs
+everything": a mismatched selection parameter now fails fast with a pointer to
+the right one instead of quietly executing the full suite.
+
+## `working_dir` manifest discoverability check
+
+### Context
+
+The cargo-mcp server's own process working directory is almost never the
+user's workspace (on Windows it is typically the home folder or a system
+directory). Tools default `working_dir` to that process cwd when the caller
+omits it, so an omitted `working_dir` makes cargo run against the wrong — or
+no — manifest. The same session above traced a class of failures to this.
+
+### Decision
+
+`ensure_manifest_discoverable` runs in `tools::call` right after argument
+validation. For every manifest-requiring tool (all `cargo_*` except
+`cargo_setup` and `cargo_diagnostic`, which intentionally tolerate a
+manifest-less directory) it walks upward from the effective `working_dir`
+(or the process cwd when omitted) looking for a `Cargo.toml`. If none is
+found it returns an actionable error that names `working_dir` and explains
+the default-to-server-cwd trap, instead of letting cargo fail opaquely or
+operate on an unexpected manifest. When `manifest_path` is supplied the check
+is skipped (the caller pinned the manifest explicitly).
+
+## Metadata-derived build-progress denominator
+
+### Context
+
+The progress counter (`(3/15)`) previously used a **running lower bound** as
+its denominator: `total_count` was the number of artifacts seen *so far*, so
+early in a build it under-reports (`(1/1)`, `(2/5)`, …) and the denominator
+visibly wobbles upward as more crates stream in. For a large dependency graph
+this gives no sense of how far along the build actually is.
+
+### Decision
+
+Before each streamed build (`cargo_check`, `cargo_build`, `cargo_test`,
+`cargo_clippy`, `cargo_doc`), `emit_progress_total` runs `cargo metadata
+--format-version=1` and counts the resolved dependency-graph nodes
+(`/resolve/nodes`, falling back to `packages`). The count is cached per
+working directory (`OnceLock<Mutex<HashMap>>`) so repeated builds in a session
+pay the metadata cost once. It is delivered to the streaming layer as an
+in-band control record:
+
+```
+{"reason":"x-cargo-mcp-progress-total","total_units":120}
+```
+
+`BuildTracker::process_line` recognises that `reason` (a normal parsed-JSON
+record, so it never collides with the `cargo-mcp:`-prefixed verbatim path),
+stores it as `known_total`, and emits nothing visible for it. The per-crate
+counter then renders `total_count / known_total` — real progress toward the
+known graph size from the first crate. The denominator is clamped with
+`known_total.max(total_count)` so it can never drop below what has already
+streamed (defensive: the resolved graph should always be a superset of the
+compiled units). When metadata is unavailable the tracker falls back to the
+old running-lower-bound behaviour, so the single-artifact `(1/1)` case is
+preserved.
+
+## Per-crate `cargo fmt` fallback for long command lines
+
+### Context
+
+`cargo fmt` (the cargo-fmt wrapper) gathers every target across the whole
+workspace and invokes rustfmt with all of their root paths on a **single**
+command line. In a large workspace that command line can exceed the OS limit
+before any file is formatted — Windows surfaces this as "The filename or
+extension is too long. (os error 206)"; Unix as `E2BIG` "Argument list too
+long". The single pass then fails outright.
+
+### Decision
+
+`call_fmt` and `call_fmt_check` share a `run_fmt(check)` implementation that
+keeps the fast path and only splits when warranted:
+
+1. Run the normal single invocation first (also the only path when the caller
+   pinned a `package` — there is nothing to split).
+2. On failure with no `package`, decide whether to fall back to a per-crate
+   pass enumerated via `cargo metadata` (`workspace_member_names`):
+   - **Apply mode** (`cargo fmt`): any non-zero exit is a real error, so fall
+     back and let each `cargo fmt --package <member>` isolate the offending
+     crate.
+   - **Check mode** (`cargo fmt --check`): a non-zero exit is the *normal*
+     "needs formatting" diff signal, so fall back **only** when the failure is
+     definitively the command-line-length case, detected by
+     `looks_like_command_too_long` (matching the os-error-206 / E2BIG
+     markers). Otherwise the single pass's diff is returned verbatim.
+3. The per-crate pass runs `cargo fmt [--check] --package <member>` for each
+   workspace member and aggregates the output. When the original failure was
+   the length-limit case its error text is suppressed (it was a spurious
+   spawn failure, not a formatting problem); the aggregated per-crate result
+   becomes authoritative.
+
+This honours the guidance "suppress the error text only if you can
+definitively detect the line-too-long case; otherwise fall back to per-crate
+formatting anyway" while avoiding any extra process launches for the common
+small-workspace case.
+
+## Build/test phase split and phase-attributed timeouts
+
+### Context
+
+A single `cargo test` invocation interleaves compilation and test execution.
+Arming the timeout watchdog on cargo's `build-finished` record already excludes
+build time from the execution clock for the streaming path, but the resulting
+`TimeoutError` could not say *which* activity overran — a slow compile and a
+hung test produced the same opaque message. Callers also asked for build time
+to be unambiguously excluded from the execution budget.
+
+### Decision
+
+`call_test_unfiltered` (cargo) and `call_run` (nextest) each run two cargo
+invocations instead of one:
+
+1. **Build phase** — `cargo test --no-run` / `cargo nextest run --no-run`,
+   bounded by `timeout_secs` with the watchdog armed immediately (no deferred
+   arm), so the clock covers the whole compile. A timeout here is labelled
+   `build`. A non-zero build exit (or `no_run: true`) returns the build output
+   directly and skips execution.
+2. **Test execution phase** — the same command without `--no-run` (build now
+   cached), bounded by `timeout_secs` with the watchdog armed on
+   `build-finished` (which fires near-immediately because nothing recompiles).
+   A timeout here is labelled `test execution`.
+
+`timeout_secs` is therefore applied **independently** to each phase on its own
+clock — build time never counts against the execution budget. The shared
+`run_phase` helper threads `on_progress` through both calls (taking
+`&mut Option<&mut dyn FnMut(&str)>` and reborrowing via `&mut **cb`, because
+`&mut dyn FnMut` is invariant and cannot be moved into two sequential calls)
+and maps any `TimeoutError` to `invoke::PhaseTimeoutError { elapsed, phase }`
+via `invoke::label_timeout_phase`. `PhaseTimeoutError`'s `Display` names the
+phase; `main.rs` already renders `error: {e}`, so the phase-attributed message
+flows through with no special casing.
+
+Splitting into two invocations means the cached execution phase emits no
+`compiler-message` warnings (nothing recompiles). `combine_build_and_exec_output`
+preserves them: it prepends the build phase's `compiler-message` lines to the
+execution phase's stdout before the existing `format_test_output` /
+`format_nextest_run_output` formats the combined stream. The execution phase's
+exit code is authoritative. The pre-existing `test_filter` path already builds
+(`--no-run` enumerate) before executing, so it was left unchanged.
+
+## Hang / slow-test bisection (`bisect`)
+
+### Context
+
+When a suite hangs or a single test runs pathologically long, the timeout
+machinery kills the run but does not pinpoint the offender (in batched filter
+mode the hung test is only inferable from the last output line). Locating it by
+hand means repeatedly editing `--exact` lists. The user asked for an automated
+bisection mode driven from the existing test tools.
+
+### Decision
+
+A new `bisect.rs` module implements a self-contained bisection engine, exposed
+as an optional `bisect` object on **both** `cargo_test` and `cargo_nextest_run`
+(a mode flag, not new tools). When `bisect::is_bisect_requested` is true the
+dispatcher hands the whole call to `bisect::run` before the normal/`test_filter`
+paths; both tools route to the same engine, which runs the **compiled libtest
+binaries directly** (bypassing the cargo and nextest runtime), so the two tools
+behave identically under bisection.
+
+Pipeline:
+
+1. **Build once** — `cargo test --no-run` (unbounded; build time is not the
+   subject of bisection). A non-zero build exit returns the build output as an
+   error.
+2. **Enumerate** — reuse `test_filter`'s `parse_no_run_artifacts` (to find the
+   test binaries) and `enumerate_tests` (libtest `--list`), filtered by the
+   optional `pattern` regex and `include_ignored`.
+3. **Bisect each binary** — form first-level groups (`initial_group_size` /
+   `initial_groups`, default one group of all tests), then a depth-first stack
+   of `(names, depth)`. Each group runs single-threaded under a
+   `group_timeout_secs` kill-deadline (`invoke::run_subprocess_capture`; a
+   `TimeoutError` marks the group hung). A group is **interesting** when it
+   hangs or — if `slow_threshold_secs` is set — exceeds that threshold.
+   Interesting groups are split into `split_factor` (or `ceil(100/split_percent)`)
+   roughly-equal contiguous sub-groups and pushed back on the stack, until the
+   group reaches `min_group_size` or `max_rounds` of depth, at which point its
+   members are reported as culprits (`hung` if the leaf timed out, else `slow`).
+   Group runs chunk their argv by `ARG_BYTE_BUDGET` so the `--exact <names…>`
+   list never exceeds the OS limit, and short-circuit on the first hang.
+
+Output is an NDJSON stream of `x-cargo-mcp-bisect-{config,group,culprit,summary}`
+records, with progress lines streamed via `on_progress` during long runs. The
+result is an error when any culprit (or enumeration error) is found.
+`output_path` is honoured through the shared `tools::resolve_output_path` (made
+`pub(crate)` for this): the full body is written to the file and a compact
+summary (config + every culprit + summary + status + file pointer) is returned
+inline.
+
+The `bisect` schema is a single object property added to both tools' `list()`
+schemas via the shared `bisect_schema()` helper; because the schemas are closed
+and `validate_known_args` derives its allow-list from `list()`, adding the
+property automatically makes `bisect` (and only `bisect`) a valid top-level key.
+Nested `bisect.*` keys are validated inside `BisectOpts::from_args`, which also
+enforces the mutual-exclusion and ordering constraints (`split_factor` vs
+`split_percent`, `initial_group_size` vs `initial_groups`, `slow_threshold_secs`
+< `group_timeout_secs`, `group_timeout_secs` required and positive).
+
+## Suppressing harmless incremental-compilation-session stderr notes
+
+### Context
+
+On Windows, rustc can fail to finalize a `-working` incremental compilation
+session directory when another process (antivirus, indexer, a lingering file
+handle) briefly holds it open, and prints a plain-text note directly to
+stderr:
+
+```
+note: error finalizing incremental compilation session directory `...-working`: Access is denied. (os error 5)
+```
+
+This is unrelated to the existing ReFS-specific advisory already covered
+above (which arrives as a structured `compiler-message` diagnostic on
+stdout and is handled by `--clear-incr-working` / diagnostic demotion). This
+note instead lands verbatim on the child's **stderr** and is folded into the
+`x-cargo-mcp-stderr` record by `format_json_output` / `format_test_output` /
+`format_nextest_run_output`. It is pure noise: the compile still succeeds,
+and the only effect is that rustc falls back to a full rebuild for that one
+crate's incremental cache next time — an idempotent, self-correcting
+condition. Left unfiltered, it clutters the stderr record (sometimes with
+dozens of near-duplicate lines in a large workspace) and risks an agent
+misreading it as a real problem.
+
+### Decision
+
+`tools::strip_incremental_notes` removes any stderr line containing the
+substring `error finalizing incremental compilation session directory`
+(matched as a substring, not anchored, since rustc prefixes it with `note: `
+and appends the path and OS error text) along with the single blank
+separator line rustc emits after each note. All other stderr content —
+genuine errors, the Restart Manager holder report, `eprintln!` output — is
+left untouched.
+
+This is applied via `tools::stderr_for_display`, a single choke point used
+by all three stderr-emitting formatters (`format_json_output`,
+`format_test_output` in `tools.rs`, and `format_nextest_run_output` in
+`nextest.rs`) in place of the previous bare `out.stderr.trim()`. Suppression
+is **on by default** (matching the existing `--clear-incr-working` and
+`--unsafe-windows-rm` opt-in pattern, but inverted: here the *quiet* behavior
+is the default and showing the notes is the opt-in) and controlled by a
+process-global `AtomicBool` set once at startup from the new
+`--show-incremental-notes=<bool>` CLI flag, mirrored as the
+`cargo-mcp.showIncrementalCompilationNotes` VS Code setting (default
+`false`), whose description explains that the notes are harmless and the
+build is idempotent. Passing the flag as `true` restores the raw stderr
+text for diagnostic purposes.
+
 
