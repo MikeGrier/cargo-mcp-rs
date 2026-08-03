@@ -1126,7 +1126,11 @@ pub(crate) fn resolve_test_phase_timeouts(
 ) -> Result<(Option<std::time::Duration>, Option<std::time::Duration>), Box<dyn std::error::Error>>
 {
     let overall = opt_timeout_explicit(args)?;
-    let test_override = opt_test_timeout_explicit(args)?;
+    // Explicit `test_timeout_secs: 0` means "no override" (matching the
+    // 0-disables convention `timeout_secs`/`per_test_timeout_secs` use), not
+    // "unbounded" -- flatten collapses it to `None`, identical to the key
+    // being absent, so it can't be mistaken for a real override below.
+    let test_override = opt_test_timeout_explicit(args)?.flatten();
 
     let build_timeout = match overall {
         Some(explicit) => explicit,
@@ -1136,8 +1140,8 @@ pub(crate) fn resolve_test_phase_timeouts(
 
     let test_timeout = match test_override {
         Some(t) => match overall {
-            Some(Some(cap)) => Some(t.map_or(cap, |d| d.min(cap))),
-            _ => t,
+            Some(Some(cap)) => Some(t.min(cap)),
+            _ => Some(t),
         },
         None => build_timeout,
     };
@@ -5150,6 +5154,20 @@ mod tests {
         let (build, test) = resolve_test_phase_timeouts(&args).unwrap();
         assert_eq!(build, Some(std::time::Duration::from_secs(60)));
         assert_eq!(test, Some(std::time::Duration::from_secs(60)));
+    }
+
+    /// `test_timeout_secs: 0` with NO `timeout_secs` at all: explicit 0 must
+    /// behave exactly as if `test_timeout_secs` were absent -- both phases
+    /// fall back to the server default, not "unbounded".
+    #[test]
+    fn resolve_test_phase_timeouts_test_override_zero_alone_uses_server_default() {
+        let _g = DEFAULT_TIMEOUT_TEST_LOCK.lock().unwrap();
+        set_default_test_timeout(Some(30));
+        let args = serde_json::json!({"test_timeout_secs": 0});
+        let (build, test) = resolve_test_phase_timeouts(&args).unwrap();
+        assert_eq!(build, Some(std::time::Duration::from_secs(30)));
+        assert_eq!(test, Some(std::time::Duration::from_secs(30)));
+        set_default_test_timeout(None);
     }
 
     #[test]
