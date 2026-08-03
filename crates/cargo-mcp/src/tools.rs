@@ -494,9 +494,12 @@ const LOCKED_DESC: &str = "If true, assert that Cargo.lock will remain unchanged
 // Subcommand-specific variants
 const TREE_TARGET_DESC: &str = "Filter dependencies matching the given target triple \
      (--target <TRIPLE>). Pass `all` to include all targets. Defaults to the host platform.";
-const TEST_DOC_DESC: &str = "If true, run only documentation tests (--doc). Default: false.";
-const NO_RUN_DESC: &str =
-    "If true, compile the tests but do not run them (--no-run). Default: false.";
+const TEST_DOC_DESC: &str = "If true, run only documentation tests (--doc). Default: false. \
+     Doctests are compiled and run in a single rustdoc invocation with no build/run split, so \
+     `no_run` is not supported together with `doc: true`.";
+const NO_RUN_DESC: &str = "If true, compile the tests but do not run them (--no-run). \
+     Default: false. Not supported together with `doc: true` — cargo has no way to compile \
+     doctests without running them.";
 
 // Toolchain override (valid for every subcommand)
 const TOOLCHAIN_DESC: &str = "Rustup toolchain to run this command with, passed as a leading \
@@ -3686,7 +3689,8 @@ fn call_test_unfiltered(
     // `cargo test` supports the full target-selection set (including --test,
     // handled by push_target_selection) plus --doc for doctests.
     push_target_selection(&mut base, args, &o);
-    if opt_bool(args, "doc") {
+    let doc_mode = opt_bool(args, "doc");
+    if doc_mode {
         base.push("--doc");
     }
     if opt_bool(args, "no_fail_fast") {
@@ -3715,6 +3719,36 @@ fn call_test_unfiltered(
 
     let mut on_progress = on_progress;
     emit_progress_total(&mut on_progress, wd, tc.as_deref());
+
+    // Doctests are compiled and executed by a single rustdoc invocation with
+    // no way to split build from run — `cargo test --doc --no-run` fails with
+    // "can't skip running doc tests with --no-run" — so they can't use the
+    // two-phase build/execute split below. Run them in one phase instead.
+    if doc_mode {
+        if opt_bool(args, "no_run") {
+            return Err(
+                "no_run is not supported together with doc: true; cargo has no way \
+                         to compile doctests without running them (\"can't skip running doc \
+                         tests with --no-run\")"
+                    .into(),
+            );
+        }
+        let mut doc_argv = base.clone();
+        if test_name.is_some() || opt_bool(args, "exact") {
+            doc_argv.push("--");
+            if let Some(ref name) = test_name {
+                doc_argv.push(name);
+            }
+            if opt_bool(args, "exact") {
+                doc_argv.push("--exact");
+            }
+        }
+        let doc_out = run_phase(&doc_argv, wd, timeout, None, &mut on_progress, "doc test")?;
+        let is_error = doc_out.exit_code != 0;
+        let body = format_test_output(&doc_out, &doc_argv, wd);
+        let text = write_output_path_and_summarize(body, output_path, wd, SummaryKind::Test)?;
+        return Ok(ToolResult::Text { text, is_error });
+    }
 
     // ── Phase 1: build (`--no-run`) ──────────────────────────────────────────
     // Compile the test binaries up front so the build time is excluded from the
@@ -4947,6 +4981,61 @@ mod tests {
         std::fs::write(dir.join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
         let args = serde_json::json!({ "working_dir": dir.to_string_lossy() });
         assert!(ensure_manifest_discoverable("cargo_build", &args).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn call_test_rejects_doc_with_no_run() {
+        // `cargo test --doc --no-run` fails with "can't skip running doc
+        // tests with --no-run"; the tool must reject this combination
+        // itself, before ever spawning cargo (no working_dir needed).
+        let args = serde_json::json!({ "doc": true, "no_run": true });
+        match call_test(&args, None) {
+            Err(e) => {
+                assert!(e.to_string().contains("no_run"));
+                assert!(e.to_string().contains("doc: true"));
+            }
+            Ok(_) => panic!("expected doc + no_run to be rejected"),
+        }
+    }
+
+    #[test]
+    fn call_test_doc_mode_runs_without_no_run_split() {
+        // Regression test: doctests must run as a single rustdoc
+        // invocation (no `--no-run` build phase), since cargo has no way
+        // to compile a doctest without also running it.
+        let dir = std::env::temp_dir().join(format!(
+            "cargo-mcp-doctest-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"doctest_fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("src/lib.rs"),
+            "/// ```\n/// assert_eq!(doctest_fixture::add_one(1), 2);\n/// ```\n\
+             pub fn add_one(x: i32) -> i32 {\n    x + 1\n}\n",
+        )
+        .unwrap();
+
+        let wd = dir.to_string_lossy().to_string();
+        let args = serde_json::json!({ "doc": true, "working_dir": wd });
+        let result = call_test(&args, None).expect("doc test run should not error");
+        match result {
+            ToolResult::Text { text, is_error } => {
+                assert!(!is_error, "doc test should pass: {text}");
+                assert!(!text.contains("--no-run"), "must not pass --no-run: {text}");
+            }
+            _ => panic!("expected ToolResult::Text"),
+        }
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
