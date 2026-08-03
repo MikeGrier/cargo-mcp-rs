@@ -3614,10 +3614,15 @@ fn normalize_working_directory_alias(args: &Value) -> std::borrow::Cow<'_, Value
     }
     let mut obj = obj.clone();
     // Always remove the alias so it never surfaces as an "unknown parameter"
-    // itself; only use its value when `working_dir` wasn't already supplied,
-    // so an explicit canonical value still wins over a stray alias.
+    // itself; only use its value when `working_dir` wasn't already supplied
+    // with a non-null value (matching `opt_str`'s null-is-absent convention
+    // elsewhere in this file), so an explicit canonical value still wins over
+    // a stray alias, but a `working_dir: null` doesn't shadow it.
     if let Some(v) = obj.remove("working_directory") {
-        obj.entry("working_dir".to_owned()).or_insert(v);
+        let canonical_supplied = obj.get("working_dir").is_some_and(|v| !v.is_null());
+        if !canonical_supplied {
+            obj.insert("working_dir".to_owned(), v);
+        }
     }
     std::borrow::Cow::Owned(Value::Object(obj))
 }
@@ -5362,6 +5367,20 @@ mod tests {
         // sent alongside it, rather than one silently overwriting the other;
         // the alias key is still stripped so it isn't flagged as unknown.
         let args = serde_json::json!({ "working_directory": "/wrong", "working_dir": "/ws" });
+        let normalized = normalize_working_directory_alias(&args);
+        assert_eq!(
+            normalized.get("working_dir").and_then(|v| v.as_str()),
+            Some("/ws")
+        );
+        assert!(normalized.get("working_directory").is_none());
+    }
+
+    #[test]
+    fn normalize_working_directory_alias_populates_when_canonical_is_explicit_null() {
+        // `opt_str` treats an explicit JSON `null` the same as "absent", so
+        // `working_dir: null` must not shadow a real `working_directory`
+        // value the way a genuinely-supplied `working_dir` does.
+        let args = serde_json::json!({ "working_directory": "/ws", "working_dir": null });
         let normalized = normalize_working_directory_alias(&args);
         assert_eq!(
             normalized.get("working_dir").and_then(|v| v.as_str()),
