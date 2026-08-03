@@ -3599,6 +3599,29 @@ pub fn tool_names() -> Vec<&'static str> {
     ]
 }
 
+/// LLMs sometimes spell `working_dir` out as `working_directory` since that
+/// is the more common name for the concept elsewhere. The two are
+/// unambiguous synonyms for every tool that accepts one, so the alias is
+/// renamed to the canonical key before validation/dispatch rather than
+/// rejected — unlike the `cross_tool_hint` cases below, there is no
+/// meaningfully different parameter this could be confused with.
+fn normalize_working_directory_alias(args: &Value) -> std::borrow::Cow<'_, Value> {
+    let Some(obj) = args.as_object() else {
+        return std::borrow::Cow::Borrowed(args);
+    };
+    if !obj.contains_key("working_directory") {
+        return std::borrow::Cow::Borrowed(args);
+    }
+    let mut obj = obj.clone();
+    // Always remove the alias so it never surfaces as an "unknown parameter"
+    // itself; only use its value when `working_dir` wasn't already supplied,
+    // so an explicit canonical value still wins over a stray alias.
+    if let Some(v) = obj.remove("working_directory") {
+        obj.entry("working_dir".to_owned()).or_insert(v);
+    }
+    std::borrow::Cow::Owned(Value::Object(obj))
+}
+
 /// Dispatch an MCP `tools/call` to the appropriate tool implementation.
 ///
 /// Pass `on_progress` for streaming progress callbacks during JSON-mode
@@ -3613,6 +3636,8 @@ pub fn call(
     // Install the cancel token for the duration of the tool call so that the
     // invoke functions can kill the child process if the client cancels.
     invoke::set_cancel_token(cancel);
+    let args = normalize_working_directory_alias(args);
+    let args = args.as_ref();
     // Reject unknown arguments up front, before any subprocess spawn, so a
     // misrouted parameter (e.g. a `cargo_test`-only `test_filter` sent to
     // `cargo_nextest_run`) fails immediately instead of being silently
@@ -5314,6 +5339,44 @@ mod tests {
         // Dispatch reports the unknown-tool error; validation must not.
         let args = serde_json::json!({ "anything": true });
         assert!(validate_known_args("not_a_tool", &args).is_ok());
+    }
+
+    #[test]
+    fn normalize_working_directory_alias_renames_to_working_dir() {
+        let args = serde_json::json!({ "working_directory": "/ws", "package": "foo" });
+        let normalized = normalize_working_directory_alias(&args);
+        assert_eq!(
+            normalized.get("working_dir").and_then(|v| v.as_str()),
+            Some("/ws")
+        );
+        assert!(normalized.get("working_directory").is_none());
+        assert_eq!(
+            normalized.get("package").and_then(|v| v.as_str()),
+            Some("foo")
+        );
+    }
+
+    #[test]
+    fn normalize_working_directory_alias_leaves_canonical_key_untouched_when_both_present() {
+        // An explicit `working_dir` wins over a stray `working_directory`
+        // sent alongside it, rather than one silently overwriting the other;
+        // the alias key is still stripped so it isn't flagged as unknown.
+        let args = serde_json::json!({ "working_directory": "/wrong", "working_dir": "/ws" });
+        let normalized = normalize_working_directory_alias(&args);
+        assert_eq!(
+            normalized.get("working_dir").and_then(|v| v.as_str()),
+            Some("/ws")
+        );
+        assert!(normalized.get("working_directory").is_none());
+    }
+
+    #[test]
+    fn normalize_working_directory_alias_is_noop_without_the_alias() {
+        let args = serde_json::json!({ "working_dir": "/ws" });
+        assert!(matches!(
+            normalize_working_directory_alias(&args),
+            std::borrow::Cow::Borrowed(_)
+        ));
     }
 
     #[test]
