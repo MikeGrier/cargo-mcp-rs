@@ -1390,6 +1390,9 @@ pub(crate) fn run_phase(
 ) -> Result<CargoOutput, Box<dyn std::error::Error>> {
     let result = match on_progress {
         Some(cb) => {
+            cb(&format!(
+                "{{\"reason\":\"{PROGRESS_PHASE_REASON}\",\"phase\":\"{phase}\"}}"
+            ));
             invoke::run_cargo_streaming_with_timeout(argv, wd, timeout, arm_deadline, &mut **cb)
         }
         None => invoke::run_cargo_with_timeout(argv, wd, timeout, arm_deadline),
@@ -3362,6 +3365,14 @@ fn ensure_manifest_discoverable(
 /// so the progress tracker learns the total crate count up front. Never
 /// emitted by cargo itself (the `x-` prefix guarantees no collision).
 pub(crate) const PROGRESS_TOTAL_REASON: &str = "x-cargo-mcp-progress-total";
+
+/// NDJSON `reason` for the control record [`run_phase`] injects immediately
+/// before spawning cargo, so the progress tracker knows which of
+/// `cargo_test`'s / `cargo_nextest_run`'s phases (`build`, `test execution`,
+/// `doc test`) the following lines belong to and can label `build-finished`
+/// unambiguously (see `main.rs`'s `BuildTracker`). Never emitted by cargo
+/// itself.
+pub(crate) const PROGRESS_PHASE_REASON: &str = "x-cargo-mcp-phase";
 
 /// Best-effort count of packages in the resolved dependency graph, used as an
 /// up-front denominator for build progress so notifications show real progress

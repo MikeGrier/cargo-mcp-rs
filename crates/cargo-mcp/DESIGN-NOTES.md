@@ -325,28 +325,40 @@ unavailable; the only levers are the literal text and the numeric counter.
 
 ### Decisions
 
-- **`Cargo ` prefix.** Lines now read `Cargo check: …` / `Cargo build [R]
+- **`Cargo ` prefix.** Lines now read `Cargo check: …` / `Cargo build [release]
   finished` rather than the bare `check:` / `cargo …`. The leading word is an
   unfortunate use of width but, without it, the collapsed history line loses
   too much context about which tool produced it.
-- **Profile tag.** Every per-crate and `build-finished` line carries a short
-  bracketed marker for the effective compilation profile:
-  - `[D]` — debug/dev (the default when neither `release` nor `profile` is set)
-  - `[R]` — release (`release: true` or `profile: "release"`)
-  - `[T]` — test (`profile: "test"`)
-  - `[B]` — bench (`profile: "bench"`)
-  - `[doc]` — doc (`profile: "doc"`)
-  - `{name}` — any other custom profile, shown verbatim in braces to set it
-    apart from the abbreviated built-in markers
+- **Profile tag.** Every per-crate and `build-finished` line carries a
+  bracketed marker naming the effective compilation profile verbatim:
+  - `[dev]` — debug/dev (the default when neither `release` nor `profile` is set)
+  - `[release]` — release (`release: true` or `profile: "release"`)
+  - `[name]` — any other profile (e.g. `[test]`, `[bench]`, `[doc]`,
+    `[my-profile]`), shown as-is rather than abbreviated
   An explicit `profile` argument wins over `release`, matching cargo's own
   precedence. Implemented in `profile_tag()` and threaded through
-  `BuildTracker`.
+  `BuildTracker`. (Earlier revisions abbreviated the built-in profiles to
+  single letters — `[D]`/`[R]`/`[T]`/`[B]` — with custom names in braces;
+  that was dropped as needlessly cryptic in favour of the plain name.)
+- **`Building` indicator and phase-aware `build-finished`.** Per-crate
+  compile lines are prefixed with `Building` (e.g. `Building serde v1.0.228
+  …`) so a progress line is never ambiguous about whether cargo is compiling
+  or running something. `cargo_test` / `cargo_nextest_run` run in two
+  `run_phase()` calls (build, then execution) that share one `BuildTracker`;
+  an `x-cargo-mcp-phase` control record injected by `run_phase` before each
+  phase lets the tracker label `build-finished` accordingly: `build phase
+  [profile] finished/failed` for the real build, and `build cached [profile]
+  — executing tests now` for the near-instant cache-hit check cargo performs
+  immediately before running tests (which would otherwise look like a second,
+  confusing "finished").
 
 ### Format
 
 ```
-Cargo check: serde v1.0.228 (3/15) [D] [crates.io]
-Cargo build [R] (x86_64-pc-windows-msvc) finished
+Cargo check: Building serde v1.0.228 (3/15) [dev] [crates.io]
+Cargo build [release] (x86_64-pc-windows-msvc) finished
+Cargo test: build phase [dev] finished
+Cargo test: build cached [dev] — executing tests now
 ```
 
 ## Toolchain override (`+toolchain`)
