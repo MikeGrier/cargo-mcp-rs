@@ -224,10 +224,10 @@ the execution phase reuses the cached build. If a build fails, the build output
 `doc: true` runs skip the build/execute split and run as a single phase —
 still bounded by `timeout_secs`, but on one clock instead of two, and labelled
 `doc test` in any `TimeoutError`. `no_run: true` combined with `doc: true` is
-rejected before cargo is spawned at all. `test_filter` is also rejected
-together with `doc: true` — doctests have no `--list`/`--exact` support and
-are always excluded from filter selection, so the combination errors up
-front instead of silently running non-doctests.
+rejected before cargo is spawned at all. `test_filter` and `bisect` are also
+rejected together with `doc: true` — doctests have no `--list`/`--exact`
+support and are always excluded from the filter/bisection pipelines, so the
+combination errors up front instead of silently running non-doctests.
 
 `cargo_test` has two independent timeout knobs with different scopes.
 `timeout_secs` bounds BOTH phases (build and execution), each on its own

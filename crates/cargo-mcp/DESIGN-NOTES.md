@@ -685,7 +685,10 @@ combined with `doc: true` is rejected up front, before either phase runs.
 `test_filter` combined with `doc: true` is rejected the same way: doctests
 have no `--list`/`--exact` support and are always excluded from filter
 selection (see `test_filter.rs` module docs), so `call_test` errors instead
-of silently running non-doctests.
+of silently running non-doctests. `bisect` combined with `doc: true` is
+rejected for the same reason: the bisection engine builds with
+`cargo test --no-run` and never adds `--doc`, so it would silently bisect
+non-doctests instead of failing fast.
 
 ## Hang / slow-test bisection (`bisect`)
 

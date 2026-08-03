@@ -259,10 +259,10 @@ though the execution phase reuses the cached build.\n\n\
 so `doc: true` runs skip the build/execute split and run as a single phase —\n\
 still bounded by `timeout_secs`, but on one clock instead of two, and labelled\n\
 `doc test` in any `TimeoutError`. `no_run: true` combined with `doc: true` is\n\
-rejected before cargo is spawned at all. `test_filter` is also rejected\n\
-together with `doc: true` — doctests have no --list/--exact support and are\n\
-always excluded from filter selection, so the combination errors up front\n\
-instead of silently running non-doctests.\n\n\
+rejected before cargo is spawned at all. `test_filter` and `bisect` are also\n\
+rejected together with `doc: true` — doctests have no --list/--exact support\n\
+and are always excluded from the filter/bisection pipelines, so the\n\
+combination errors up front instead of silently running non-doctests.\n\n\
 `cargo_test` has two independent timeout knobs with different scopes:\n\
 `timeout_secs` bounds BOTH phases (build and execution), each on its own\n\
 independent clock (see above); `per_test_timeout_secs` applies only to the\n\
@@ -505,10 +505,10 @@ const TREE_TARGET_DESC: &str = "Filter dependencies matching the given target tr
      (--target <TRIPLE>). Pass `all` to include all targets. Defaults to the host platform.";
 const TEST_DOC_DESC: &str = "If true, run only documentation tests (--doc). Default: false. \
      Doctests are compiled and run in a single rustdoc invocation with no build/run split, so \
-     `no_run` is not supported together with `doc: true`. `test_filter` is also not supported \
-     together with `doc: true` — doctests have no --list/--exact support and are always \
-     excluded from filter selection, so the call is rejected rather than silently running \
-     non-doctests.";
+     `no_run` is not supported together with `doc: true`. `test_filter` and `bisect` are also \
+     not supported together with `doc: true` — doctests have no --list/--exact support and \
+     are always excluded from the filter/bisection pipelines, so the call is rejected rather \
+     than silently running non-doctests.";
 const NO_RUN_DESC: &str = "If true, compile the tests but do not run them (--no-run). \
      Default: false. Not supported together with `doc: true` — cargo has no way to compile \
      doctests without running them.";
@@ -1700,7 +1700,10 @@ fn bisect_schema() -> Value {
              classified `hung` (exceeded the kill deadline) or `slow` (completed but over \
              the threshold). Works identically on cargo_test and cargo_nextest_run (it runs \
              the compiled libtest binaries directly). Standard selectors (package, target, \
-             features, manifest_path, release, profile, toolchain) scope the build.",
+             features, manifest_path, release, profile, toolchain) scope the build. Not \
+             supported together with `doc: true` — bisection builds with `cargo test \
+             --no-run` and never adds `--doc`, so this combination is rejected rather than \
+             silently bisecting non-doctests.",
         "properties": {
             "group_timeout_secs": {
                 "type": "number",
@@ -3690,6 +3693,15 @@ fn call_test(
     // Bisection mode takes precedence: when the caller supplies a `bisect`
     // object, hand control to the hang/slow-test bisection engine.
     if crate::bisect::is_bisect_requested(args) {
+        if opt_bool(args, "doc") {
+            return Err(
+                "doc: true is not supported together with bisect; the bisection engine \
+                 builds with `cargo test --no-run` and never adds `--doc`, so this \
+                 combination would silently run non-doctests instead of bisecting the \
+                 doctests you asked for. Run doctests without bisect instead."
+                    .into(),
+            );
+        }
         return crate::bisect::run(args, on_progress)?.ok_or_else(
             || -> Box<dyn std::error::Error> {
                 "bisect requested but the bisection engine returned no result".into()
@@ -5059,6 +5071,22 @@ mod tests {
                 assert!(e.to_string().contains("doc: true"));
             }
             Ok(_) => panic!("expected doc + test_filter to be rejected"),
+        }
+    }
+
+    #[test]
+    fn call_test_rejects_doc_with_bisect() {
+        // The bisection engine builds with `cargo test --no-run` and never
+        // adds `--doc`; the tool must reject this combination rather than
+        // silently bisecting non-doctests instead of failing fast (no
+        // working_dir needed).
+        let args = serde_json::json!({ "doc": true, "bisect": { "group_timeout_secs": 10 } });
+        match call_test(&args, None) {
+            Err(e) => {
+                assert!(e.to_string().contains("bisect"));
+                assert!(e.to_string().contains("doc: true"));
+            }
+            Ok(_) => panic!("expected doc + bisect to be rejected"),
         }
     }
 
