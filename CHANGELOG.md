@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.11.0](https://github.com/MikeGrier/cargo-mcp-rs/compare/v0.10.0...v0.11.0) (2026-08-03)
+
+
+### Features
+
+* **test:** add test_timeout_secs to override the execution phase's budget independently ([68d9d69](https://github.com/MikeGrier/cargo-mcp-rs/commit/68d9d69645b20b57e50d538934d3b5dbaa6318d5))
+
+
+### Bug Fixes
+
+* accept `working_directory` as an alias for `working_dir` ([8be0436](https://github.com/MikeGrier/cargo-mcp-rs/commit/8be0436dda6658e195391ba956e844930d65b05e))
+* accept `working_directory` as an alias for `working_dir` ([357b95c](https://github.com/MikeGrier/cargo-mcp-rs/commit/357b95cc098d397e406bd5e21cf2c458b8ed4d79))
+* address Copilot review feedback on doc-test PR ([f061dc7](https://github.com/MikeGrier/cargo-mcp-rs/commit/f061dc77c7deeea2e775fabd1d9261db136ca223))
+* clarify build vs execute phase in cargo_test/nextest progress ([044fc8a](https://github.com/MikeGrier/cargo-mcp-rs/commit/044fc8aba896b081373e469beb0d32540ff751dd))
+* don't emit bare --exact in doc-mode argv without test_name ([578a8e3](https://github.com/MikeGrier/cargo-mcp-rs/commit/578a8e3858c2d11251bbd0e84012eca1d5759bc3))
+* don't label doc-test build-finished as a cache-hit check ([6ba191d](https://github.com/MikeGrier/cargo-mcp-rs/commit/6ba191d1fde1e21ce23dfe755efef8cda814cdd4))
+* reject doc: true combined with bisect ([6fc6522](https://github.com/MikeGrier/cargo-mcp-rs/commit/6fc6522ecc20f1ad8869ea84c3a18922397a0b34))
+* reject doc: true combined with test_filter ([fa9426f](https://github.com/MikeGrier/cargo-mcp-rs/commit/fa9426fdcc317014fcd7d82e71b0dc850251fe4b))
+* **test:** don't pass --no-run when running doctests ([367af9e](https://github.com/MikeGrier/cargo-mcp-rs/commit/367af9e08ae065564d6a2bafcb791ac6f2011af0))
+* **test:** don't pass --no-run when running doctests ([94ea60e](https://github.com/MikeGrier/cargo-mcp-rs/commit/94ea60ebc9260e88b50de481ef15ea9d4864e2f1))
+* **test:** explicit test_timeout_secs: 0 no longer unbounds the build phase ([aab1a63](https://github.com/MikeGrier/cargo-mcp-rs/commit/aab1a632a278476ce083b82314934bc90d309d18))
+* treat working_dir: null as absent when applying the alias ([3bc75ae](https://github.com/MikeGrier/cargo-mcp-rs/commit/3bc75ae8da7e445e6d181790b685da443ba50411))
+
 ## [0.10.0](https://github.com/MikeGrier/cargo-mcp-rs/compare/v0.9.0...v0.10.0) (2026-08-01)
 
 
