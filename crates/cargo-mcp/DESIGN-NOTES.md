@@ -658,6 +658,12 @@ execution phase's stdout before the existing `format_test_output` /
 exit code is authoritative. The pre-existing `test_filter` path already builds
 (`--no-run` enumerate) before executing, so it was left unchanged.
 
+Doctests are the one exception: cargo rejects `cargo test --doc --no-run`
+(`can't skip running doc tests with --no-run`), so `doc: true` bypasses the
+build/execute split entirely and runs `cargo test --doc ...` as a single
+phase, still bounded by `timeout_secs` but on one clock. `no_run: true`
+combined with `doc: true` is rejected up front, before either phase runs.
+
 ## Hang / slow-test bisection (`bisect`)
 
 ### Context

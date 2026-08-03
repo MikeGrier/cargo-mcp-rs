@@ -219,6 +219,13 @@ Build-phase compiler warnings are preserved in the combined output even though
 the execution phase reuses the cached build. If a build fails, the build output
 (compile errors) is returned and the execution phase is skipped.
 
+**Doctests are the one exception to the two-phase split.** Cargo rejects
+`cargo test --doc --no-run` (`can't skip running doc tests with --no-run`), so
+`doc: true` runs skip the build/execute split and run as a single phase —
+still bounded by `timeout_secs`, but on one clock instead of two, and labelled
+`doc test` in any `TimeoutError`. `no_run: true` combined with `doc: true` is
+rejected before cargo is spawned at all.
+
 `cargo_test` has two independent timeout knobs with different scopes.
 `timeout_secs` bounds BOTH phases (build and execution), each on its own
 independent clock (see above). `per_test_timeout_secs` applies only to the

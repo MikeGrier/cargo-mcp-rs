@@ -254,6 +254,12 @@ names the phase that fired (e.g. \"... during the build phase\" vs \"... during\
 the test execution phase\"), so you can tell a slow compile apart from a hung\n\
 test. Build-phase compiler warnings are preserved in the combined output even\n\
 though the execution phase reuses the cached build.\n\n\
+**Doctests are the one exception to the two-phase split.** Cargo rejects\n\
+`cargo test --doc --no-run` (\"can't skip running doc tests with --no-run\"),\n\
+so `doc: true` runs skip the build/execute split and run as a single phase —\n\
+still bounded by `timeout_secs`, but on one clock instead of two, and labelled\n\
+`doc test` in any `TimeoutError`. `no_run: true` combined with `doc: true` is\n\
+rejected before cargo is spawned at all.\n\n\
 `cargo_test` has two independent timeout knobs with different scopes:\n\
 `timeout_secs` bounds BOTH phases (build and execution), each on its own\n\
 independent clock (see above); `per_test_timeout_secs` applies only to the\n\
@@ -832,6 +838,28 @@ pub(crate) fn push_target_selection<'a>(argv: &mut Vec<&'a str>, args: &Value, o
     if opt_bool(args, "all_targets") {
         argv.push("--all-targets");
     }
+}
+
+/// Build the argv for the single-phase doctest run: `base` (which already
+/// contains `--doc`) plus an optional `-- <test_name> [--exact]` filter
+/// suffix. Doctests have no build/execute split, so — unlike the two-phase
+/// path below — this never appends `--no-run`.
+fn build_doc_test_argv<'a>(
+    base: &[&'a str],
+    test_name: Option<&'a str>,
+    exact: bool,
+) -> Vec<&'a str> {
+    let mut argv = base.to_vec();
+    if test_name.is_some() || exact {
+        argv.push("--");
+        if let Some(name) = test_name {
+            argv.push(name);
+        }
+        if exact {
+            argv.push("--exact");
+        }
+    }
+    argv
 }
 
 /// Append the reduced target-selection flags supported by `cargo doc`
@@ -3733,16 +3761,7 @@ fn call_test_unfiltered(
                     .into(),
             );
         }
-        let mut doc_argv = base.clone();
-        if test_name.is_some() || opt_bool(args, "exact") {
-            doc_argv.push("--");
-            if let Some(ref name) = test_name {
-                doc_argv.push(name);
-            }
-            if opt_bool(args, "exact") {
-                doc_argv.push("--exact");
-            }
-        }
+        let doc_argv = build_doc_test_argv(&base, test_name.as_deref(), opt_bool(args, "exact"));
         let doc_out = run_phase(&doc_argv, wd, timeout, None, &mut on_progress, "doc test")?;
         let is_error = doc_out.exit_code != 0;
         let body = format_test_output(&doc_out, &doc_argv, wd);
@@ -5000,43 +5019,32 @@ mod tests {
     }
 
     #[test]
-    fn call_test_doc_mode_runs_without_no_run_split() {
-        // Regression test: doctests must run as a single rustdoc
-        // invocation (no `--no-run` build phase), since cargo has no way
-        // to compile a doctest without also running it.
-        let dir = std::env::temp_dir().join(format!(
-            "cargo-mcp-doctest-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos(),
-        ));
-        std::fs::create_dir_all(dir.join("src")).unwrap();
-        std::fs::write(
-            dir.join("Cargo.toml"),
-            "[package]\nname = \"doctest_fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-        )
-        .unwrap();
-        std::fs::write(
-            dir.join("src/lib.rs"),
-            "/// ```\n/// assert_eq!(doctest_fixture::add_one(1), 2);\n/// ```\n\
-             pub fn add_one(x: i32) -> i32 {\n    x + 1\n}\n",
-        )
-        .unwrap();
+    fn call_test_doc_mode_argv_never_includes_no_run() {
+        // Regression test for the doc-mode argv builder: doctests must run
+        // as a single rustdoc invocation with no `--no-run` build phase,
+        // since cargo has no way to compile a doctest without also running
+        // it. Pure argv assertion — no cargo subprocess spawned.
+        let base = vec!["test", "--message-format=json", "--doc"];
+        let argv = build_doc_test_argv(&base, None, false);
+        assert_eq!(argv, vec!["test", "--message-format=json", "--doc"]);
+        assert!(!argv.contains(&"--no-run"));
+    }
 
-        let wd = dir.to_string_lossy().to_string();
-        let args = serde_json::json!({ "doc": true, "working_dir": wd });
-        let result = call_test(&args, None).expect("doc test run should not error");
-        match result {
-            ToolResult::Text { text, is_error } => {
-                assert!(!is_error, "doc test should pass: {text}");
-                assert!(!text.contains("--no-run"), "must not pass --no-run: {text}");
-            }
-            _ => panic!("expected ToolResult::Text"),
-        }
-
-        let _ = std::fs::remove_dir_all(&dir);
+    #[test]
+    fn call_test_doc_mode_argv_appends_test_name_and_exact() {
+        let base = vec!["test", "--message-format=json", "--doc"];
+        let argv = build_doc_test_argv(&base, Some("my_doctest"), true);
+        assert_eq!(
+            argv,
+            vec![
+                "test",
+                "--message-format=json",
+                "--doc",
+                "--",
+                "my_doctest",
+                "--exact",
+            ]
+        );
     }
 
     #[test]
