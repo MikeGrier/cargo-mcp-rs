@@ -856,11 +856,11 @@ fn build_doc_test_argv<'a>(
     exact: bool,
 ) -> Vec<&'a str> {
     let mut argv = base.to_vec();
-    if test_name.is_some() || exact {
+    // `--exact` without a name filter is meaningless to libtest, so it only
+    // applies (and only gets a `--` separator) when `test_name` is present.
+    if let Some(name) = test_name {
         argv.push("--");
-        if let Some(name) = test_name {
-            argv.push(name);
-        }
+        argv.push(name);
         if exact {
             argv.push("--exact");
         }
@@ -5089,6 +5089,15 @@ mod tests {
                 "--exact",
             ]
         );
+    }
+
+    #[test]
+    fn call_test_doc_mode_argv_ignores_exact_without_test_name() {
+        // `--exact` with no name filter is meaningless to libtest; it must
+        // not be emitted (nor the `--` separator) when `test_name` is None.
+        let base = vec!["test", "--message-format=json", "--doc"];
+        let argv = build_doc_test_argv(&base, None, true);
+        assert_eq!(argv, vec!["test", "--message-format=json", "--doc"]);
     }
 
     #[test]
