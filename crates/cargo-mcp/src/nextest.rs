@@ -21,9 +21,9 @@ use serde_json::Value;
 use crate::invoke::{self, CargoOutput};
 use crate::tools::{
     self, CommonOpts, STDERR_REASON, SummaryKind, ToolResult, combine_build_and_exec_output,
-    invocation_header, is_build_finished_line, opt_bool, opt_int_str, opt_str,
-    opt_timeout_explicit, push_feature_flags, push_manifest_options, push_package_selection,
-    run_phase, toolchain_arg, validate_relative_output_path, write_output_path_and_summarize,
+    invocation_header, is_build_finished_line, opt_bool, opt_int_str, opt_str, push_feature_flags,
+    push_manifest_options, push_package_selection, run_phase, toolchain_arg,
+    validate_relative_output_path, write_output_path_and_summarize,
 };
 
 /// Discriminator for the NDJSON record that wraps one line of nextest's
@@ -416,6 +416,14 @@ pub(crate) fn call_run(
     // the compiled libtest binaries directly), so `bisect` behaves identically
     // whether requested via cargo_test or cargo_nextest_run.
     if crate::bisect::is_bisect_requested(args) {
+        if tools::opt_test_timeout_explicit(args)?.is_some() {
+            return Err(
+                "test_timeout_secs is not supported together with bisect; the bisection \
+                 engine has its own `group_timeout_secs` / `slow_threshold_secs` budget \
+                 model instead of the build/execute phase split. Use those instead."
+                    .into(),
+            );
+        }
         return crate::bisect::run(args, on_progress)?.ok_or_else(
             || -> Box<dyn std::error::Error> {
                 "bisect requested but the bisection engine returned no result".into()
@@ -467,12 +475,10 @@ pub(crate) fn call_run(
     // Same three-state timeout selection as cargo_test: caller wins; missing
     // falls back to the server-wide default. The budget is applied
     // INDEPENDENTLY to each phase below, so a slow build never consumes the
-    // test-execution budget. Per-test enforcement is left to nextest's profile
-    // (slow-timeout / terminate-after).
-    let timeout = match opt_timeout_explicit(args)? {
-        None => tools::default_test_timeout(),
-        Some(explicit) => explicit,
-    };
+    // test-execution budget. `test_timeout_secs` overrides the execution
+    // phase specifically — see resolve_test_phase_timeouts. Per-test
+    // enforcement is left to nextest's profile (slow-timeout / terminate-after).
+    let (build_timeout, test_timeout) = tools::resolve_test_phase_timeouts(args)?;
 
     let mut on_progress = on_progress;
 
@@ -482,7 +488,14 @@ pub(crate) fn call_run(
     // whole build; a timeout here is labelled "build".
     let mut build_argv = base.clone();
     build_argv.push("--no-run");
-    let build_out = run_phase(&build_argv, wd, timeout, None, &mut on_progress, "build")?;
+    let build_out = run_phase(
+        &build_argv,
+        wd,
+        build_timeout,
+        None,
+        &mut on_progress,
+        "build",
+    )?;
 
     // If the build failed, or the caller only wanted a build (`no_run`), return
     // the build output directly without an execution phase.
@@ -534,7 +547,7 @@ pub(crate) fn call_run(
     let exec_out = run_phase(
         &argv,
         wd,
-        timeout,
+        test_timeout,
         Some(&is_build_finished_line),
         &mut on_progress,
         "test execution",
@@ -630,6 +643,26 @@ mod tests {
         // in VS Code Copilot Chat; assert the fence is present so the UX
         // promise documented in DESIGN-NOTES does not silently regress.
         assert!(s.contains("```pwsh"));
+    }
+
+    #[test]
+    fn call_run_rejects_bisect_with_test_timeout_secs() {
+        // The bisection engine has its own group_timeout_secs /
+        // slow_threshold_secs budget model instead of the build/execute
+        // phase split, so test_timeout_secs must be rejected rather than
+        // silently ignored (no working_dir needed — rejected before any
+        // cargo subprocess is spawned).
+        let args = serde_json::json!({
+            "bisect": { "group_timeout_secs": 10 },
+            "test_timeout_secs": 10,
+        });
+        match call_run(&args, None) {
+            Err(e) => {
+                assert!(e.to_string().contains("test_timeout_secs"));
+                assert!(e.to_string().contains("bisect"));
+            }
+            Ok(_) => panic!("expected bisect + test_timeout_secs to be rejected"),
+        }
     }
 
     #[test]

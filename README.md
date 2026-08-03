@@ -193,6 +193,7 @@ These parameters are available on most tools:
   "test": "integration_tests",        // optional: specific integration test target
   "no_fail_fast": true,               // optional: run all tests even if some fail
   "timeout_secs": 0,                  // optional: hard OVERALL wall-clock cap; 0 disables
+  "test_timeout_secs": 0,             // optional: overrides the execution phase's budget only (unfiltered mode)
   "per_test_timeout_secs": 30,        // optional: per-test idle watchdog (filter mode only); 0 disables
   // optional: regex-based selection. When set, cargo_test enumerates
   // tests via `--list`, matches names against the regex, and runs ONLY

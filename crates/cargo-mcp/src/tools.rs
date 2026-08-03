@@ -278,6 +278,22 @@ per-test). Bounds each phase independently (build, then execution). Defaults:\n\
   pass an explicit value to cap the whole phase.\n\
 - Pass `timeout_secs: 0` to disable for this call regardless of the\n\
   server default.\n\n\
+**`test_timeout_secs` — execution-phase-only override (unfiltered mode).**\n\
+Overrides the EXECUTION phase's budget specifically, independently of\n\
+`timeout_secs` which still governs the build phase. Not supported together\n\
+with `doc: true` (single-phase, no build/execute split), `test_filter`\n\
+(has its own `per_test_timeout_secs` model), or `bisect` (has its own\n\
+`group_timeout_secs` model) — the call is rejected rather than silently\n\
+ignoring it.\n\
+- If `timeout_secs` is omitted, the build phase is left UNBOUNDED —\n\
+  supplying only a test-specific budget signals you want to bound\n\
+  execution alone.\n\
+- If `timeout_secs` is also set, `test_timeout_secs` is CLAMPED to never\n\
+  exceed it — it can only tighten the execution budget, not loosen it\n\
+  beyond the overall cap.\n\
+- Pass `test_timeout_secs: 0` to omit the override and fall back to\n\
+  `timeout_secs` (or its default) for both phases, same as leaving it\n\
+  unset.\n\n\
 **`per_test_timeout_secs` — per-test budget (filter mode only).**\n\
 Only meaningful when `test_filter` is set; ignored otherwise. Its exact\n\
 semantics depend on the `cargo-mcp.test.perTestExecution` setting:\n\n\
@@ -302,6 +318,9 @@ When to override:\n\n\
 - **Raise / disable `timeout_secs`** for slow suites or integration\n\
   tests that internally poll. Better to disable for one call than to\n\
   chase a spurious `TimeoutError`.\n\
+- **Set `test_timeout_secs`** when you want the build left unbounded\n\
+  (a first run on a cold cache, or a package with a known-slow build)\n\
+  while still capping how long test execution itself may run.\n\
 - **Raise / disable `per_test_timeout_secs`** when a single matched\n\
   test legitimately runs longer than the default.\n\
 - **Lower either** when sanity-checking a fix to fail fast on an\n\
@@ -1055,6 +1074,75 @@ pub(crate) fn opt_per_test_timeout_explicit(
         return Ok(Some(None));
     }
     Ok(Some(Some(std::time::Duration::from_secs(secs))))
+}
+
+/// Parallel of [`opt_timeout_explicit`] for the `test_timeout_secs`
+/// parameter, which overrides the EXECUTION phase's budget specifically in
+/// the two-phase build/execute split shared by `cargo_test` and
+/// `cargo_nextest_run` (see [`resolve_test_phase_timeouts`]).
+///
+/// Same three-state contract: `None` (absent/null), `Some(None)` (explicit
+/// `0` = no phase-specific override), `Some(Some(d))` (positive budget).
+pub(crate) fn opt_test_timeout_explicit(
+    args: &Value,
+) -> Result<Option<Option<std::time::Duration>>, Box<dyn std::error::Error>> {
+    let Some(v) = args.get("test_timeout_secs") else {
+        return Ok(None);
+    };
+    if v.is_null() {
+        return Ok(None);
+    }
+    let Some(n) = v.as_number() else {
+        return Err(format!("test_timeout_secs must be a non-negative integer, got {v}").into());
+    };
+    let secs = n.as_u64().ok_or_else(|| -> Box<dyn std::error::Error> {
+        format!("test_timeout_secs must be a non-negative integer, got {n}").into()
+    })?;
+    if secs == 0 {
+        return Ok(Some(None));
+    }
+    Ok(Some(Some(std::time::Duration::from_secs(secs))))
+}
+
+/// Resolve the independent (build, execution) timeout budgets for the
+/// two-phase build/execute split shared by `cargo_test` (unfiltered path)
+/// and `cargo_nextest_run`.
+///
+/// `timeout_secs` is the caller's overall budget, applied to the BUILD phase
+/// as before. `test_timeout_secs` lets the caller override the EXECUTION
+/// phase's budget specifically:
+///
+/// - Only `test_timeout_secs` set (no `timeout_secs`): the build phase is
+///   left unbounded — supplying a test-specific budget signals the caller
+///   only wants to bound test execution — and the execution phase gets
+///   `test_timeout_secs`.
+/// - Both set: the execution budget is clamped to never exceed the overall
+///   `timeout_secs` ceiling (it can only be tightened, not loosened).
+/// - Only `timeout_secs` set, or neither: unchanged pre-existing behaviour —
+///   the same value (explicit, or the server default) applies to both
+///   phases independently.
+pub(crate) fn resolve_test_phase_timeouts(
+    args: &Value,
+) -> Result<(Option<std::time::Duration>, Option<std::time::Duration>), Box<dyn std::error::Error>>
+{
+    let overall = opt_timeout_explicit(args)?;
+    let test_override = opt_test_timeout_explicit(args)?;
+
+    let build_timeout = match overall {
+        Some(explicit) => explicit,
+        None if test_override.is_some() => None,
+        None => default_test_timeout(),
+    };
+
+    let test_timeout = match test_override {
+        Some(t) => match overall {
+            Some(Some(cap)) => Some(t.map_or(cap, |d| d.min(cap))),
+            _ => t,
+        },
+        None => build_timeout,
+    };
+
+    Ok((build_timeout, test_timeout))
 }
 
 /// Extract the optional `env` map from JSON args.
@@ -2230,6 +2318,26 @@ pub fn list() -> Value {
                              phase. Pass 0 to disable for this call regardless of the \
                              server default."
                     },
+                    "test_timeout_secs": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description":
+                            "Overrides the EXECUTION phase's budget specifically, leaving \
+                             the build phase governed by `timeout_secs` (or its default) \
+                             independently. ONLY meaningful in the unfiltered path — not \
+                             supported together with `doc: true` (single-phase, no \
+                             build/execute split), `test_filter` (has its own \
+                             `per_test_timeout_secs` model), or `bisect` (has its own \
+                             `group_timeout_secs` model); the call is rejected rather than \
+                             silently ignoring it. If `timeout_secs` is omitted, the build \
+                             phase is left UNBOUNDED (supplying a test-specific budget \
+                             signals you only want to bound execution). If `timeout_secs` \
+                             is also set, this value is CLAMPED to never exceed it — it can \
+                             only tighten the execution budget, not loosen it beyond the \
+                             overall cap. Pass 0 to omit the override and fall back to \
+                             `timeout_secs` (or its default) for both phases, same as \
+                             leaving this unset."
+                    },
                     "per_test_timeout_secs": {
                         "type": "integer",
                         "minimum": 0,
@@ -3017,11 +3125,22 @@ pub fn list() -> Value {
                     "no_run":        { "type": "boolean", "description": NO_RUN_DESC },
 
                     "timeout_secs":  { "type": "integer", "minimum": 0, "description":
-                        "OVERALL wall-clock cap on the execution phase (does not include the build). \
-                         Same three-state semantics as `cargo_test`: omit to use the server default, \
-                         pass 0 to disable, pass N to cap at N seconds. PER-TEST enforcement is the \
-                         job of nextest's profile config (`slow-timeout`, `terminate-after`); \
-                         cargo-mcp does NOT expose a per-test-timeout knob for nextest." },
+                        "OVERALL wall-clock cap, applied independently to each phase: first \
+                         the build (--no-run), then the test execution phase. Same \
+                         three-state semantics as `cargo_test`: omit to use the server \
+                         default, pass 0 to disable, pass N to cap each phase at N seconds. \
+                         PER-TEST enforcement is the job of nextest's profile config \
+                         (`slow-timeout`, `terminate-after`); cargo-mcp does NOT expose a \
+                         per-test-timeout knob for nextest." },
+                    "test_timeout_secs": { "type": "integer", "minimum": 0, "description":
+                        "Overrides the EXECUTION phase's budget specifically, leaving the \
+                         build phase governed by `timeout_secs` (or its default) \
+                         independently. Not supported together with `bisect` (which has its \
+                         own `group_timeout_secs` model); the call is rejected rather than \
+                         silently ignoring it. If `timeout_secs` is omitted, the build phase \
+                         is left UNBOUNDED. If `timeout_secs` is also set, this value is \
+                         CLAMPED to never exceed it. Pass 0 to omit the override, same as \
+                         leaving this unset." },
 
                     "bisect": bisect_schema()
                 },
@@ -3702,6 +3821,14 @@ fn call_test(
                     .into(),
             );
         }
+        if opt_test_timeout_explicit(args)?.is_some() {
+            return Err(
+                "test_timeout_secs is not supported together with bisect; the bisection \
+                 engine has its own `group_timeout_secs` / `slow_threshold_secs` budget \
+                 model instead of the build/execute phase split. Use those instead."
+                    .into(),
+            );
+        }
         return crate::bisect::run(args, on_progress)?.ok_or_else(
             || -> Box<dyn std::error::Error> {
                 "bisect requested but the bisection engine returned no result".into()
@@ -3720,6 +3847,15 @@ fn call_test(
                  --list/--exact support and are always excluded from filter selection, so \
                  this combination would silently run non-doctests instead of the doctests \
                  you asked for. Run doctests without test_filter instead."
+                    .into(),
+            );
+        }
+        if opt_test_timeout_explicit(args)?.is_some() {
+            return Err(
+                "test_timeout_secs is not supported together with test_filter; filter mode \
+                 already has its own `timeout_secs` (overall) / `per_test_timeout_secs` \
+                 (per-invocation) budget pair instead of the plain build/execute phase \
+                 split. Use those instead."
                     .into(),
             );
         }
@@ -3772,18 +3908,9 @@ fn call_test_unfiltered(
         base.insert(0, t);
     }
 
-    // Caller-supplied timeout wins; fall back to the server-configured default
-    // (cargo-mcp.test.timeoutSecs VS Code setting, default 30s).
-    // opt_timeout_explicit distinguishes three cases:
-    //   None         → key absent: apply server default
-    //   Some(None)   → explicit 0: disable timeout for this run
-    //   Some(Some(d))→ explicit positive: use caller's budget
-    // The budget is applied INDEPENDENTLY to each phase below, so a slow build
-    // never consumes the test-execution budget.
-    let timeout = match opt_timeout_explicit(args)? {
-        None => default_test_timeout(), // use server default
-        Some(explicit) => explicit,     // caller wins (including None=disable)
-    };
+    // Independent (build, execution) budgets — see resolve_test_phase_timeouts
+    // for the exact `timeout_secs` / `test_timeout_secs` interaction.
+    let (build_timeout, test_timeout) = resolve_test_phase_timeouts(args)?;
 
     let mut on_progress = on_progress;
     emit_progress_total(&mut on_progress, wd, tc.as_deref());
@@ -3801,8 +3928,23 @@ fn call_test_unfiltered(
                     .into(),
             );
         }
+        if opt_test_timeout_explicit(args)?.is_some() {
+            return Err(
+                "test_timeout_secs is not supported together with doc: true; doctests run \
+                 as a single phase with no separate build/execute split, so there is no \
+                 distinct execution budget to override. Use timeout_secs instead."
+                    .into(),
+            );
+        }
         let doc_argv = build_doc_test_argv(&base, test_name.as_deref(), opt_bool(args, "exact"));
-        let doc_out = run_phase(&doc_argv, wd, timeout, None, &mut on_progress, "doc test")?;
+        let doc_out = run_phase(
+            &doc_argv,
+            wd,
+            build_timeout,
+            None,
+            &mut on_progress,
+            "doc test",
+        )?;
         let is_error = doc_out.exit_code != 0;
         let body = format_test_output(&doc_out, &doc_argv, wd);
         let text = write_output_path_and_summarize(body, output_path, wd, SummaryKind::Test)?;
@@ -3815,7 +3957,14 @@ fn call_test_unfiltered(
     // None) so it bounds the whole build; a timeout is labelled "build".
     let mut build_argv = base.clone();
     build_argv.push("--no-run");
-    let build_out = run_phase(&build_argv, wd, timeout, None, &mut on_progress, "build")?;
+    let build_out = run_phase(
+        &build_argv,
+        wd,
+        build_timeout,
+        None,
+        &mut on_progress,
+        "build",
+    )?;
 
     // If the build failed (compile error) or the caller only wanted a build
     // (`no_run`), return the build output directly without an execution phase.
@@ -3848,7 +3997,7 @@ fn call_test_unfiltered(
     let exec_out = run_phase(
         &exec_argv,
         wd,
-        timeout,
+        test_timeout,
         Some(&is_build_finished_line),
         &mut on_progress,
         "test execution",
@@ -4861,6 +5010,160 @@ mod tests {
         assert_eq!(opt_per_test_timeout_explicit(&b).unwrap(), Some(None));
     }
 
+    // ── opt_test_timeout_explicit tests ──────────────────────────────────────
+    // Mirror of the opt_timeout_explicit / opt_per_test_timeout_explicit
+    // suites for the `test_timeout_secs` key.
+
+    #[test]
+    fn opt_test_timeout_explicit_absent_returns_none() {
+        let args = serde_json::json!({});
+        assert!(matches!(opt_test_timeout_explicit(&args), Ok(None)));
+    }
+
+    #[test]
+    fn opt_test_timeout_explicit_null_returns_none() {
+        let args = serde_json::json!({"test_timeout_secs": null});
+        assert!(matches!(opt_test_timeout_explicit(&args), Ok(None)));
+    }
+
+    #[test]
+    fn opt_test_timeout_explicit_zero_returns_some_none() {
+        let args = serde_json::json!({"test_timeout_secs": 0});
+        assert!(matches!(opt_test_timeout_explicit(&args), Ok(Some(None))));
+    }
+
+    #[test]
+    fn opt_test_timeout_explicit_positive_returns_duration() {
+        let args = serde_json::json!({"test_timeout_secs": 45});
+        match opt_test_timeout_explicit(&args) {
+            Ok(Some(Some(d))) => assert_eq!(d, std::time::Duration::from_secs(45)),
+            other => panic!("expected Ok(Some(Some(45s))), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn opt_test_timeout_explicit_invalid_returns_err() {
+        let args = serde_json::json!({"test_timeout_secs": "thirty"});
+        let err = opt_test_timeout_explicit(&args).unwrap_err();
+        assert!(
+            err.to_string().contains("test_timeout_secs"),
+            "error should mention the offending key, got {err}"
+        );
+    }
+
+    /// `timeout_secs` must not leak into `test_timeout_secs` parsing.
+    #[test]
+    fn opt_test_timeout_explicit_ignores_sibling_timeout_secs() {
+        let args = serde_json::json!({"timeout_secs": 60});
+        assert!(matches!(opt_test_timeout_explicit(&args), Ok(None)));
+    }
+
+    // ── resolve_test_phase_timeouts tests ─────────────────────────────────────
+    // Covers every combination described in the doc comment: neither set,
+    // only test_timeout_secs, only timeout_secs, both set (override smaller
+    // and larger than the cap), and overall explicitly disabled.
+
+    #[test]
+    fn resolve_test_phase_timeouts_neither_set_uses_server_default_for_both() {
+        let _g = DEFAULT_TIMEOUT_TEST_LOCK.lock().unwrap();
+        set_default_test_timeout(Some(30));
+        let args = serde_json::json!({});
+        let (build, test) = resolve_test_phase_timeouts(&args).unwrap();
+        assert_eq!(build, Some(std::time::Duration::from_secs(30)));
+        assert_eq!(test, Some(std::time::Duration::from_secs(30)));
+        set_default_test_timeout(None);
+    }
+
+    /// Only `test_timeout_secs` set: build is left unbounded, execution gets
+    /// the override — even when a server default is configured.
+    #[test]
+    fn resolve_test_phase_timeouts_test_only_leaves_build_unbounded() {
+        let _g = DEFAULT_TIMEOUT_TEST_LOCK.lock().unwrap();
+        set_default_test_timeout(Some(30));
+        let args = serde_json::json!({"test_timeout_secs": 45});
+        let (build, test) = resolve_test_phase_timeouts(&args).unwrap();
+        assert_eq!(build, None, "build phase must be unbounded");
+        assert_eq!(test, Some(std::time::Duration::from_secs(45)));
+        set_default_test_timeout(None);
+    }
+
+    /// Only `timeout_secs` set: unchanged pre-existing behaviour — same
+    /// budget applies independently to both phases.
+    #[test]
+    fn resolve_test_phase_timeouts_overall_only_applies_to_both_phases() {
+        let args = serde_json::json!({"timeout_secs": 90});
+        let (build, test) = resolve_test_phase_timeouts(&args).unwrap();
+        assert_eq!(build, Some(std::time::Duration::from_secs(90)));
+        assert_eq!(test, Some(std::time::Duration::from_secs(90)));
+    }
+
+    /// Both set, override smaller than the cap: execution uses the tighter
+    /// override value unclamped.
+    #[test]
+    fn resolve_test_phase_timeouts_both_set_override_smaller_than_cap() {
+        let args = serde_json::json!({"timeout_secs": 120, "test_timeout_secs": 20});
+        let (build, test) = resolve_test_phase_timeouts(&args).unwrap();
+        assert_eq!(build, Some(std::time::Duration::from_secs(120)));
+        assert_eq!(test, Some(std::time::Duration::from_secs(20)));
+    }
+
+    /// Both set, override larger than the cap: execution budget is clamped
+    /// down to the overall ceiling rather than exceeding it.
+    #[test]
+    fn resolve_test_phase_timeouts_both_set_override_larger_than_cap_is_clamped() {
+        let args = serde_json::json!({"timeout_secs": 30, "test_timeout_secs": 300});
+        let (build, test) = resolve_test_phase_timeouts(&args).unwrap();
+        assert_eq!(build, Some(std::time::Duration::from_secs(30)));
+        assert_eq!(
+            test,
+            Some(std::time::Duration::from_secs(30)),
+            "execution budget must be clamped to the overall cap"
+        );
+    }
+
+    /// Overall explicitly disabled (`timeout_secs: 0`) with a test override
+    /// set: the override applies to execution unclamped (no cap to clamp
+    /// against); build stays unbounded.
+    #[test]
+    fn resolve_test_phase_timeouts_overall_disabled_test_override_unclamped() {
+        let args = serde_json::json!({"timeout_secs": 0, "test_timeout_secs": 15});
+        let (build, test) = resolve_test_phase_timeouts(&args).unwrap();
+        assert_eq!(build, None);
+        assert_eq!(test, Some(std::time::Duration::from_secs(15)));
+    }
+
+    /// Overall explicitly disabled with test override also explicitly
+    /// disabled (`test_timeout_secs: 0`): both phases unbounded.
+    #[test]
+    fn resolve_test_phase_timeouts_both_explicitly_disabled() {
+        let args = serde_json::json!({"timeout_secs": 0, "test_timeout_secs": 0});
+        let (build, test) = resolve_test_phase_timeouts(&args).unwrap();
+        assert_eq!(build, None);
+        assert_eq!(test, None);
+    }
+
+    /// `test_timeout_secs: 0` with an overall cap set: explicit 0 means "no
+    /// override", so execution falls back to the overall cap.
+    #[test]
+    fn resolve_test_phase_timeouts_test_override_zero_falls_back_to_cap() {
+        let args = serde_json::json!({"timeout_secs": 60, "test_timeout_secs": 0});
+        let (build, test) = resolve_test_phase_timeouts(&args).unwrap();
+        assert_eq!(build, Some(std::time::Duration::from_secs(60)));
+        assert_eq!(test, Some(std::time::Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn call_test_rejects_doc_with_test_timeout_secs() {
+        let args = serde_json::json!({"doc": true, "test_timeout_secs": 30});
+        match call_test_unfiltered(&args, None) {
+            Err(e) => assert!(
+                e.to_string().contains("test_timeout_secs"),
+                "error should mention test_timeout_secs, got {e}"
+            ),
+            Ok(_) => panic!("expected doc + test_timeout_secs to be rejected"),
+        }
+    }
+
     #[test]
     fn is_build_finished_line_matches_cargo_record() {
         // The exact compact JSON cargo emits with --message-format=json.
@@ -5087,6 +5390,40 @@ mod tests {
                 assert!(e.to_string().contains("doc: true"));
             }
             Ok(_) => panic!("expected doc + bisect to be rejected"),
+        }
+    }
+
+    #[test]
+    fn call_test_rejects_test_filter_with_test_timeout_secs() {
+        // test_filter mode has its own timeout_secs/per_test_timeout_secs
+        // budget pair instead of the plain build/execute phase split, so
+        // test_timeout_secs must be rejected rather than silently ignored.
+        let args =
+            serde_json::json!({ "test_filter": { "pattern": "x" }, "test_timeout_secs": 10 });
+        match call_test(&args, None) {
+            Err(e) => {
+                assert!(e.to_string().contains("test_timeout_secs"));
+                assert!(e.to_string().contains("test_filter"));
+            }
+            Ok(_) => panic!("expected test_filter + test_timeout_secs to be rejected"),
+        }
+    }
+
+    #[test]
+    fn call_test_rejects_bisect_with_test_timeout_secs() {
+        // The bisection engine has its own group_timeout_secs /
+        // slow_threshold_secs budget model instead of the build/execute
+        // phase split, so test_timeout_secs must be rejected.
+        let args = serde_json::json!({
+            "bisect": { "group_timeout_secs": 10 },
+            "test_timeout_secs": 10,
+        });
+        match call_test(&args, None) {
+            Err(e) => {
+                assert!(e.to_string().contains("test_timeout_secs"));
+                assert!(e.to_string().contains("bisect"));
+            }
+            Ok(_) => panic!("expected bisect + test_timeout_secs to be rejected"),
         }
     }
 

@@ -472,7 +472,7 @@ compiler diagnostics flow through the existing
 **is** stable — the discovery result is returned as structured JSON
 directly.
 
-### Timeout model: overall cap only
+### Timeout model: overall cap, plus an execution-phase override
 
 Nextest has its own per-test timeout machinery via profile config
 (`slow-timeout`, `terminate-after`). To avoid two competing watchdogs
@@ -480,6 +480,17 @@ we expose only the overall `timeout_secs` wall-clock cap (deferred-arm
 on `build-finished`, identical to `cargo_test`'s) and let nextest's
 profile do the per-test work. The tool description says so explicitly
 so callers do not expect a `per_test_timeout_secs` parameter.
+
+`test_timeout_secs` (added alongside `cargo_test`'s equivalent — see
+"`test_timeout_secs`: an execution-phase-only override" below) is the
+one exception: it overrides the EXECUTION phase's budget specifically,
+letting a caller leave the build phase unbounded while still capping
+test execution, without introducing a second per-test watchdog. It is
+resolved by the same `resolve_test_phase_timeouts` helper `cargo_test`
+uses, so the two tools' semantics never drift apart. `bisect` rejects
+`test_timeout_secs` for the same reason it isn't paired with
+`per_test_timeout_secs` — bisection has its own
+`group_timeout_secs`/`slow_threshold_secs` budget model.
 
 ### Flag remapping
 
@@ -689,6 +700,40 @@ of silently running non-doctests. `bisect` combined with `doc: true` is
 rejected for the same reason: the bisection engine builds with
 `cargo test --no-run` and never adds `--doc`, so it would silently bisect
 non-doctests instead of failing fast.
+
+### `test_timeout_secs`: an execution-phase-only override
+
+A user asked: given the build/execution phase split above, could the build
+phase be left unbounded while only test execution is capped — and if both a
+budget and this override are supplied, should the override be capped by the
+overall budget? Both "yes"; `test_timeout_secs` implements exactly that.
+
+`resolve_test_phase_timeouts(args)` is the single place that resolves the
+`(build_timeout, test_timeout)` pair from `timeout_secs` and
+`test_timeout_secs`, shared verbatim by `call_test_unfiltered` (cargo) and
+`call_run` (nextest) so the two tools can never drift apart:
+
+- Only `test_timeout_secs` set: the build phase is left **unbounded** (an
+  explicit test-specific budget signals the caller only wants execution
+  bounded), and execution gets `test_timeout_secs`.
+- Both set: execution is **clamped** to never exceed `timeout_secs` — it can
+  only tighten the budget, never loosen it beyond the overall cap.
+- Only `timeout_secs` set, or neither: unchanged pre-existing behaviour —
+  the same value (explicit or the server default) applies to both phases
+  independently.
+- Explicit `test_timeout_secs: 0` means "no override" (not "unbounded") —
+  matching the `0` = disable convention `timeout_secs` and
+  `per_test_timeout_secs` already use, so execution falls back to whatever
+  the overall budget provides.
+
+`test_timeout_secs` is rejected outright when combined with `doc: true`
+(doctests have no separate build/execute split to override — there is only
+one phase), `test_filter` (already has its own `timeout_secs` /
+`per_test_timeout_secs` pair covering an analogous but distinct model), or
+`bisect` (has its own `group_timeout_secs` / `slow_threshold_secs` model) —
+each rejection fires before the incompatible pipeline runs, mirroring the
+existing `doc`-combination rejections above rather than silently ignoring an
+unusable parameter.
 
 ## Hang / slow-test bisection (`bisect`)
 

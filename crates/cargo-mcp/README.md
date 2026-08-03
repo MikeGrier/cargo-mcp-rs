@@ -316,7 +316,7 @@ for secrets — the env block is passed verbatim to the cargo child process
 (visible via OS-level process inspection) and may be captured by future
 logging additions, so treat it as not confidential.
 
-**Timeouts (`timeout_secs` and `per_test_timeout_secs`)**
+**Timeouts (`timeout_secs`, `test_timeout_secs`, and `per_test_timeout_secs`)**
 
 Every `cargo_test` and `cargo_nextest_run` call runs in two independently
 timed phases: a **build** phase (`cargo test --no-run`) followed by a **test
@@ -337,12 +337,13 @@ rejected together with `doc: true` — doctests have no `--list`/`--exact`
 support and are always excluded from the filter/bisection pipelines, so the
 combination errors up front instead of silently running non-doctests.
 
-`cargo_test` has two independent timeout knobs with different scopes:
+`cargo_test` has three independent timeout knobs with different scopes:
 `timeout_secs` bounds both phases (build and execution), each on its own
-independent clock (see above); `per_test_timeout_secs` applies only to the
-test **execution** phase (and only in `test_filter` mode) — its clock arms
-when compilation and linking finish (cargo's `build-finished` record), so a
-slow build never trips it.
+independent clock (see above); `test_timeout_secs` overrides the execution
+phase's budget specifically (unfiltered mode only); `per_test_timeout_secs`
+applies only to the test **execution** phase (and only in `test_filter`
+mode) — its clock arms when compilation and linking finish (cargo's
+`build-finished` record), so a slow build never trips it.
 
 - **`timeout_secs`** is a hard OVERALL wall-clock cap, applied
   independently to each phase (build, then execution). Same meaning in
@@ -355,6 +356,17 @@ slow build never trips it.
     - Filter mode: **no default** — omit to let a long matched run
       complete unbounded, pass an explicit positive value to cap it.
     - Pass `0` to disable for this call regardless of the server default.
+- **`test_timeout_secs`** overrides the EXECUTION phase's budget
+  specifically, independently of `timeout_secs` which still governs the
+  build phase. Not supported together with `doc: true` (single-phase, no
+  build/execute split), `test_filter` (has its own `per_test_timeout_secs`
+  model), or `bisect` (has its own `group_timeout_secs` model) — the call
+  is rejected rather than silently ignoring it.
+    - If `timeout_secs` is omitted, the build phase is left **unbounded**.
+    - If `timeout_secs` is also set, `test_timeout_secs` is **clamped** to
+      never exceed it.
+    - Pass `0` to omit the override and fall back to `timeout_secs` (or its
+      default) for both phases.
 - **`per_test_timeout_secs`** is a per-test budget (ONLY meaningful
   when `test_filter` is set; ignored otherwise). Its semantics depend on
   the `cargo-mcp.test.perTestExecution` VS Code setting:
@@ -556,6 +568,7 @@ the summary indicates failures worth drilling into.
   "test": "integration_tests",        // optional: specific integration test target name
   "no_fail_fast": true,               // optional: run all tests even if some fail
   "timeout_secs": 0,                  // optional: overall wall-clock cap; 0 disables
+  "test_timeout_secs": 0,             // optional: overrides the execution phase's budget only (unfiltered mode)
   "per_test_timeout_secs": 30,        // optional: per-test budget (filter mode); 0 disables
   "env": { "RUST_BACKTRACE": "1" },   // optional: one-shot env for this call only
   // optional: regex-based selection.
