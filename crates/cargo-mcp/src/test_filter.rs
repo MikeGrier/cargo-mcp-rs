@@ -27,8 +27,9 @@
 //!
 //! Doctests live in a separate, rustdoc-managed harness with no
 //! `compiler-artifact` executable, no `--list`, and no `--exact`. They are
-//! intentionally excluded from filter selection; a future revision can add a
-//! parallel doctest pipeline.
+//! not selectable via this pipeline; `crate::tools::call_test` rejects
+//! `doc: true` combined with `test_filter` up front, before this module
+//! ever runs, rather than silently ignoring `doc` and running non-doctests.
 
 use std::cell::Cell;
 use std::path::{Path, PathBuf};

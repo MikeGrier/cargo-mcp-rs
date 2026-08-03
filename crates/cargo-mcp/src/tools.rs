@@ -259,7 +259,10 @@ though the execution phase reuses the cached build.\n\n\
 so `doc: true` runs skip the build/execute split and run as a single phase —\n\
 still bounded by `timeout_secs`, but on one clock instead of two, and labelled\n\
 `doc test` in any `TimeoutError`. `no_run: true` combined with `doc: true` is\n\
-rejected before cargo is spawned at all.\n\n\
+rejected before cargo is spawned at all. `test_filter` is also rejected\n\
+together with `doc: true` — doctests have no --list/--exact support and are\n\
+always excluded from filter selection, so the combination errors up front\n\
+instead of silently running non-doctests.\n\n\
 `cargo_test` has two independent timeout knobs with different scopes:\n\
 `timeout_secs` bounds BOTH phases (build and execution), each on its own\n\
 independent clock (see above); `per_test_timeout_secs` applies only to the\n\
@@ -502,7 +505,10 @@ const TREE_TARGET_DESC: &str = "Filter dependencies matching the given target tr
      (--target <TRIPLE>). Pass `all` to include all targets. Defaults to the host platform.";
 const TEST_DOC_DESC: &str = "If true, run only documentation tests (--doc). Default: false. \
      Doctests are compiled and run in a single rustdoc invocation with no build/run split, so \
-     `no_run` is not supported together with `doc: true`.";
+     `no_run` is not supported together with `doc: true`. `test_filter` is also not supported \
+     together with `doc: true` — doctests have no --list/--exact support and are always \
+     excluded from filter selection, so the call is rejected rather than silently running \
+     non-doctests.";
 const NO_RUN_DESC: &str = "If true, compile the tests but do not run them (--no-run). \
      Default: false. Not supported together with `doc: true` — cargo has no way to compile \
      doctests without running them.";
@@ -2154,9 +2160,11 @@ pub fn list() -> Value {
                              watchdog in batched mode; simple wall-clock cap in per-test \
                              mode). Mutually meaningful with `package`, `manifest_path`, \
                              `target`, `features`, `release`, and `profile`. \
-                             Mutually IGNORED: `test_name`, `exact`, `no_run`, \
-                             `no_fail_fast`, and `doc` \u{2014} doctests are not selectable \
-                             via this mode in v1.",
+                             Mutually IGNORED: `test_name`, `exact`, `no_run`, and \
+                             `no_fail_fast`. Mutually EXCLUSIVE with `doc: true` \u{2014} \
+                             doctests are not selectable via this mode in v1 and the call \
+                             is rejected with an error rather than silently running \
+                             non-doctests.",
                         "properties": {
                             "pattern": {
                                 "type": "string",
@@ -3683,6 +3691,15 @@ fn call_test(
     // under the per-test watchdog). Peek at args first so `on_progress` is
     // only handed off (and consumed) when the filter path will actually run.
     if crate::test_filter::is_filter_requested(args) {
+        if opt_bool(args, "doc") {
+            return Err(
+                "doc: true is not supported together with test_filter; doctests have no \
+                 --list/--exact support and are always excluded from filter selection, so \
+                 this combination would silently run non-doctests instead of the doctests \
+                 you asked for. Run doctests without test_filter instead."
+                    .into(),
+            );
+        }
         if let Some(result) =
             crate::test_filter::run(args, on_progress, per_test_execution_enabled())?
         {
@@ -5015,6 +5032,22 @@ mod tests {
                 assert!(e.to_string().contains("doc: true"));
             }
             Ok(_) => panic!("expected doc + no_run to be rejected"),
+        }
+    }
+
+    #[test]
+    fn call_test_rejects_doc_with_test_filter() {
+        // Doctests have no --list/--exact support and are always excluded
+        // from the test_filter pipeline; the tool must reject this
+        // combination rather than silently running non-doctests instead of
+        // the doctests the caller asked for (no working_dir needed).
+        let args = serde_json::json!({ "doc": true, "test_filter": { "pattern": "x" } });
+        match call_test(&args, None) {
+            Err(e) => {
+                assert!(e.to_string().contains("test_filter"));
+                assert!(e.to_string().contains("doc: true"));
+            }
+            Ok(_) => panic!("expected doc + test_filter to be rejected"),
         }
     }
 

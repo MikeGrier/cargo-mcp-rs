@@ -663,6 +663,10 @@ Doctests are the one exception: cargo rejects `cargo test --doc --no-run`
 build/execute split entirely and runs `cargo test --doc ...` as a single
 phase, still bounded by `timeout_secs` but on one clock. `no_run: true`
 combined with `doc: true` is rejected up front, before either phase runs.
+`test_filter` combined with `doc: true` is rejected the same way: doctests
+have no `--list`/`--exact` support and are always excluded from filter
+selection (see `test_filter.rs` module docs), so `call_test` errors instead
+of silently running non-doctests.
 
 ## Hang / slow-test bisection (`bisect`)
 
