@@ -548,6 +548,21 @@ The failure mode this fixes is specifically "wrong knob silently runs
 everything": a mismatched selection parameter now fails fast with a pointer to
 the right one instead of quietly executing the full suite.
 
+### `working_directory` alias
+
+Strict validation had an unintended side effect: `working_directory` — the
+name an LLM reaches for far more often than the actual `working_dir` key —
+was rejected outright, and its Levenshtein distance from `working_dir` (6
+edits) exceeds `closest_key`'s "did you mean" threshold, so callers got a
+plain "unknown parameter" error with no useful correction. Unlike
+`test_filter`/`per_test_timeout_secs`, there is no meaningfully different
+parameter `working_directory` could be confused with — it is purely an
+alternate spelling of the same concept for every tool that accepts it. Rather
+than special-case a hint, `tools::call` renames the key to `working_dir` via
+`normalize_working_directory_alias` before validation/dispatch ever see it
+(stripping the alias either way, so it never leaks through as "unknown" even
+when both keys are sent together — the existing `working_dir` value wins).
+
 ## `working_dir` manifest discoverability check
 
 ### Context
