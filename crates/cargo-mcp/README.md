@@ -189,8 +189,10 @@ triplet is appended when one is supplied. `cargo_test` and
 phase ends with `Cargo <verb>: build phase [profile] finished`, and the
 follow-up cache-hit check that immediately precedes test execution reads
 `Cargo <verb>: build cached [profile] — executing tests now` rather than
-a second, ambiguous "finished". This is what appears as the collapsed
-summary line in the VS Code chat history.
+a second, ambiguous "finished". Doctests (`doc: true`) have no such
+build/execute split, so their single `build-finished` is a real compile
+and reads `Cargo test: doc test [profile] finished` instead. This is what
+appears as the collapsed summary line in the VS Code chat history.
 
 For **text-mode tools** (`fmt`, `tree`, `clean`, `update`, `fix`, `add`,
 `remove`, `publish`) only the first line (the invocation header) is

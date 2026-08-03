@@ -888,20 +888,27 @@ impl BuildTracker {
                         let outcome = if ok { "finished" } else { "failed" };
                         format!("Cargo {verb}: build phase {profile}{target_suffix} {outcome}")
                     }
-                    // Phase 2 (or the single-phase doctest run): cargo
-                    // re-emits `build-finished` as a cache-hit check
-                    // immediately before running tests, so label this as
-                    // execution starting, not a second "finished".
-                    Some("test execution") | Some("doc test") if ok => {
+                    // Phase 2: cargo re-emits `build-finished` as a
+                    // cache-hit check immediately before running tests, so
+                    // label this as execution starting, not a second
+                    // "finished".
+                    Some("test execution") if ok => {
                         format!(
                             "Cargo {verb}: build cached {profile}{target_suffix} — executing \
                              tests now"
                         )
                     }
-                    Some("test execution") | Some("doc test") => format!(
+                    Some("test execution") => format!(
                         "Cargo {verb}: unexpected build failure before test execution \
                          {profile}{target_suffix}"
                     ),
+                    // Single-phase doctest run: unlike phase 2 above, this
+                    // `build-finished` is the real (and only) compile step,
+                    // not a pre-execution cache-hit check.
+                    Some("doc test") => {
+                        let outcome = if ok { "finished" } else { "failed" };
+                        format!("Cargo {verb}: doc test {profile}{target_suffix} {outcome}")
+                    }
                     _ => {
                         let outcome = if ok { "finished" } else { "failed" };
                         format!("Cargo {verb} {profile}{target_suffix} {outcome}")
@@ -1182,6 +1189,35 @@ mod tests {
         );
         let msg = t.process_line(r#"{"reason":"build-finished","success":false}"#);
         assert_eq!(msg, "Cargo check [dev] (x86_64-pc-windows-msvc) failed");
+    }
+
+    #[test]
+    fn process_line_test_execution_phase_reports_cache_hit() {
+        let mut t = BuildTracker::new("test".to_owned(), None, "[dev]".to_owned());
+        let phase = format!(
+            r#"{{"reason":"{}","phase":"test execution"}}"#,
+            tools::PROGRESS_PHASE_REASON
+        );
+        let _ = t.process_line(&phase);
+        let msg = t.process_line(r#"{"reason":"build-finished","success":true}"#);
+        assert_eq!(msg, "Cargo test: build cached [dev] — executing tests now");
+    }
+
+    #[test]
+    fn process_line_doc_test_phase_reports_real_finish_not_cache_hit() {
+        // Regression test: unlike phase 2 of the build/execute split, a
+        // single-phase doctest run's `build-finished` is a real compile, not
+        // a pre-execution cache-hit check, so it must not read "executing
+        // tests now".
+        let mut t = BuildTracker::new("test".to_owned(), None, "[dev]".to_owned());
+        let phase = format!(
+            r#"{{"reason":"{}","phase":"doc test"}}"#,
+            tools::PROGRESS_PHASE_REASON
+        );
+        let _ = t.process_line(&phase);
+        let msg = t.process_line(r#"{"reason":"build-finished","success":true}"#);
+        assert_eq!(msg, "Cargo test: doc test [dev] finished");
+        assert!(!msg.contains("executing tests now"));
     }
 
     #[test]

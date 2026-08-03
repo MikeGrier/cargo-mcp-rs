@@ -346,11 +346,17 @@ unavailable; the only levers are the literal text and the numeric counter.
   or running something. `cargo_test` / `cargo_nextest_run` run in two
   `run_phase()` calls (build, then execution) that share one `BuildTracker`;
   an `x-cargo-mcp-phase` control record injected by `run_phase` before each
-  phase lets the tracker label `build-finished` accordingly: `build phase
-  [profile] finished/failed` for the real build, and `build cached [profile]
-  — executing tests now` for the near-instant cache-hit check cargo performs
-  immediately before running tests (which would otherwise look like a second,
-  confusing "finished").
+  phase lets the tracker label `build-finished` accordingly:
+  - phase `build` — a real compile: `build phase [profile] finished/failed`
+  - phase `test execution` — the near-instant cache-hit check cargo performs
+    immediately before running tests (which would otherwise look like a
+    second, confusing "finished"): `build cached [profile] — executing
+    tests now`
+  - phase `doc test` — the single-phase doctest path's `build-finished` is a
+    *real* compile, not a pre-execution cache-hit check (doctests have no
+    build/execute split to begin with), so it gets its own message rather
+    than reusing the `test execution` cache-hit wording: `doc test [profile]
+    finished/failed`
 
 ### Format
 
@@ -359,6 +365,7 @@ Cargo check: Building serde v1.0.228 (3/15) [dev] [crates.io]
 Cargo build [release] (x86_64-pc-windows-msvc) finished
 Cargo test: build phase [dev] finished
 Cargo test: build cached [dev] — executing tests now
+Cargo test: doc test [dev] finished
 ```
 
 ## Toolchain override (`+toolchain`)
