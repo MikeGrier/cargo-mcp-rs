@@ -752,16 +752,24 @@ fn handle_tool_call(
 ///   `build-failed` message so the chat-history summary line is unambiguous
 ///   (e.g. `Cargo check (x86_64-pc-windows-msvc) finished` instead of just
 ///   `Build finished`).
-/// - `profile_tag` — a short bracketed marker for the effective compilation
-///   profile (`[D]` debug/dev, `[R]` release, `[name]` for any other named
-///   profile), so the progress line shows at a glance whether this is a
-///   debug or optimized build.
+/// - `profile_tag` — a bracketed marker naming the effective compilation
+///   profile (`[dev]`, `[release]`, `[name]` for any other named profile),
+///   so the progress line shows at a glance which profile is being built.
+/// - `phase` — which of `cargo_test`'s / `cargo_nextest_run`'s phases
+///   (`build`, `test execution`, `doc test`) is currently streaming,
+///   learned from the `x-cargo-mcp-phase` control record `run_phase`
+///   injects ahead of each phase. `None` for every other (single-phase)
+///   tool. Used to disambiguate `build-finished`, which cargo emits once
+///   per phase: a real compile at the end of phase 1, and again as an
+///   (almost always cached) precondition check right before phase 2 starts
+///   running tests.
 struct BuildTracker {
     total_count: u32,
     known_total: Option<u32>,
     verb: String,
     target: Option<String>,
     profile_tag: String,
+    phase: Option<String>,
 }
 
 impl BuildTracker {
@@ -772,6 +780,7 @@ impl BuildTracker {
             verb,
             target,
             profile_tag,
+            phase: None,
         }
     }
 
@@ -809,6 +818,12 @@ impl BuildTracker {
                 }
                 String::new()
             }
+            Some(reason) if reason == tools::PROGRESS_PHASE_REASON => {
+                // Which cargo_test / cargo_nextest_run phase is about to
+                // stream. Record it; emits no user-visible notification.
+                self.phase = v.get("phase").and_then(|p| p.as_str()).map(str::to_owned);
+                String::new()
+            }
             Some("compiler-artifact") => {
                 let fresh = v.get("fresh").and_then(|f| f.as_bool()).unwrap_or(true);
                 self.total_count += 1;
@@ -834,9 +849,9 @@ impl BuildTracker {
                 let verb = &self.verb;
                 let profile = &self.profile_tag;
                 if let Some(reg) = registry_name {
-                    format!("Cargo {verb}: {name} v{version} {counter} {profile} [{reg}]")
+                    format!("Cargo {verb}: Building {name} v{version} {counter} {profile} [{reg}]")
                 } else {
-                    format!("Cargo {verb}: {name} v{version} {counter} {profile}")
+                    format!("Cargo {verb}: Building {name} v{version} {counter} {profile}")
                 }
             }
             Some("compiler-message") => {
@@ -862,11 +877,43 @@ impl BuildTracker {
                     Some(t) => format!(" ({t})"),
                     None => String::new(),
                 };
-                let outcome = if ok { "finished" } else { "failed" };
-                format!(
-                    "Cargo {} {}{} {}",
-                    self.verb, self.profile_tag, target_suffix, outcome
-                )
+                let verb = &self.verb;
+                let profile = &self.profile_tag;
+                match self.phase.as_deref() {
+                    // Phase 1 of cargo_test / cargo_nextest_run: a real
+                    // compile just completed. Say "build phase" explicitly
+                    // rather than the ambiguous "Cargo test finished", which
+                    // reads as if the whole test run were done.
+                    Some("build") => {
+                        let outcome = if ok { "finished" } else { "failed" };
+                        format!("Cargo {verb}: build phase {profile}{target_suffix} {outcome}")
+                    }
+                    // Phase 2: cargo re-emits `build-finished` as a
+                    // cache-hit check immediately before running tests, so
+                    // label this as execution starting, not a second
+                    // "finished".
+                    Some("test execution") if ok => {
+                        format!(
+                            "Cargo {verb}: build cached {profile}{target_suffix} — executing \
+                             tests now"
+                        )
+                    }
+                    Some("test execution") => format!(
+                        "Cargo {verb}: unexpected build failure before test execution \
+                         {profile}{target_suffix}"
+                    ),
+                    // Single-phase doctest run: unlike phase 2 above, this
+                    // `build-finished` is the real (and only) compile step,
+                    // not a pre-execution cache-hit check.
+                    Some("doc test") => {
+                        let outcome = if ok { "finished" } else { "failed" };
+                        format!("Cargo {verb}: doc test {profile}{target_suffix} {outcome}")
+                    }
+                    _ => {
+                        let outcome = if ok { "finished" } else { "failed" };
+                        format!("Cargo {verb} {profile}{target_suffix} {outcome}")
+                    }
+                }
             }
             _ => String::new(),
         }
@@ -918,18 +965,13 @@ fn registry_label(pkg_id: &str) -> Option<String> {
     }
 }
 
-/// Derive a short bracketed profile marker for the progress line from the
-/// tool's `arguments`.
+/// Derive a bracketed profile marker for the progress line from the tool's
+/// `arguments`, using the real profile name rather than an abbreviation so
+/// the marker is unambiguous at a glance.
 ///
-/// - explicit `profile: "dev"` (or no profile and no `release`) → `[D]`
-/// - explicit `profile: "release"` or `release: true`           → `[R]`
-/// - `profile: "test"`                                          → `[T]`
-/// - `profile: "bench"`                                         → `[B]`
-/// - `profile: "doc"`                                           → `[doc]`
-/// - any other named profile (e.g. `my-profile`)               → `{name}`
-///
-/// Braces distinguish a custom profile name from the abbreviated markers for
-/// the well-known built-in profiles.
+/// - explicit `profile: "dev"` (or no profile and no `release`) → `[dev]`
+/// - explicit `profile: "release"` or `release: true`           → `[release]`
+/// - any other profile name (e.g. `test`, `bench`, `my-profile`) → `[name]`
 ///
 /// An explicit `profile` argument always wins over `release`, matching
 /// cargo's own precedence.
@@ -938,7 +980,7 @@ fn profile_tag(args: &Value) -> String {
     // Route through `opt_bool` so `release: "true"` / `release: 1` / etc.
     // coerce identically to how the tool dispatcher reads the same field,
     // and an unrecognised shape produces the same MCP warning rather than
-    // silently tagging a release build as `[D]`.
+    // silently tagging a release build as `[dev]`.
     let release = tools::opt_bool(args, "release");
     let name = match explicit {
         Some(p) => p,
@@ -946,12 +988,8 @@ fn profile_tag(args: &Value) -> String {
         None => "dev",
     };
     match name {
-        "dev" | "debug" => "[D]".to_owned(),
-        "release" => "[R]".to_owned(),
-        "test" => "[T]".to_owned(),
-        "bench" => "[B]".to_owned(),
-        "doc" => "[doc]".to_owned(),
-        other => format!("{{{other}}}"),
+        "dev" | "debug" => "[dev]".to_owned(),
+        other => format!("[{other}]"),
     }
 }
 
@@ -1050,35 +1088,38 @@ mod tests {
 
     #[test]
     fn profile_tag_defaults_to_debug() {
-        assert_eq!(profile_tag(&serde_json::json!({})), "[D]");
+        assert_eq!(profile_tag(&serde_json::json!({})), "[dev]");
     }
 
     #[test]
     fn profile_tag_release_flag_is_r() {
-        assert_eq!(profile_tag(&serde_json::json!({ "release": true })), "[R]");
+        assert_eq!(
+            profile_tag(&serde_json::json!({ "release": true })),
+            "[release]"
+        );
     }
 
     #[test]
     fn profile_tag_explicit_profile_wins_over_release() {
         let args = serde_json::json!({ "release": true, "profile": "dev" });
-        assert_eq!(profile_tag(&args), "[D]");
+        assert_eq!(profile_tag(&args), "[dev]");
     }
 
     #[test]
     fn profile_tag_named_profile_shown_verbatim() {
         let args = serde_json::json!({ "profile": "my-profile" });
-        assert_eq!(profile_tag(&args), "{my-profile}");
+        assert_eq!(profile_tag(&args), "[my-profile]");
     }
 
     #[test]
-    fn profile_tag_known_named_profiles_abbreviated() {
+    fn profile_tag_known_named_profiles_shown_verbatim() {
         assert_eq!(
             profile_tag(&serde_json::json!({ "profile": "test" })),
-            "[T]"
+            "[test]"
         );
         assert_eq!(
             profile_tag(&serde_json::json!({ "profile": "bench" })),
-            "[B]"
+            "[bench]"
         );
         assert_eq!(
             profile_tag(&serde_json::json!({ "profile": "doc" })),
@@ -1088,15 +1129,18 @@ mod tests {
 
     #[test]
     fn process_line_compile_line_has_cargo_prefix_and_profile() {
-        let mut t = BuildTracker::new("check".to_owned(), None, "[D]".to_owned());
+        let mut t = BuildTracker::new("check".to_owned(), None, "[dev]".to_owned());
         let line = r#"{"reason":"compiler-artifact","fresh":false,"package_id":"registry+https://github.com/rust-lang/crates.io-index#serde@1.0.228","target":{"name":"serde"}}"#;
         let msg = t.process_line(line);
-        assert_eq!(msg, "Cargo check: serde v1.0.228 (1/1) [D] [crates.io]");
+        assert_eq!(
+            msg,
+            "Cargo check: Building serde v1.0.228 (1/1) [dev] [crates.io]"
+        );
     }
 
     #[test]
     fn process_line_uses_known_total_as_denominator() {
-        let mut t = BuildTracker::new("build".to_owned(), None, "[D]".to_owned());
+        let mut t = BuildTracker::new("build".to_owned(), None, "[dev]".to_owned());
         // The control record sets the denominator and emits nothing visible.
         let ctrl = format!(
             r#"{{"reason":"{}","total_units":120}}"#,
@@ -1106,12 +1150,15 @@ mod tests {
         let line = r#"{"reason":"compiler-artifact","fresh":false,"package_id":"registry+https://github.com/rust-lang/crates.io-index#serde@1.0.228","target":{"name":"serde"}}"#;
         let msg = t.process_line(line);
         // First processed crate against the up-front total of 120.
-        assert_eq!(msg, "Cargo build: serde v1.0.228 (1/120) [D] [crates.io]");
+        assert_eq!(
+            msg,
+            "Cargo build: Building serde v1.0.228 (1/120) [dev] [crates.io]"
+        );
     }
 
     #[test]
     fn process_line_known_total_clamps_to_streamed_count() {
-        let mut t = BuildTracker::new("build".to_owned(), None, "[D]".to_owned());
+        let mut t = BuildTracker::new("build".to_owned(), None, "[dev]".to_owned());
         let ctrl = format!(
             r#"{{"reason":"{}","total_units":1}}"#,
             tools::PROGRESS_TOTAL_REASON
@@ -1123,14 +1170,14 @@ mod tests {
         let b = r#"{"reason":"compiler-artifact","fresh":false,"package_id":"path+file:///x#b@0.1.0","target":{"name":"b"}}"#;
         let _ = t.process_line(a);
         let msg = t.process_line(b);
-        assert!(msg.ends_with("(2/2) [D]"), "got: {msg}");
+        assert!(msg.ends_with("(2/2) [dev]"), "got: {msg}");
     }
 
     #[test]
     fn process_line_finished_has_cargo_prefix_and_profile() {
-        let mut t = BuildTracker::new("build".to_owned(), None, "[R]".to_owned());
+        let mut t = BuildTracker::new("build".to_owned(), None, "[release]".to_owned());
         let msg = t.process_line(r#"{"reason":"build-finished","success":true}"#);
-        assert_eq!(msg, "Cargo build [R] finished");
+        assert_eq!(msg, "Cargo build [release] finished");
     }
 
     #[test]
@@ -1138,10 +1185,39 @@ mod tests {
         let mut t = BuildTracker::new(
             "check".to_owned(),
             Some("x86_64-pc-windows-msvc".to_owned()),
-            "[D]".to_owned(),
+            "[dev]".to_owned(),
         );
         let msg = t.process_line(r#"{"reason":"build-finished","success":false}"#);
-        assert_eq!(msg, "Cargo check [D] (x86_64-pc-windows-msvc) failed");
+        assert_eq!(msg, "Cargo check [dev] (x86_64-pc-windows-msvc) failed");
+    }
+
+    #[test]
+    fn process_line_test_execution_phase_reports_cache_hit() {
+        let mut t = BuildTracker::new("test".to_owned(), None, "[dev]".to_owned());
+        let phase = format!(
+            r#"{{"reason":"{}","phase":"test execution"}}"#,
+            tools::PROGRESS_PHASE_REASON
+        );
+        let _ = t.process_line(&phase);
+        let msg = t.process_line(r#"{"reason":"build-finished","success":true}"#);
+        assert_eq!(msg, "Cargo test: build cached [dev] — executing tests now");
+    }
+
+    #[test]
+    fn process_line_doc_test_phase_reports_real_finish_not_cache_hit() {
+        // Regression test: unlike phase 2 of the build/execute split, a
+        // single-phase doctest run's `build-finished` is a real compile, not
+        // a pre-execution cache-hit check, so it must not read "executing
+        // tests now".
+        let mut t = BuildTracker::new("test".to_owned(), None, "[dev]".to_owned());
+        let phase = format!(
+            r#"{{"reason":"{}","phase":"doc test"}}"#,
+            tools::PROGRESS_PHASE_REASON
+        );
+        let _ = t.process_line(&phase);
+        let msg = t.process_line(r#"{"reason":"build-finished","success":true}"#);
+        assert_eq!(msg, "Cargo test: doc test [dev] finished");
+        assert!(!msg.contains("executing tests now"));
     }
 
     #[test]

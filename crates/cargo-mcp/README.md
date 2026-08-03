@@ -178,13 +178,21 @@ output shape for `cargo_test` is therefore:
 {x-cargo-mcp-stderr}               ← optional, when stderr non-empty
 ```
 
-While the build runs, streaming progress notifications are also emitted;
-the final notification reads `Cargo <verb> [D] finished` (or `failed`),
-where the profile tag marks the effective profile — `[D]` dev/debug, `[R]`
-release, `[T]` test, `[B]` bench, `[doc]` doc, or `{name}` (in braces) for
-any other custom profile — and the optional target triplet is appended when
-one is supplied. This is what appears as the collapsed summary line in the
-VS Code chat history.
+While the build runs, streaming progress notifications are also emitted.
+Each newly-compiled crate is announced as
+`Cargo <verb>: Building <name> v<version> (n/total) [profile]`, and the
+final notification reads `Cargo <verb> [profile] finished` (or `failed`),
+where the profile tag names the effective profile in brackets (`[dev]`,
+`[release]`, or any other profile name verbatim) and the optional target
+triplet is appended when one is supplied. `cargo_test` and
+`cargo_nextest_run` additionally distinguish their two phases: the build
+phase ends with `Cargo <verb>: build phase [profile] finished`, and the
+follow-up cache-hit check that immediately precedes test execution reads
+`Cargo <verb>: build cached [profile] — executing tests now` rather than
+a second, ambiguous "finished". Doctests (`doc: true`) have no such
+build/execute split, so their single `build-finished` is a real compile
+and reads `Cargo test: doc test [profile] finished` instead. This is what
+appears as the collapsed summary line in the VS Code chat history.
 
 For **text-mode tools** (`fmt`, `tree`, `clean`, `update`, `fix`, `add`,
 `remove`, `publish`) only the first line (the invocation header) is
@@ -308,7 +316,7 @@ for secrets — the env block is passed verbatim to the cargo child process
 (visible via OS-level process inspection) and may be captured by future
 logging additions, so treat it as not confidential.
 
-**Timeouts (`timeout_secs` and `per_test_timeout_secs`)**
+**Timeouts (`timeout_secs`, `test_timeout_secs`, and `per_test_timeout_secs`)**
 
 Every `cargo_test` and `cargo_nextest_run` call runs in two independently
 timed phases: a **build** phase (`cargo test --no-run`) followed by a **test
@@ -319,12 +327,23 @@ execution phase` — so a slow compile is distinguishable from a hung test.
 Build-phase compiler warnings are preserved in the combined output even though
 the execution phase reuses the cached build.
 
-`cargo_test` has two independent timeout knobs with different scopes:
+**Doctests are the one exception to the two-phase split.** Cargo rejects
+`cargo test --doc --no-run` (`can't skip running doc tests with --no-run`), so
+`doc: true` runs skip the build/execute split and run as a single phase —
+still bounded by `timeout_secs`, but on one clock instead of two, and labelled
+`doc test` in any `TimeoutError`. `no_run: true` combined with `doc: true` is
+rejected before cargo is spawned at all. `test_filter` and `bisect` are also
+rejected together with `doc: true` — doctests have no `--list`/`--exact`
+support and are always excluded from the filter/bisection pipelines, so the
+combination errors up front instead of silently running non-doctests.
+
+`cargo_test` has three independent timeout knobs with different scopes:
 `timeout_secs` bounds both phases (build and execution), each on its own
-independent clock (see above); `per_test_timeout_secs` applies only to the
-test **execution** phase (and only in `test_filter` mode) — its clock arms
-when compilation and linking finish (cargo's `build-finished` record), so a
-slow build never trips it.
+independent clock (see above); `test_timeout_secs` overrides the execution
+phase's budget specifically (unfiltered mode only); `per_test_timeout_secs`
+applies only to the test **execution** phase (and only in `test_filter`
+mode) — its clock arms when compilation and linking finish (cargo's
+`build-finished` record), so a slow build never trips it.
 
 - **`timeout_secs`** is a hard OVERALL wall-clock cap, applied
   independently to each phase (build, then execution). Same meaning in
@@ -337,6 +356,17 @@ slow build never trips it.
     - Filter mode: **no default** — omit to let a long matched run
       complete unbounded, pass an explicit positive value to cap it.
     - Pass `0` to disable for this call regardless of the server default.
+- **`test_timeout_secs`** overrides the EXECUTION phase's budget
+  specifically, independently of `timeout_secs` which still governs the
+  build phase. Not supported together with `doc: true` (single-phase, no
+  build/execute split), `test_filter` (has its own `per_test_timeout_secs`
+  model), or `bisect` (has its own `group_timeout_secs` model) — the call
+  is rejected rather than silently ignoring it.
+    - If `timeout_secs` is omitted, the build phase is left **unbounded**.
+    - If `timeout_secs` is also set, `test_timeout_secs` is **clamped** to
+      never exceed it.
+    - Pass `0` to omit the override and fall back to `timeout_secs` (or its
+      default) for both phases.
 - **`per_test_timeout_secs`** is a per-test budget (ONLY meaningful
   when `test_filter` is set; ignored otherwise). Its semantics depend on
   the `cargo-mcp.test.perTestExecution` VS Code setting:
@@ -538,6 +568,7 @@ the summary indicates failures worth drilling into.
   "test": "integration_tests",        // optional: specific integration test target name
   "no_fail_fast": true,               // optional: run all tests even if some fail
   "timeout_secs": 0,                  // optional: overall wall-clock cap; 0 disables
+  "test_timeout_secs": 0,             // optional: overrides the execution phase's budget only (unfiltered mode)
   "per_test_timeout_secs": 30,        // optional: per-test budget (filter mode); 0 disables
   "env": { "RUST_BACKTRACE": "1" },   // optional: one-shot env for this call only
   // optional: regex-based selection.

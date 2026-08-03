@@ -325,28 +325,47 @@ unavailable; the only levers are the literal text and the numeric counter.
 
 ### Decisions
 
-- **`Cargo ` prefix.** Lines now read `Cargo check: …` / `Cargo build [R]
+- **`Cargo ` prefix.** Lines now read `Cargo check: …` / `Cargo build [release]
   finished` rather than the bare `check:` / `cargo …`. The leading word is an
   unfortunate use of width but, without it, the collapsed history line loses
   too much context about which tool produced it.
-- **Profile tag.** Every per-crate and `build-finished` line carries a short
-  bracketed marker for the effective compilation profile:
-  - `[D]` — debug/dev (the default when neither `release` nor `profile` is set)
-  - `[R]` — release (`release: true` or `profile: "release"`)
-  - `[T]` — test (`profile: "test"`)
-  - `[B]` — bench (`profile: "bench"`)
-  - `[doc]` — doc (`profile: "doc"`)
-  - `{name}` — any other custom profile, shown verbatim in braces to set it
-    apart from the abbreviated built-in markers
+- **Profile tag.** Every per-crate and `build-finished` line carries a
+  bracketed marker naming the effective compilation profile verbatim:
+  - `[dev]` — debug/dev (the default when neither `release` nor `profile` is set)
+  - `[release]` — release (`release: true` or `profile: "release"`)
+  - `[name]` — any other profile (e.g. `[test]`, `[bench]`, `[doc]`,
+    `[my-profile]`), shown as-is rather than abbreviated
   An explicit `profile` argument wins over `release`, matching cargo's own
   precedence. Implemented in `profile_tag()` and threaded through
-  `BuildTracker`.
+  `BuildTracker`. (Earlier revisions abbreviated the built-in profiles to
+  single letters — `[D]`/`[R]`/`[T]`/`[B]` — with custom names in braces;
+  that was dropped as needlessly cryptic in favour of the plain name.)
+- **`Building` indicator and phase-aware `build-finished`.** Per-crate
+  compile lines are prefixed with `Building` (e.g. `Building serde v1.0.228
+  …`) so a progress line is never ambiguous about whether cargo is compiling
+  or running something. `cargo_test` / `cargo_nextest_run` run in two
+  `run_phase()` calls (build, then execution) that share one `BuildTracker`;
+  an `x-cargo-mcp-phase` control record injected by `run_phase` before each
+  phase lets the tracker label `build-finished` accordingly:
+  - phase `build` — a real compile: `build phase [profile] finished/failed`
+  - phase `test execution` — the near-instant cache-hit check cargo performs
+    immediately before running tests (which would otherwise look like a
+    second, confusing "finished"): `build cached [profile] — executing
+    tests now`
+  - phase `doc test` — the single-phase doctest path's `build-finished` is a
+    *real* compile, not a pre-execution cache-hit check (doctests have no
+    build/execute split to begin with), so it gets its own message rather
+    than reusing the `test execution` cache-hit wording: `doc test [profile]
+    finished/failed`
 
 ### Format
 
 ```
-Cargo check: serde v1.0.228 (3/15) [D] [crates.io]
-Cargo build [R] (x86_64-pc-windows-msvc) finished
+Cargo check: Building serde v1.0.228 (3/15) [dev] [crates.io]
+Cargo build [release] (x86_64-pc-windows-msvc) finished
+Cargo test: build phase [dev] finished
+Cargo test: build cached [dev] — executing tests now
+Cargo test: doc test [dev] finished
 ```
 
 ## Toolchain override (`+toolchain`)
@@ -453,7 +472,7 @@ compiler diagnostics flow through the existing
 **is** stable — the discovery result is returned as structured JSON
 directly.
 
-### Timeout model: overall cap only
+### Timeout model: overall cap, plus an execution-phase override
 
 Nextest has its own per-test timeout machinery via profile config
 (`slow-timeout`, `terminate-after`). To avoid two competing watchdogs
@@ -461,6 +480,17 @@ we expose only the overall `timeout_secs` wall-clock cap (deferred-arm
 on `build-finished`, identical to `cargo_test`'s) and let nextest's
 profile do the per-test work. The tool description says so explicitly
 so callers do not expect a `per_test_timeout_secs` parameter.
+
+`test_timeout_secs` (added alongside `cargo_test`'s equivalent — see
+"`test_timeout_secs`: an execution-phase-only override" below) is the
+one exception: it overrides the EXECUTION phase's budget specifically,
+letting a caller leave the build phase unbounded while still capping
+test execution, without introducing a second per-test watchdog. It is
+resolved by the same `resolve_test_phase_timeouts` helper `cargo_test`
+uses, so the two tools' semantics never drift apart. `bisect` rejects
+`test_timeout_secs` for the same reason it isn't paired with
+`per_test_timeout_secs` — bisection has its own
+`group_timeout_secs`/`slow_threshold_secs` budget model.
 
 ### Flag remapping
 
@@ -657,6 +687,53 @@ execution phase's stdout before the existing `format_test_output` /
 `format_nextest_run_output` formats the combined stream. The execution phase's
 exit code is authoritative. The pre-existing `test_filter` path already builds
 (`--no-run` enumerate) before executing, so it was left unchanged.
+
+Doctests are the one exception: cargo rejects `cargo test --doc --no-run`
+(`can't skip running doc tests with --no-run`), so `doc: true` bypasses the
+build/execute split entirely and runs `cargo test --doc ...` as a single
+phase, still bounded by `timeout_secs` but on one clock. `no_run: true`
+combined with `doc: true` is rejected up front, before either phase runs.
+`test_filter` combined with `doc: true` is rejected the same way: doctests
+have no `--list`/`--exact` support and are always excluded from filter
+selection (see `test_filter.rs` module docs), so `call_test` errors instead
+of silently running non-doctests. `bisect` combined with `doc: true` is
+rejected for the same reason: the bisection engine builds with
+`cargo test --no-run` and never adds `--doc`, so it would silently bisect
+non-doctests instead of failing fast.
+
+### `test_timeout_secs`: an execution-phase-only override
+
+A user asked: given the build/execution phase split above, could the build
+phase be left unbounded while only test execution is capped — and if both a
+budget and this override are supplied, should the override be capped by the
+overall budget? Both "yes"; `test_timeout_secs` implements exactly that.
+
+`resolve_test_phase_timeouts(args)` is the single place that resolves the
+`(build_timeout, test_timeout)` pair from `timeout_secs` and
+`test_timeout_secs`, shared verbatim by `call_test_unfiltered` (cargo) and
+`call_run` (nextest) so the two tools can never drift apart:
+
+- Only `test_timeout_secs` set: the build phase is left **unbounded** (an
+  explicit test-specific budget signals the caller only wants execution
+  bounded), and execution gets `test_timeout_secs`.
+- Both set: execution is **clamped** to never exceed `timeout_secs` — it can
+  only tighten the budget, never loosen it beyond the overall cap.
+- Only `timeout_secs` set, or neither: unchanged pre-existing behaviour —
+  the same value (explicit or the server default) applies to both phases
+  independently.
+- Explicit `test_timeout_secs: 0` means "no override" (not "unbounded") —
+  matching the `0` = disable convention `timeout_secs` and
+  `per_test_timeout_secs` already use, so execution falls back to whatever
+  the overall budget provides.
+
+`test_timeout_secs` is rejected outright when combined with `doc: true`
+(doctests have no separate build/execute split to override — there is only
+one phase), `test_filter` (already has its own `timeout_secs` /
+`per_test_timeout_secs` pair covering an analogous but distinct model), or
+`bisect` (has its own `group_timeout_secs` / `slow_threshold_secs` model) —
+each rejection fires before the incompatible pipeline runs, mirroring the
+existing `doc`-combination rejections above rather than silently ignoring an
+unusable parameter.
 
 ## Hang / slow-test bisection (`bisect`)
 

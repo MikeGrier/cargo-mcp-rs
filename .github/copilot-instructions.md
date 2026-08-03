@@ -219,6 +219,16 @@ Build-phase compiler warnings are preserved in the combined output even though
 the execution phase reuses the cached build. If a build fails, the build output
 (compile errors) is returned and the execution phase is skipped.
 
+**Doctests are the one exception to the two-phase split.** Cargo rejects
+`cargo test --doc --no-run` (`can't skip running doc tests with --no-run`), so
+`doc: true` runs skip the build/execute split and run as a single phase —
+still bounded by `timeout_secs`, but on one clock instead of two, and labelled
+`doc test` in any `TimeoutError`. `no_run: true` combined with `doc: true` is
+rejected before cargo is spawned at all. `test_filter` and `bisect` are also
+rejected together with `doc: true` — doctests have no `--list`/`--exact`
+support and are always excluded from the filter/bisection pipelines, so the
+combination errors up front instead of silently running non-doctests.
+
 `cargo_test` has two independent timeout knobs with different scopes.
 `timeout_secs` bounds BOTH phases (build and execution), each on its own
 independent clock (see above). `per_test_timeout_secs` applies only to the
@@ -243,6 +253,24 @@ slow system.
   tests; the overall cap is only for bounding total wall time.)
 - Pass `timeout_secs: 0` to disable the overall cap for this run
   regardless of the server default.
+
+**`test_timeout_secs` — execution-phase-only override (unfiltered mode).**
+Overrides the EXECUTION phase's budget specifically, independently of
+`timeout_secs` which still governs the build phase. Not supported together
+with `doc: true` (single-phase, no build/execute split), `test_filter` (has
+its own `per_test_timeout_secs` model), or `bisect` (has its own
+`group_timeout_secs` model) — the call is rejected rather than silently
+ignoring it.
+
+- If `timeout_secs` is omitted, the build phase is left **unbounded** —
+  supplying only a test-specific budget signals you want to bound
+  execution alone.
+- If `timeout_secs` is also set, `test_timeout_secs` is **clamped** to
+  never exceed it — it can only tighten the execution budget, not loosen
+  it beyond the overall cap.
+- Pass `test_timeout_secs: 0` to omit the override and fall back to
+  `timeout_secs` (or its default) for both phases, same as leaving it
+  unset.
 
 **`per_test_timeout_secs` — per-test idle watchdog.** Only meaningful when
 `test_filter` is set; **ignored otherwise**. Arms on the per-binary
@@ -272,6 +300,9 @@ When to override the budgets:
   slow — long integration suites, tests that internally sleep or poll,
   benchmark-style tests. Better to disable for one call than chase a
   spurious `TimeoutError`.
+- **Set `test_timeout_secs`** when you want the build left unbounded (a
+  cold-cache first run, or a package with a known-slow build) while still
+  capping how long test execution itself may run.
 - **Raise / disable `per_test_timeout_secs`** for filter runs where a
   single matched test legitimately takes longer than the default (e.g.
   an integration test that bootstraps a fixture). The clock resets on
