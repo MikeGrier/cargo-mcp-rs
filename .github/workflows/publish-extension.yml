@@ -121,6 +121,8 @@ jobs:
         uses: actions/setup-node@v5
         with:
           node-version: "22"
+          cache: npm
+          cache-dependency-path: crates/cargo-mcp/extension/package-lock.json
 
       - name: npm ci (extension)
         working-directory: crates/cargo-mcp/extension
@@ -193,6 +195,8 @@ jobs:
         uses: actions/setup-node@v5
         with:
           node-version: "22"
+          cache: npm
+          cache-dependency-path: crates/cargo-mcp/extension/package-lock.json
 
       - name: Install @vscode/vsce
         working-directory: crates/cargo-mcp/extension
