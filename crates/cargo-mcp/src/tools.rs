@@ -1776,6 +1776,50 @@ pub(crate) fn combine_build_and_exec_output(
 
 // ── tool list ─────────────────────────────────────────────────────────────────
 
+/// JSON schema for `test_filter` on `cargo_nextest_run`/`cargo_nextest_list`.
+/// Unlike `cargo_test`'s `test_filter` (its own build/enumerate/`--exact`
+/// pipeline), here the same `{ pattern, include_ignored }` shape is
+/// translated automatically into nextest's native `test(/pattern/)`
+/// filterset expression (plus `--run-ignored all` when `include_ignored` is
+/// true) — see `nextest::translate_test_filter`. This exists purely to
+/// absorb the common cross-tool mistake of reaching for `test_filter` on
+/// nextest out of `cargo_test` habit, turning what used to be a rejected
+/// "unknown parameter" into the intended selection.
+fn nextest_test_filter_schema() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "description":
+            "Regex-based test selection, same shape as `cargo_test`'s `test_filter`. \
+             Automatically translated into an equivalent nextest filterset expression \
+             (`test(/pattern/)`, passed via `-E`) plus `--run-ignored all` when \
+             `include_ignored` is true \u{2014} nextest itself performs the regex \
+             matching, so no separate enumerate/match step is needed. Not supported \
+             together with `filter_expr`, `filter`, or `run_ignored`: `test_filter` is \
+             already translated into all of those internally, so supplying one directly \
+             as well is ambiguous and the call is rejected. Prefer `filter_expr` directly \
+             if you need nextest's fuller filterset DSL (AND/OR, `kind()`, `binary()`, \
+             etc.) or if `pattern` must contain a literal `/`, which this translation \
+             cannot express (nextest's `/regex/` delimiter has no escape for it).",
+        "properties": {
+            "pattern": {
+                "type": "string",
+                "description":
+                    "RE2-style regular expression (the `regex` crate's flavor), matched \
+                     by nextest against each test's full name. Must not contain a literal \
+                     `/` (see above). Example: `^(my_mod::a|my_mod::b)$`."
+            },
+            "include_ignored": {
+                "type": "boolean",
+                "description":
+                    "If true, translated to `--run-ignored all` (run both ignored and \
+                     non-ignored tests). Default: false (nextest's default `--run-ignored` \
+                     behavior, i.e. ignored tests are skipped)."
+            }
+        },
+        "required": ["pattern"]
+    })
+}
+
 /// JSON schema for the `bisect` object shared by `cargo_test` and
 /// `cargo_nextest_run`. Presence of this object switches the tool into the
 /// hang/slow-test bisection engine (see [`crate::bisect`]).
@@ -2168,7 +2212,16 @@ pub fn list() -> Value {
                         "type": "string",
                         "description":
                             "Filter: only run tests whose name contains this string. \
-                             Passed as a positional argument after `--` to the test harness."
+                             Passed as a positional argument after `--` to the test harness. \
+                             Not supported together with `filter` (see below)."
+                    },
+                    "filter": {
+                        "type": "string",
+                        "description":
+                            "Alias for `test_name`, accepted here for cross-tool convenience \
+                             since it is nextest's own substring-filter parameter name. \
+                             Automatically treated as `test_name`. Not supported together \
+                             with `test_name`."
                     },
                     "release": {
                         "type": "boolean",
@@ -3022,8 +3075,13 @@ pub fn list() -> Value {
                  Prefer this over `cargo_test` when the workspace contains a \
                  `.config/nextest.toml`, when the user asks for nextest, or when you \
                  want per-test process isolation, built-in flaky-test retries, or \
-                 nextest's filter expressions. NOTE: nextest does NOT support \
-                 doctests \u{2014} use `cargo_test` with `doc: true` for those. \
+                 nextest's filter expressions. Use `filter` (substring) or `filter_expr` \
+                 (the nextest `-E` filterset DSL) to select tests; `test_filter` and \
+                 `test_name`/`exact` (the same shapes `cargo_test` uses) are ALSO \
+                 accepted here and automatically translated into the equivalent \
+                 `filter_expr`/`filter` \u{2014} use whichever you already have in mind. \
+                 NOTE: nextest does NOT support doctests \u{2014} use `cargo_test` with \
+                 `doc: true` for those. \
                  If cargo-nextest is not installed the tool returns an error whose \
                  body contains fenced install commands; VS Code Copilot Chat will \
                  render those with **Copy** and **Run in Terminal** buttons. \
@@ -3114,6 +3172,18 @@ pub fn list() -> Value {
                     "filter":      { "type": "string", "description":
                         "Bare positional test-name substring filter (cargo-test-compatible). \
                          Combined with `filter_expr` when both are supplied (both apply)." },
+                    "test_filter": nextest_test_filter_schema(),
+                    "test_name": { "type": "string", "description":
+                        "Same shape as `cargo_test`'s `test_name`, accepted here for \
+                         cross-tool convenience. Automatically translated: alone it \
+                         becomes the `filter` substring argument; combined with \
+                         `exact: true` it becomes `test(=name)`. Not supported together \
+                         with `filter`, `filter_expr`, or `test_filter`." },
+                    "exact": { "type": "boolean", "description":
+                        "Only meaningful together with `test_name` (silently ignored \
+                         otherwise, matching `cargo_test`'s own behavior): if true, the \
+                         translated selection matches the test name exactly instead of \
+                         as a substring. Default: false." },
 
                     "target":              { "type": "string",  "description": TARGET_DESC },
                     "target_dir":          { "type": "string",  "description": TARGET_DIR_DESC },
@@ -3218,6 +3288,14 @@ pub fn list() -> Value {
                          https://nexte.st/docs/filtersets." },
                     "filter":      { "type": "string", "description":
                         "Bare positional test-name substring filter." },
+                    "test_filter": nextest_test_filter_schema(),
+                    "test_name": { "type": "string", "description":
+                        "Same shape as `cargo_test`'s `test_name`, translated the same way \
+                         as on `cargo_nextest_run` (see that tool's description). Not \
+                         supported together with `filter`, `filter_expr`, or `test_filter`." },
+                    "exact": { "type": "boolean", "description":
+                        "Only meaningful together with `test_name`; if true, matches \
+                         exactly instead of as a substring. Default: false." },
 
                     "list_type":      { "type": "string", "enum": ["full", "binaries-only"],
                         "description":
@@ -3279,24 +3357,22 @@ fn tool_arg_schema() -> &'static std::collections::HashMap<String, std::collecti
 /// LLM commonly sends to the wrong tool. Returning a precise hint here is far
 /// more useful than a generic "did you mean" suggestion, because these are
 /// not typos but valid-elsewhere parameters that would otherwise be silently
-/// dropped and cause a runaway run (e.g. a `test_filter` meant for
-/// `cargo_test` passed to `cargo_nextest_run`, which then runs the entire
-/// suite).
+/// dropped and cause a runaway run (e.g. `test_name`, a `cargo_test`-only
+/// parameter, passed to `cargo_nextest_run`, which then runs the entire
+/// suite instead of the intended subset).
 fn cross_tool_hint(tool: &str, key: &str) -> Option<&'static str> {
     match (tool, key) {
-        ("cargo_nextest_run" | "cargo_nextest_list", "test_filter") => Some(
-            "`test_filter` is a `cargo_test`-only regex parameter and is NOT honoured by \
-             nextest. For nextest use `filter` (a plain substring) or `filter_expr` (the \
-             nextest `-E` filterset DSL).",
-        ),
+        // NOTE: `test_filter` and `test_name`/`exact` are deliberately NOT
+        // listed here — they are legitimate parameters on
+        // `cargo_nextest_run`/`cargo_nextest_list` now (see their schema
+        // entries): the server translates `test_filter`'s regex `pattern`
+        // into an equivalent `test(/pattern/)` filterset expression, and
+        // `test_name`/`exact` into `filter`/`test(=name)`, automatically —
+        // so neither is ever an "unknown parameter".
         ("cargo_nextest_run" | "cargo_nextest_list", "per_test_timeout_secs") => Some(
             "nextest has no per-test-timeout parameter here \u{2014} configure `slow-timeout` / \
              `terminate-after` in `.config/nextest.toml`, and use `timeout_secs` for an \
              overall wall-clock cap.",
-        ),
-        ("cargo_nextest_run" | "cargo_nextest_list", "test_name") => Some(
-            "use `filter` (substring) or `filter_expr` (nextest `-E` expression) instead of \
-             `test_name`.",
         ),
         ("cargo_nextest_run" | "cargo_nextest_list", "jobs") => Some(
             "nextest splits cargo-test's `jobs`: use `build_jobs` for build parallelism or \
@@ -3309,9 +3385,16 @@ fn cross_tool_hint(tool: &str, key: &str) -> Option<&'static str> {
         ("cargo_nextest_run", "doc") => {
             Some("nextest cannot run doctests; use `cargo_test` with `doc: true` for those.")
         }
-        ("cargo_test", "filter") | ("cargo_test", "filter_expr") => Some(
-            "`filter`/`filter_expr` are nextest parameters. For `cargo_test` use `test_name` \
-             (substring) or `test_filter` (regex selection).",
+        // `filter` is NOT listed here — it is now a legitimate `cargo_test`
+        // parameter (translated into `test_name`, see its schema entry).
+        // `filter_expr` has no equivalent: nextest's filterset DSL (boolean
+        // combinators, package/kind/binary predicates, glob/regex matchers)
+        // cannot be mechanically reduced to libtest's single substring/exact
+        // name filter, so it stays rejected.
+        ("cargo_test", "filter_expr") => Some(
+            "`filter_expr` is nextest's filterset DSL, which has no `cargo_test` equivalent \
+             beyond `test_name` (substring) or `test_filter` (regex selection) \u{2014} it \
+             cannot be mechanically translated.",
         ),
         _ => None,
     }
@@ -3906,6 +3989,25 @@ fn call_test(
     call_test_unfiltered(args, on_progress)
 }
 
+/// Resolve `cargo_test`'s test-name selector from `test_name` and/or its
+/// nextest-alias `filter` (accepted here for cross-tool convenience, since
+/// both are plain libtest-compatible substring filters). Supplying both is
+/// rejected as ambiguous rather than silently preferring one.
+fn resolve_test_name(args: &Value) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let test_name = opt_str(args, "test_name").map(String::from);
+    let filter = opt_str(args, "filter").map(String::from);
+    match (test_name, filter) {
+        (Some(_), Some(_)) => Err(
+            "test_name and filter are not supported together on cargo_test; `filter` is \
+             automatically treated as an alias for `test_name`, so supplying both is \
+             ambiguous. Pass just one."
+                .into(),
+        ),
+        (Some(n), None) | (None, Some(n)) => Ok(Some(n)),
+        (None, None) => Ok(None),
+    }
+}
+
 fn call_test_unfiltered(
     args: &Value,
     on_progress: Option<&mut dyn FnMut(&str)>,
@@ -3917,7 +4019,7 @@ fn call_test_unfiltered(
     }
     let tc = toolchain_arg(args);
     let o = CommonOpts::from_args(args);
-    let test_name = opt_str(args, "test_name").map(String::from);
+    let test_name = resolve_test_name(args)?;
 
     // Build the selector set shared by both phases (everything except the
     // `--no-run` build flag and the `--` test-harness arguments, which differ
@@ -5313,16 +5415,32 @@ mod tests {
     }
 
     #[test]
-    fn validate_known_args_rejects_cross_tool_test_filter_on_nextest() {
-        // The exact mistake that caused full-suite timeouts: a cargo_test
-        // parameter routed to cargo_nextest_run.
+    fn validate_known_args_accepts_test_filter_on_nextest() {
+        // `test_filter` used to be the exact mistake that caused full-suite
+        // timeouts (a cargo_test parameter routed to cargo_nextest_run,
+        // rejected as unknown). It is now a legitimate parameter, translated
+        // internally into an equivalent `filter_expr`.
         let args = serde_json::json!({ "test_filter": { "pattern": "x" } });
-        let err = validate_known_args("cargo_nextest_run", &args).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("test_filter"));
-        // The curated cross-tool hint must name the correct nextest knobs.
-        assert!(msg.contains("filter_expr"));
-        assert!(msg.contains("Valid parameters"));
+        assert!(validate_known_args("cargo_nextest_run", &args).is_ok());
+        assert!(validate_known_args("cargo_nextest_list", &args).is_ok());
+    }
+
+    #[test]
+    fn validate_known_args_accepts_test_name_and_exact_on_nextest() {
+        // Same cross-tool-habit story as `test_filter`: `test_name`/`exact`
+        // are cargo_test parameters, now translated automatically instead
+        // of rejected as unknown on the nextest tools.
+        let args = serde_json::json!({ "test_name": "x", "exact": true });
+        assert!(validate_known_args("cargo_nextest_run", &args).is_ok());
+        assert!(validate_known_args("cargo_nextest_list", &args).is_ok());
+    }
+
+    #[test]
+    fn validate_known_args_accepts_filter_on_cargo_test() {
+        // The inverse habit: `filter` is nextest's own substring parameter,
+        // now translated into `test_name` on cargo_test instead of rejected.
+        let args = serde_json::json!({ "filter": "x" });
+        assert!(validate_known_args("cargo_test", &args).is_ok());
     }
 
     #[test]
@@ -5524,6 +5642,40 @@ mod tests {
                 assert!(e.to_string().contains("bisect"));
             }
             Ok(_) => panic!("expected bisect + test_timeout_secs to be rejected"),
+        }
+    }
+
+    #[test]
+    fn resolve_test_name_prefers_either_single_source() {
+        assert_eq!(resolve_test_name(&serde_json::json!({})).unwrap(), None);
+        assert_eq!(
+            resolve_test_name(&serde_json::json!({ "test_name": "a" })).unwrap(),
+            Some("a".to_owned())
+        );
+        assert_eq!(
+            resolve_test_name(&serde_json::json!({ "filter": "b" })).unwrap(),
+            Some("b".to_owned())
+        );
+    }
+
+    #[test]
+    fn resolve_test_name_rejects_both_test_name_and_filter() {
+        let args = serde_json::json!({ "test_name": "a", "filter": "b" });
+        let err = resolve_test_name(&args).unwrap_err();
+        assert!(err.to_string().contains("test_name"));
+        assert!(err.to_string().contains("filter"));
+    }
+
+    #[test]
+    fn call_test_rejects_test_name_with_filter() {
+        // Rejected before any cargo subprocess is spawned.
+        let args = serde_json::json!({ "test_name": "a", "filter": "b" });
+        match call_test(&args, None) {
+            Err(e) => {
+                assert!(e.to_string().contains("test_name"));
+                assert!(e.to_string().contains("filter"));
+            }
+            Ok(_) => panic!("expected test_name + filter to be rejected"),
         }
     }
 

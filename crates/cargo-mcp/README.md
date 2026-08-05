@@ -467,6 +467,26 @@ module"). Don't use it for first-time runs of an unfamiliar suite
 (plain `cargo_test` is faster when you want everything) or for
 doctests.
 
+`test_filter` is also accepted on `cargo_nextest_run` / `cargo_nextest_list`,
+using the exact same `{ pattern, include_ignored }` shape. There it is
+translated into nextest's native filterset expression (`filter_expr:
+"test(/pattern/)"`), plus `run_ignored: "all"` when `include_ignored` is
+true — nextest performs the regex matching itself, so there is no separate
+build/enumerate/`--exact` pipeline on that path. Supplying `test_filter`
+together with `filter_expr`, `filter`, or `run_ignored` on the nextest tools
+is rejected as ambiguous, and a `pattern` containing a literal `/` is
+rejected up front (nextest's `/regex/` delimiter can't escape it) — pass an
+equivalent `filter_expr` directly in that case.
+
+Likewise, `cargo_test`'s `test_name` (+ optional `exact: true`) is accepted
+on the nextest tools: alone it becomes nextest's own `filter` substring
+argument; combined with `exact: true` it becomes the filterset equality
+matcher `test(=name)`. And in the other direction, nextest's `filter` is
+accepted on `cargo_test`, translated into `test_name`. Each pair (`test_name`
+vs. `filter`/`filter_expr`/`test_filter` on the nextest tools; `test_name`
+vs. `filter` on `cargo_test`) is mutually exclusive and rejected as
+ambiguous when both are supplied.
+
 **Hang / slow-test bisection (`bisect`)**
 
 `cargo_test` and `cargo_nextest_run` accept an optional `bisect` object that

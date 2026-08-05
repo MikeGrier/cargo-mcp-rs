@@ -83,42 +83,67 @@ running in the wrong place.
 
 ### Test selection — which knobs belong to which tool
 
-`cargo_test` and `cargo_nextest_run` have **separate, non-interchangeable**
-selection parameters. The server now **rejects unknown arguments** with an
-actionable error (including a "did you mean" hint), so a mismatched knob fails
-fast instead of silently running the entire suite. Use the right set:
+`cargo_test` and `cargo_nextest_run` mostly have **separate,
+non-interchangeable** selection parameters, but `test_filter`, `test_name`
+(+`exact`), and `filter` are deliberate, documented exceptions (see below).
+The server **rejects unknown arguments** with an actionable error (including
+a "did you mean" hint), so a mismatched knob fails fast instead of silently
+running the entire suite. Use the right set:
 
 - **`cargo_test` only:**
-  - `test_name` — substring (or `exact: true`) positional filter.
-  - `test_filter` — `{ "pattern": "<regex>", "include_ignored": <bool> }`,
-    a regex matched against full `module::path::test_name` strings.
   - `per_test_timeout_secs` — per-test idle watchdog; **only** meaningful
     together with `test_filter`.
   - `doc: true` — run doctests (nextest cannot).
 - **`cargo_nextest_run` only:**
-  - `filter` — substring filter over test names.
   - `filter_expr` — nextest filterset DSL (the `-E '<expr>'` expression
-    language, e.g. `test(/parser::/)`).
+    language, e.g. `test(/parser::/)`). Strictly more expressive than
+    anything `cargo_test` supports (boolean combinators, package/kind/binary
+    predicates), so it has no automatic translation in either direction.
+- **`test_filter` — accepted on BOTH tools:**
+  `{ "pattern": "<regex>", "include_ignored": <bool> }`. On `cargo_test` it
+  drives its own build/enumerate/`--exact` pipeline. On `cargo_nextest_run` /
+  `cargo_nextest_list` it is automatically translated into an equivalent
+  `filter_expr: "test(/<pattern>/)"` (plus `run_ignored: "all"` when
+  `include_ignored` is true) — nextest's filterset DSL supports the same
+  regex matching natively, so no separate pipeline is needed. Supplying
+  `test_filter` together with `filter_expr`, `filter`, or `run_ignored` on
+  the nextest tools is rejected as ambiguous. A `pattern` containing a
+  literal `/` is also rejected (nextest's `/regex/` delimiter can't escape
+  it) — pass an equivalent `filter_expr` directly for that case.
+- **`test_name` (+ optional `exact: true`) — accepted on BOTH tools:** on
+  `cargo_test` it's the native substring/exact positional filter. On
+  `cargo_nextest_run`/`cargo_nextest_list` it's automatically translated:
+  `test_name` alone becomes nextest's own `filter` substring argument;
+  `test_name` + `exact: true` becomes the filterset equality matcher
+  `test(=name)`. Supplying `test_name` together with `filter`, `filter_expr`,
+  or `test_filter` on the nextest tools is rejected as ambiguous.
+- **`filter` (nextest's bare substring filter) — accepted on BOTH tools:**
+  on `cargo_nextest_run`/`cargo_nextest_list` it's the native positional
+  substring filter. On `cargo_test` it's automatically translated into
+  `test_name`. Supplying both `test_name` and `filter` on `cargo_test` is
+  rejected as ambiguous.
 
-Do NOT pass `test_filter`, `test_name`, `per_test_timeout_secs`, or `doc` to
-`cargo_nextest_run`, and do NOT pass `filter`/`filter_expr` to `cargo_test` —
-the call will now error rather than run unfiltered.
+Do NOT pass `per_test_timeout_secs` or `doc` to `cargo_nextest_run`, and do
+NOT pass `filter_expr` to `cargo_test` — those have no translation and will
+error. `test_filter`, `test_name`/`exact`, and `filter` are all safe to use
+on either tool.
 
 ### Very large test suites — avoid runaway full runs
 
 A workspace with thousands of tests across hundreds of binaries can blow past
 any reasonable wall-clock cap on a full run. When spot-checking such a suite:
 
-- **Narrow it.** Use `cargo_test`'s `test_filter`/`test_name`, or
-  `cargo_nextest_run`'s `filter`/`filter_expr`, to run only the relevant
-  slice.
+- **Narrow it.** Use `test_filter`, `test_name`, or `filter` on either tool
+  (all three are cross-accepted and translated as needed — see above), or
+  `filter_expr` on `cargo_nextest_run` for its fuller DSL, to run only the
+  relevant slice.
 - **Or run it intentionally unbounded.** For a deliberate full run, raise or
   disable the overall cap with `timeout_secs: 0` (see the timeout sections
   below) rather than fighting a spurious `TimeoutError`.
 
-Picking the wrong knob (e.g. a `cargo_test`-style `test_filter` on
-`cargo_nextest_run`) used to silently run everything; it now errors, but the
-fix is still to supply the correct tool's filter parameter.
+A mismatched selection parameter (e.g. `test_name` on `cargo_nextest_run`)
+used to silently run everything; it now errors instead, pointing at the
+correct tool's parameter.
 
 ### Toolchain override (`+toolchain`)
 
