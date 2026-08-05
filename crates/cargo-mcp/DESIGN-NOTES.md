@@ -952,4 +952,30 @@ process-global `AtomicBool` set once at startup from the new
 build is idempotent. Passing the flag as `true` restores the raw stderr
 text for diagnostic purposes.
 
+### Addendum: the same advisory also arrives as a `compiler-message` JSON record
+
+The suppression above only ever looked at plain-text **stderr**. But every
+`--message-format=json` tool (`cargo_build`, `cargo_check`, `cargo_test`,
+`cargo_nextest_run`) can *also* receive this exact advisory as a structured
+`compiler-message` record on **stdout** — and until this addendum, that form
+was forwarded to the caller completely unfiltered, regardless of the
+`show_incremental_notes` setting. This was most visible in
+`cargo_nextest_run`, whose `filter_nextest_run_ndjson` unconditionally kept
+every `compiler-message` line. It also missed the newer wording rustc
+switched to per rust-lang/rust#154110 (`did not finalize incremental
+compilation session directory ...`), which ships already at `level: "note"`
+from the compiler itself rather than `warning`/`error`.
+
+`INCREMENTAL_NOTE_MARKERS` (a `[&str; 2]`, replacing the earlier single
+`INCREMENTAL_NOTE_MARKER` constant) now holds both wordings, and
+`tools::compiler_message_is_incremental_note` checks a parsed
+`compiler-message` value's `message.rendered` (falling back to
+`message.message`) against either marker — independent of `level`, since the
+same advisory can appear at `warning`, `error` (via `-D warnings`), or `note`
+depending on rustc version. `filter_build_ndjson` / `filter_test_ndjson`
+(`tools.rs`) and `filter_nextest_run_ndjson` (`nextest.rs`) all drop a
+matching `compiler-message` record when `show_incremental_notes_enabled()`
+is `false` (the default), so the same CLI flag / VS Code setting now gates
+both the stderr text and the JSON record forms consistently.
+
 

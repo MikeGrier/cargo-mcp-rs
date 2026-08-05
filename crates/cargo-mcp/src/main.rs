@@ -72,10 +72,10 @@ struct StartupConfig {
     /// Whether to proactively delete stale `*-working` incremental-session
     /// directories under `target/` before each cargo invocation.
     clear_incr_working: bool,
-    /// Whether to show cargo's harmless "error finalizing incremental
-    /// compilation session directory" notes. Off by default (they are
-    /// suppressed) because the underlying failure is idempotent Windows
-    /// file-locking noise.
+    /// Whether to show cargo's harmless incremental-compilation-session
+    /// finalize advisory (stderr text and `compiler-message` JSON forms).
+    /// Off by default (they are suppressed) because the underlying failure
+    /// is idempotent Windows file-locking noise.
     show_incremental_notes: bool,
     warnings: Vec<String>,
 }
@@ -344,9 +344,9 @@ fn main() {
     if cfg.show_incremental_notes {
         log_info(
             &mut out,
-            "incremental compilation session notes: SHOWN (rustc's \"error finalizing \
-             incremental compilation session directory\" notes are harmless and the \
-             build is idempotent; suppressed by default)"
+            "incremental compilation session notes: SHOWN (rustc's incremental-\
+             compilation-session finalize advisory is harmless and the build \
+             is idempotent; suppressed by default)"
                 .to_string(),
         );
     }

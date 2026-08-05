@@ -879,18 +879,29 @@ AI agent sees a coherent "build succeeded" picture.
 This advisory is fixed natively in rustc 1.96.0: the diagnostic was changed
 from `warn` to `note`, which is unaffected by `-D warnings`.
 
-**Stderr suppression (`--show-incremental-notes`)** — the same advisory can
-also reach cargo-mcp as plain text on the cargo child's **stderr** rather than
-as a structured JSON diagnostic (this happens, for example, when an
-antivirus or indexer briefly holds a handle to the `-working` directory on a
-non-ReFS Windows volume). By default cargo-mcp strips these
-`note: error finalizing incremental compilation session directory ...`
-lines out of the `x-cargo-mcp-stderr` record before returning it, because
-they are harmless and the build is idempotent — re-running just redoes the
-one affected crate's incremental cache. Pass `--show-incremental-notes=true`
-on the command line, or enable
-`cargo-mcp.showIncrementalCompilationNotes` in VS Code settings, to see them
-verbatim for diagnostic purposes.
+**Suppression (`--show-incremental-notes`)** — the same advisory can reach
+cargo-mcp in two different shapes, and both are suppressed by default:
+
+- As plain text on the cargo child's **stderr** (this happens, for example,
+  when an antivirus or indexer briefly holds a handle to the `-working`
+  directory on a non-ReFS Windows volume), where it is stripped out of the
+  `x-cargo-mcp-stderr` record.
+- As a structured `compiler-message` JSON record on **stdout** — the shape
+  every `--message-format=json` tool uses, including `cargo_build`,
+  `cargo_check`, `cargo_test`, and `cargo_nextest_run` — where the matching
+  record is dropped from the NDJSON stream entirely rather than passed
+  through.
+
+Both forms are recognised regardless of wording: the original
+`error finalizing incremental compilation session directory ...` and the
+`did not finalize incremental compilation session directory ...` text
+rustc switched to per [rust-lang/rust#154110](https://github.com/rust-lang/rust/pull/154110)
+(shipped already at `level: "note"`, unaffected by `-D warnings`). They are
+harmless and the build is idempotent — re-running just redoes the one
+affected crate's incremental cache. Pass `--show-incremental-notes=true` on
+the command line, or enable `cargo-mcp.showIncrementalCompilationNotes` in
+VS Code settings, to see them verbatim (both shapes) for diagnostic
+purposes.
 
 ---
 
