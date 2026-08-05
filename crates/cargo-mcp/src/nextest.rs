@@ -854,6 +854,13 @@ mod tests {
         // `cargo_nextest_run` output the same way it is from `cargo_test` /
         // `cargo_build`, not forwarded verbatim just because it arrives as
         // a `compiler-message` record instead of plain-text stderr.
+        //
+        // Takes tools::SHOW_INCREMENTAL_NOTES_TEST_LOCK because this
+        // assertion depends on the process-global SHOW_INCREMENTAL_NOTES
+        // flag being at its default (`false`); other tests in `tools.rs`
+        // temporarily flip it to `true` under the same lock.
+        let _g = tools::SHOW_INCREMENTAL_NOTES_TEST_LOCK.lock().unwrap();
+        tools::set_show_incremental_notes(false);
         let input = "\
 {\"reason\":\"compiler-message\",\"message\":{\"level\":\"note\",\"message\":\"did not finalize incremental compilation session directory `x`: Access is denied. (os error 5)\",\"rendered\":\"note: did not finalize incremental compilation session directory `x`: Access is denied. (os error 5)\\n\"}}\n\
 {\"reason\":\"build-finished\",\"success\":true}\n";

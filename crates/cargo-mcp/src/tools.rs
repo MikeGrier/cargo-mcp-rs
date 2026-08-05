@@ -127,6 +127,14 @@ pub(crate) fn show_incremental_notes_enabled() -> bool {
     SHOW_INCREMENTAL_NOTES.load(Ordering::Relaxed)
 }
 
+/// Serializes tests (in this module and `nextest::tests`) that read or write
+/// the process-global `SHOW_INCREMENTAL_NOTES` flag, so a test asserting the
+/// default (`false`) behaviour cannot observe a transient `true` left by a
+/// concurrently-running test that temporarily flips it.
+#[cfg(test)]
+pub(crate) static SHOW_INCREMENTAL_NOTES_TEST_LOCK: std::sync::Mutex<()> =
+    std::sync::Mutex::new(());
+
 /// Substrings identifying rustc's harmless incremental-compilation-session
 /// finalize advisory. On Windows an antivirus/indexer/prior process can still
 /// hold a handle to a `target\…\incremental\…-working` directory when rustc
@@ -5982,9 +5990,6 @@ mod tests {
 
     // ── output_path: path validation ─────────────────────────────────────────
 
-    /// Serializes tests that read/write the process-global SHOW_INCREMENTAL_NOTES flag.
-    static SHOW_INCREMENTAL_NOTES_TEST_LOCK: Mutex<()> = Mutex::new(());
-
     #[test]
     fn strip_incremental_notes_removes_note_and_blank_separator() {
         let stderr = "before\n\
@@ -6060,6 +6065,8 @@ mod tests {
 
     #[test]
     fn filter_build_ndjson_drops_incremental_note_by_default() {
+        let _g = SHOW_INCREMENTAL_NOTES_TEST_LOCK.lock().unwrap();
+        set_show_incremental_notes(false);
         let stdout = r#"{"reason":"compiler-message","message":{"level":"note","message":"did not finalize incremental compilation session directory `x`: Access is denied. (os error 5)","rendered":"note: did not finalize incremental compilation session directory `x`: Access is denied. (os error 5)\n"}}
 {"reason":"build-finished","success":true}"#;
         let filtered = filter_build_ndjson(stdout);
@@ -6072,6 +6079,8 @@ mod tests {
 
     #[test]
     fn filter_test_ndjson_drops_incremental_note_by_default() {
+        let _g = SHOW_INCREMENTAL_NOTES_TEST_LOCK.lock().unwrap();
+        set_show_incremental_notes(false);
         let stdout = r#"{"reason":"compiler-message","message":{"level":"note","message":"did not finalize incremental compilation session directory `x`: Access is denied. (os error 5)","rendered":"note: did not finalize incremental compilation session directory `x`: Access is denied. (os error 5)\n"}}
 {"reason":"build-finished","success":true}"#;
         let filtered = filter_test_ndjson(stdout);
