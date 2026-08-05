@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.12.0](https://github.com/MikeGrier/cargo-mcp-rs/compare/v0.11.0...v0.12.0) (2026-08-05)
+
+
+### Features
+
+* **nextest:** translate test_filter into nextest filterset expression ([f5985c7](https://github.com/MikeGrier/cargo-mcp-rs/commit/f5985c780d6373d39466e0ae2bf2b82da26f5d55))
+* **nextest:** translate test_filter, test_name/exact, and filter across cargo_test/nextest ([d234bc6](https://github.com/MikeGrier/cargo-mcp-rs/commit/d234bc6a579a9724a9e35606609c01d55ea1aef1))
+* **nextest:** translate test_name/exact and filter across cargo_test/nextest ([b9f4665](https://github.com/MikeGrier/cargo-mcp-rs/commit/b9f46651b39208bedeb516a8818aff7eb110065a))
+
 ## [0.11.0](https://github.com/MikeGrier/cargo-mcp-rs/compare/v0.10.0...v0.11.0) (2026-08-03)
 
 
