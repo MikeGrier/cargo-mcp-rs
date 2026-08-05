@@ -83,15 +83,15 @@ running in the wrong place.
 
 ### Test selection — which knobs belong to which tool
 
-`cargo_test` and `cargo_nextest_run` have **separate, non-interchangeable**
-selection parameters. The server now **rejects unknown arguments** with an
-actionable error (including a "did you mean" hint), so a mismatched knob fails
-fast instead of silently running the entire suite. Use the right set:
+`cargo_test` and `cargo_nextest_run` mostly have **separate,
+non-interchangeable** selection parameters, but `test_filter` is a
+deliberate, documented exception (see below). The server **rejects unknown
+arguments** with an actionable error (including a "did you mean" hint), so a
+mismatched knob fails fast instead of silently running the entire suite. Use
+the right set:
 
 - **`cargo_test` only:**
   - `test_name` — substring (or `exact: true`) positional filter.
-  - `test_filter` — `{ "pattern": "<regex>", "include_ignored": <bool> }`,
-    a regex matched against full `module::path::test_name` strings.
   - `per_test_timeout_secs` — per-test idle watchdog; **only** meaningful
     together with `test_filter`.
   - `doc: true` — run doctests (nextest cannot).
@@ -99,26 +99,38 @@ fast instead of silently running the entire suite. Use the right set:
   - `filter` — substring filter over test names.
   - `filter_expr` — nextest filterset DSL (the `-E '<expr>'` expression
     language, e.g. `test(/parser::/)`).
+- **`test_filter` — accepted on BOTH tools:**
+  `{ "pattern": "<regex>", "include_ignored": <bool> }`. On `cargo_test` it
+  drives its own build/enumerate/`--exact` pipeline. On `cargo_nextest_run` /
+  `cargo_nextest_list` it is automatically translated into an equivalent
+  `filter_expr: "test(/<pattern>/)"` (plus `run_ignored: "all"` when
+  `include_ignored` is true) — nextest's filterset DSL supports the same
+  regex matching natively, so no separate pipeline is needed. Supplying
+  `test_filter` together with `filter_expr`, `filter`, or `run_ignored` on
+  the nextest tools is rejected as ambiguous. A `pattern` containing a
+  literal `/` is also rejected (nextest's `/regex/` delimiter can't escape
+  it) — pass an equivalent `filter_expr` directly for that case.
 
-Do NOT pass `test_filter`, `test_name`, `per_test_timeout_secs`, or `doc` to
+Do NOT pass `test_name`, `per_test_timeout_secs`, or `doc` to
 `cargo_nextest_run`, and do NOT pass `filter`/`filter_expr` to `cargo_test` —
-the call will now error rather than run unfiltered.
+those calls will error rather than run unfiltered. `test_filter` is safe to
+use on either tool.
 
 ### Very large test suites — avoid runaway full runs
 
 A workspace with thousands of tests across hundreds of binaries can blow past
 any reasonable wall-clock cap on a full run. When spot-checking such a suite:
 
-- **Narrow it.** Use `cargo_test`'s `test_filter`/`test_name`, or
-  `cargo_nextest_run`'s `filter`/`filter_expr`, to run only the relevant
-  slice.
+- **Narrow it.** Use `test_filter` or `cargo_test`'s `test_name` on
+  `cargo_test`, or `test_filter`, `filter`, or `filter_expr` on
+  `cargo_nextest_run`, to run only the relevant slice.
 - **Or run it intentionally unbounded.** For a deliberate full run, raise or
   disable the overall cap with `timeout_secs: 0` (see the timeout sections
   below) rather than fighting a spurious `TimeoutError`.
 
-Picking the wrong knob (e.g. a `cargo_test`-style `test_filter` on
-`cargo_nextest_run`) used to silently run everything; it now errors, but the
-fix is still to supply the correct tool's filter parameter.
+A mismatched selection parameter (e.g. `test_name` on `cargo_nextest_run`)
+used to silently run everything; it now errors instead, pointing at the
+correct tool's parameter.
 
 ### Toolchain override (`+toolchain`)
 

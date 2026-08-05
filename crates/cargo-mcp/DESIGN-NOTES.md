@@ -507,10 +507,15 @@ silently mis-route values if we reused `cargo_test`'s schema verbatim:
   `jobs`.
 - `--doc` is not accepted (unsupported by nextest). Doctests stay on
   `cargo_test`.
-- `test_filter` (our regex pipeline) is **not** added; nextest's
-  `-E '<filterset>'` is strictly more expressive. We expose it as
-  `filter_expr` and also accept a positional `filter` substring for
-  parity with `cargo_test`'s `test_name`.
+- `test_filter` (our regex pipeline) IS accepted on
+  `cargo_nextest_run`/`cargo_nextest_list` — see "`test_filter` translation
+  on nextest" below — because nextest's filterset DSL supports regex
+  matching natively (`test(/regex/)`), so the same `{ pattern,
+  include_ignored }` shape can be translated into an equivalent
+  `filter_expr` instead of forcing callers to learn a second syntax. We
+  still also expose the native `filter_expr` (nextest's `-E` DSL, strictly
+  more expressive) and a positional `filter` substring for parity with
+  `cargo_test`'s `test_name`.
 
 ## Strict argument validation (unknown-key rejection)
 
@@ -535,10 +540,11 @@ dispatch, via `validate_known_args`:
   cross-tool keys are rejected, so strict validation is safe for real clients.
 - An unknown key produces an actionable error listing the valid parameters,
   plus a curated **cross-tool hint** (`cross_tool_hint`) for the common
-  confusions (`test_filter`/`per_test_timeout_secs`/`test_name`/`doc` →
+  confusions (`per_test_timeout_secs`/`test_name`/`doc` →
   "that's a `cargo_test` parameter; nextest uses `filter`/`filter_expr`", and
   the reverse), and a Levenshtein "did you mean `<closest>`?" suggestion for
-  typos.
+  typos. (`test_filter` used to be in this curated list too, but is now a
+  legitimate parameter on the nextest tools — see below.)
 - Validation is centralised in the dispatcher rather than per-tool so it stays
   in lock-step with the schema automatically and cannot drift. Unit tests
   call the `call_*` functions directly, which is below the validation layer,
@@ -547,6 +553,45 @@ dispatch, via `validate_known_args`:
 The failure mode this fixes is specifically "wrong knob silently runs
 everything": a mismatched selection parameter now fails fast with a pointer to
 the right one instead of quietly executing the full suite.
+
+### `test_filter` translation on nextest
+
+Even with the curated cross-tool hint in place, callers (LLMs in particular)
+kept reaching for `test_filter` on `cargo_nextest_run` out of `cargo_test`
+habit, hitting the same rejected-as-unknown error repeatedly across
+sessions — a better error message did not stop the mistake from recurring.
+Unlike `working_directory` (a pure alternate spelling — see below),
+`test_filter` is a fundamentally different mechanism from `filter_expr`: on
+`cargo_test` it drives a whole build/enumerate/`--exact` pipeline
+(`test_filter.rs`), and on nextest that pipeline doesn't exist at all.
+
+The fix is a genuine translation rather than a smarter rejection, made
+possible by a fact this document previously used as the *reason not to*
+support it: nextest's filterset DSL supports regex matching natively via
+`test(/regex/)`. Both cargo-mcp's `test_filter.pattern` and nextest's
+`test(/…/)` compile the pattern with the same underlying `regex` crate, so
+the translation is a direct string substitution rather than a semantic
+reinterpretation:
+
+- `test_filter.pattern` → `filter_expr: "test(/{pattern}/)"`.
+- `test_filter.include_ignored: true` → `run_ignored: "all"` (mirrors
+  `cargo_test`'s `--include-ignored`: run both ignored and non-ignored
+  tests, rather than nextest's `only`, which would run *just* ignored
+  tests).
+- A `pattern` containing a literal `/` is rejected up front rather than
+  silently producing a broken filterset expression: nextest's `/…/`
+  delimiter has no escape sequence for it. The error points the caller at
+  `filter_expr` directly for that edge case.
+- Supplying `test_filter` alongside `filter_expr`, `filter`, or
+  `run_ignored` explicitly is rejected (ambiguous — which selection should
+  win?) rather than silently overriding one with the other.
+
+Implementation: `nextest::translate_test_filter` parses and validates the
+`test_filter` object (reusing the same shape as `cargo_test`'s), and
+`NextestOwnedOpts::apply_test_filter` folds the translated `filter_expr` /
+`run_ignored` into the same struct fields the native parameters populate —
+so the rest of `call_run` / `call_list`'s argv construction is unaware
+`test_filter` was ever involved.
 
 ### `working_directory` alias
 

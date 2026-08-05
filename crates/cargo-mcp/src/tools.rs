@@ -1776,6 +1776,50 @@ pub(crate) fn combine_build_and_exec_output(
 
 // ── tool list ─────────────────────────────────────────────────────────────────
 
+/// JSON schema for `test_filter` on `cargo_nextest_run`/`cargo_nextest_list`.
+/// Unlike `cargo_test`'s `test_filter` (its own build/enumerate/`--exact`
+/// pipeline), here the same `{ pattern, include_ignored }` shape is
+/// translated automatically into nextest's native `test(/pattern/)`
+/// filterset expression (plus `--run-ignored all` when `include_ignored` is
+/// true) — see `nextest::translate_test_filter`. This exists purely to
+/// absorb the common cross-tool mistake of reaching for `test_filter` on
+/// nextest out of `cargo_test` habit, turning what used to be a rejected
+/// "unknown parameter" into the intended selection.
+fn nextest_test_filter_schema() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "description":
+            "Regex-based test selection, same shape as `cargo_test`'s `test_filter`. \
+             Automatically translated into an equivalent nextest filterset expression \
+             (`test(/pattern/)`, passed via `-E`) plus `--run-ignored all` when \
+             `include_ignored` is true \u{2014} nextest itself performs the regex \
+             matching, so no separate enumerate/match step is needed. Not supported \
+             together with `filter_expr`, `filter`, or `run_ignored`: `test_filter` is \
+             already translated into all of those internally, so supplying one directly \
+             as well is ambiguous and the call is rejected. Prefer `filter_expr` directly \
+             if you need nextest's fuller filterset DSL (AND/OR, `kind()`, `binary()`, \
+             etc.) or if `pattern` must contain a literal `/`, which this translation \
+             cannot express (nextest's `/regex/` delimiter has no escape for it).",
+        "properties": {
+            "pattern": {
+                "type": "string",
+                "description":
+                    "RE2-style regular expression (the `regex` crate's flavor), matched \
+                     by nextest against each test's full name. Must not contain a literal \
+                     `/` (see above). Example: `^(my_mod::a|my_mod::b)$`."
+            },
+            "include_ignored": {
+                "type": "boolean",
+                "description":
+                    "If true, translated to `--run-ignored all` (run both ignored and \
+                     non-ignored tests). Default: false (nextest's default `--run-ignored` \
+                     behavior, i.e. ignored tests are skipped)."
+            }
+        },
+        "required": ["pattern"]
+    })
+}
+
 /// JSON schema for the `bisect` object shared by `cargo_test` and
 /// `cargo_nextest_run`. Presence of this object switches the tool into the
 /// hang/slow-test bisection engine (see [`crate::bisect`]).
@@ -3022,8 +3066,13 @@ pub fn list() -> Value {
                  Prefer this over `cargo_test` when the workspace contains a \
                  `.config/nextest.toml`, when the user asks for nextest, or when you \
                  want per-test process isolation, built-in flaky-test retries, or \
-                 nextest's filter expressions. NOTE: nextest does NOT support \
-                 doctests \u{2014} use `cargo_test` with `doc: true` for those. \
+                 nextest's filter expressions. Use `filter` (substring) or `filter_expr` \
+                 (the nextest `-E` filterset DSL) to select tests; `test_filter` (the \
+                 same `{ pattern, include_ignored }` shape as `cargo_test`) is ALSO \
+                 accepted here and is automatically translated into the equivalent \
+                 `filter_expr` \u{2014} use whichever you already have in mind. NOTE: \
+                 nextest does NOT support doctests \u{2014} use `cargo_test` with \
+                 `doc: true` for those. \
                  If cargo-nextest is not installed the tool returns an error whose \
                  body contains fenced install commands; VS Code Copilot Chat will \
                  render those with **Copy** and **Run in Terminal** buttons. \
@@ -3114,6 +3163,7 @@ pub fn list() -> Value {
                     "filter":      { "type": "string", "description":
                         "Bare positional test-name substring filter (cargo-test-compatible). \
                          Combined with `filter_expr` when both are supplied (both apply)." },
+                    "test_filter": nextest_test_filter_schema(),
 
                     "target":              { "type": "string",  "description": TARGET_DESC },
                     "target_dir":          { "type": "string",  "description": TARGET_DIR_DESC },
@@ -3218,6 +3268,7 @@ pub fn list() -> Value {
                          https://nexte.st/docs/filtersets." },
                     "filter":      { "type": "string", "description":
                         "Bare positional test-name substring filter." },
+                    "test_filter": nextest_test_filter_schema(),
 
                     "list_type":      { "type": "string", "enum": ["full", "binaries-only"],
                         "description":
@@ -3279,16 +3330,16 @@ fn tool_arg_schema() -> &'static std::collections::HashMap<String, std::collecti
 /// LLM commonly sends to the wrong tool. Returning a precise hint here is far
 /// more useful than a generic "did you mean" suggestion, because these are
 /// not typos but valid-elsewhere parameters that would otherwise be silently
-/// dropped and cause a runaway run (e.g. a `test_filter` meant for
-/// `cargo_test` passed to `cargo_nextest_run`, which then runs the entire
-/// suite).
+/// dropped and cause a runaway run (e.g. `test_name`, a `cargo_test`-only
+/// parameter, passed to `cargo_nextest_run`, which then runs the entire
+/// suite instead of the intended subset).
 fn cross_tool_hint(tool: &str, key: &str) -> Option<&'static str> {
     match (tool, key) {
-        ("cargo_nextest_run" | "cargo_nextest_list", "test_filter") => Some(
-            "`test_filter` is a `cargo_test`-only regex parameter and is NOT honoured by \
-             nextest. For nextest use `filter` (a plain substring) or `filter_expr` (the \
-             nextest `-E` filterset DSL).",
-        ),
+        // NOTE: `test_filter` is deliberately NOT listed here — it is a
+        // legitimate parameter on `cargo_nextest_run`/`cargo_nextest_list`
+        // now (see their schema entries): the server translates its regex
+        // `pattern` into an equivalent `test(/pattern/)` filterset
+        // expression automatically, so it is never an "unknown parameter".
         ("cargo_nextest_run" | "cargo_nextest_list", "per_test_timeout_secs") => Some(
             "nextest has no per-test-timeout parameter here \u{2014} configure `slow-timeout` / \
              `terminate-after` in `.config/nextest.toml`, and use `timeout_secs` for an \
@@ -5313,16 +5364,14 @@ mod tests {
     }
 
     #[test]
-    fn validate_known_args_rejects_cross_tool_test_filter_on_nextest() {
-        // The exact mistake that caused full-suite timeouts: a cargo_test
-        // parameter routed to cargo_nextest_run.
+    fn validate_known_args_accepts_test_filter_on_nextest() {
+        // `test_filter` used to be the exact mistake that caused full-suite
+        // timeouts (a cargo_test parameter routed to cargo_nextest_run,
+        // rejected as unknown). It is now a legitimate parameter, translated
+        // internally into an equivalent `filter_expr`.
         let args = serde_json::json!({ "test_filter": { "pattern": "x" } });
-        let err = validate_known_args("cargo_nextest_run", &args).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("test_filter"));
-        // The curated cross-tool hint must name the correct nextest knobs.
-        assert!(msg.contains("filter_expr"));
-        assert!(msg.contains("Valid parameters"));
+        assert!(validate_known_args("cargo_nextest_run", &args).is_ok());
+        assert!(validate_known_args("cargo_nextest_list", &args).is_ok());
     }
 
     #[test]
