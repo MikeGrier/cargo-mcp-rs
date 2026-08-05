@@ -148,7 +148,15 @@ fn filter_nextest_run_ndjson(stdout: &str) -> String {
             }
             if let Ok(v) = serde_json::from_str::<Value>(line) {
                 match v.get("reason").and_then(|r| r.as_str()) {
-                    Some("compiler-message") | Some("build-finished") => {
+                    Some("compiler-message") => {
+                        if !tools::show_incremental_notes_enabled()
+                            && tools::compiler_message_is_incremental_note(&v)
+                        {
+                            return None;
+                        }
+                        return Some(line.to_owned());
+                    }
+                    Some("build-finished") => {
                         return Some(line.to_owned());
                     }
                     Some("compiler-artifact") | Some("build-script-executed") => {
@@ -836,6 +844,25 @@ mod tests {
         assert!(lines[2].contains(NEXTEST_OUTPUT_REASON));
         assert!(lines[2].contains("Starting 12 tests"));
         assert!(lines[3].contains(NEXTEST_OUTPUT_REASON));
+    }
+
+    #[test]
+    fn filter_nextest_run_ndjson_drops_incremental_finalize_note_by_default() {
+        // Regression test: rustc's harmless incremental-compilation-session
+        // finalize advisory (rust-lang/rust#154110 wording, emitted at
+        // `level: "note"` directly by newer rustc) must be dropped from
+        // `cargo_nextest_run` output the same way it is from `cargo_test` /
+        // `cargo_build`, not forwarded verbatim just because it arrives as
+        // a `compiler-message` record instead of plain-text stderr.
+        let input = "\
+{\"reason\":\"compiler-message\",\"message\":{\"level\":\"note\",\"message\":\"did not finalize incremental compilation session directory `x`: Access is denied. (os error 5)\",\"rendered\":\"note: did not finalize incremental compilation session directory `x`: Access is denied. (os error 5)\\n\"}}\n\
+{\"reason\":\"build-finished\",\"success\":true}\n";
+        let out = filter_nextest_run_ndjson(input);
+        assert!(
+            !out.contains("did not finalize"),
+            "incremental-finalize note should be dropped by default:\n{out}"
+        );
+        assert!(out.contains("\"build-finished\""));
     }
 
     #[test]
