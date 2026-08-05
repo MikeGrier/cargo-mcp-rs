@@ -127,27 +127,43 @@ pub(crate) fn show_incremental_notes_enabled() -> bool {
     SHOW_INCREMENTAL_NOTES.load(Ordering::Relaxed)
 }
 
-/// Substring identifying rustc's "error finalizing incremental compilation
-/// session directory" note. On Windows an antivirus/indexer/prior process can
-/// still hold a handle to a `target\…\incremental\…-working` directory when
-/// rustc tries to finalize it, so rustc emits this note and simply skips
-/// reusing that one incremental cache entry. The build is unaffected and
-/// re-running is idempotent, so the note is pure noise. Matched as a substring
-/// (not anchored) because rustc prefixes it with `note: ` and appends the
+/// Serializes tests (in this module and `nextest::tests`) that read or write
+/// the process-global `SHOW_INCREMENTAL_NOTES` flag, so a test asserting the
+/// default (`false`) behaviour cannot observe a transient `true` left by a
+/// concurrently-running test that temporarily flips it.
+#[cfg(test)]
+pub(crate) static SHOW_INCREMENTAL_NOTES_TEST_LOCK: std::sync::Mutex<()> =
+    std::sync::Mutex::new(());
+
+/// Substrings identifying rustc's harmless incremental-compilation-session
+/// finalize advisory. On Windows an antivirus/indexer/prior process can still
+/// hold a handle to a `target\…\incremental\…-working` directory when rustc
+/// tries to finalize it, so rustc emits this note and simply skips reusing
+/// that one incremental cache entry. The build is unaffected and re-running
+/// is idempotent, so the note is pure noise. Two wordings are recognised:
+/// the original "error finalizing incremental compilation session directory"
+/// and the "did not finalize incremental compilation session directory" text
+/// rustc switched to per rust-lang/rust#154110 (which also demoted the
+/// diagnostic to `level: "note"` at the source). Matched as substrings (not
+/// anchored) because rustc prefixes them with `note: ` and appends the
 /// offending path and `Access is denied. (os error 5)`.
-const INCREMENTAL_NOTE_MARKER: &str = "error finalizing incremental compilation session directory";
+const INCREMENTAL_NOTE_MARKERS: [&str; 2] = [
+    "error finalizing incremental compilation session directory",
+    "did not finalize incremental compilation session directory",
+];
 
 /// Remove rustc's harmless incremental-compilation-session notes (and the
 /// single blank separator line that trails each one) from `stderr`.
 ///
-/// Only lines containing [`INCREMENTAL_NOTE_MARKER`] are dropped; every other
-/// line — including genuine errors and the Restart Manager holder report — is
-/// preserved verbatim. The result is not trimmed; callers trim as needed.
+/// Only lines containing one of [`INCREMENTAL_NOTE_MARKERS`] are dropped;
+/// every other line — including genuine errors and the Restart Manager
+/// holder report — is preserved verbatim. The result is not trimmed; callers
+/// trim as needed.
 pub(crate) fn strip_incremental_notes(stderr: &str) -> String {
     let mut kept: Vec<&str> = Vec::new();
     let mut just_removed = false;
     for line in stderr.lines() {
-        if line.contains(INCREMENTAL_NOTE_MARKER) {
+        if INCREMENTAL_NOTE_MARKERS.iter().any(|m| line.contains(m)) {
             just_removed = true;
             continue;
         }
@@ -161,6 +177,25 @@ pub(crate) fn strip_incremental_notes(stderr: &str) -> String {
         kept.push(line);
     }
     kept.join("\n")
+}
+
+/// True when the parsed `compiler-message` JSON record `v` is rustc's
+/// harmless incremental-compilation-session finalize advisory (either
+/// wording in [`INCREMENTAL_NOTE_MARKERS`]), regardless of the diagnostic's
+/// `level`. Used to drop these records from `--message-format=json` NDJSON
+/// streams (`cargo_build`/`cargo_check`/`cargo_test`/`cargo_nextest_run`)
+/// the same way [`strip_incremental_notes`] drops the plain-text stderr
+/// form, so an agent never sees the JSON variant as unfiltered noise either.
+pub(crate) fn compiler_message_is_incremental_note(v: &serde_json::Value) -> bool {
+    if v.get("reason").and_then(|r| r.as_str()) != Some("compiler-message") {
+        return false;
+    }
+    let text = v
+        .pointer("/message/rendered")
+        .and_then(|m| m.as_str())
+        .or_else(|| v.pointer("/message/message").and_then(|m| m.as_str()))
+        .unwrap_or("");
+    INCREMENTAL_NOTE_MARKERS.iter().any(|m| text.contains(m))
 }
 
 /// Produce the trimmed stderr text to surface in tool output, honouring the
@@ -1209,10 +1244,14 @@ fn filter_build_ndjson(stdout: &str) -> String {
         .lines()
         .filter(|line| {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-                matches!(
-                    v.get("reason").and_then(|r| r.as_str()),
-                    Some("compiler-message") | Some("build-finished")
-                )
+                match v.get("reason").and_then(|r| r.as_str()) {
+                    Some("compiler-message") => {
+                        show_incremental_notes_enabled()
+                            || !compiler_message_is_incremental_note(&v)
+                    }
+                    Some("build-finished") => true,
+                    _ => false,
+                }
             } else {
                 false
             }
@@ -1241,7 +1280,16 @@ fn filter_test_ndjson(stdout: &str) -> String {
                 // diagnostics and the build-finished summary; drop artifact
                 // and build-script noise already delivered via streaming.
                 match v.get("reason").and_then(|r| r.as_str()) {
-                    Some("compiler-message") | Some("build-finished") => Some(line.to_owned()),
+                    Some("compiler-message") => {
+                        if !show_incremental_notes_enabled()
+                            && compiler_message_is_incremental_note(&v)
+                        {
+                            None
+                        } else {
+                            Some(line.to_owned())
+                        }
+                    }
+                    Some("build-finished") => Some(line.to_owned()),
                     _ => None,
                 }
             } else {
@@ -5942,9 +5990,6 @@ mod tests {
 
     // ── output_path: path validation ─────────────────────────────────────────
 
-    /// Serializes tests that read/write the process-global SHOW_INCREMENTAL_NOTES flag.
-    static SHOW_INCREMENTAL_NOTES_TEST_LOCK: Mutex<()> = Mutex::new(());
-
     #[test]
     fn strip_incremental_notes_removes_note_and_blank_separator() {
         let stderr = "before\n\
@@ -5961,6 +6006,89 @@ mod tests {
     fn strip_incremental_notes_preserves_other_lines() {
         let stderr = "error: aborting due to previous error\nsome other note";
         assert_eq!(strip_incremental_notes(stderr), stderr);
+    }
+
+    #[test]
+    fn strip_incremental_notes_removes_new_rustc_154110_wording() {
+        let stderr = "before\n\
+             note: did not finalize incremental compilation session directory \
+             `\\\\?\\C:\\proj\\target\\debug\\incremental\\foo-abc\\s-xyz-working`: \
+             Access is denied. (os error 5)\n\
+             \n\
+             after";
+        assert_eq!(strip_incremental_notes(stderr), "before\nafter");
+    }
+
+    /// `compiler-message` JSON records for the incremental-finalize advisory
+    /// must be recognised regardless of which rustc wording produced them,
+    /// so `filter_build_ndjson`/`filter_test_ndjson`/`filter_nextest_run_ndjson`
+    /// can drop them from `--message-format=json` streams the same way
+    /// `strip_incremental_notes` drops the plain-text stderr form.
+    #[test]
+    fn compiler_message_is_incremental_note_matches_old_and_new_wording() {
+        let old = serde_json::json!({
+            "reason": "compiler-message",
+            "message": {
+                "level": "warning",
+                "message": "error finalizing incremental compilation session directory `x`: Access is denied. (os error 5)",
+                "rendered": "warning: error finalizing incremental compilation session directory `x`: Access is denied. (os error 5)\n",
+            },
+        });
+        assert!(compiler_message_is_incremental_note(&old));
+
+        let new = serde_json::json!({
+            "reason": "compiler-message",
+            "message": {
+                "level": "note",
+                "message": "did not finalize incremental compilation session directory `x`: Access is denied. (os error 5)",
+                "rendered": "note: did not finalize incremental compilation session directory `x`: Access is denied. (os error 5)\n",
+            },
+        });
+        assert!(compiler_message_is_incremental_note(&new));
+    }
+
+    #[test]
+    fn compiler_message_is_incremental_note_false_for_genuine_diagnostics() {
+        let genuine = serde_json::json!({
+            "reason": "compiler-message",
+            "message": {
+                "level": "error",
+                "message": "mismatched types",
+                "rendered": "error: mismatched types\n",
+            },
+        });
+        assert!(!compiler_message_is_incremental_note(&genuine));
+
+        let not_compiler_message = serde_json::json!({"reason": "build-finished", "success": true});
+        assert!(!compiler_message_is_incremental_note(&not_compiler_message));
+    }
+
+    #[test]
+    fn filter_build_ndjson_drops_incremental_note_by_default() {
+        let _g = SHOW_INCREMENTAL_NOTES_TEST_LOCK.lock().unwrap();
+        set_show_incremental_notes(false);
+        let stdout = r#"{"reason":"compiler-message","message":{"level":"note","message":"did not finalize incremental compilation session directory `x`: Access is denied. (os error 5)","rendered":"note: did not finalize incremental compilation session directory `x`: Access is denied. (os error 5)\n"}}
+{"reason":"build-finished","success":true}"#;
+        let filtered = filter_build_ndjson(stdout);
+        assert!(
+            !filtered.contains("did not finalize"),
+            "incremental note should be dropped by default:\n{filtered}"
+        );
+        assert!(filtered.contains("build-finished"));
+    }
+
+    #[test]
+    fn filter_test_ndjson_drops_incremental_note_by_default() {
+        let _g = SHOW_INCREMENTAL_NOTES_TEST_LOCK.lock().unwrap();
+        set_show_incremental_notes(false);
+        let stdout = r#"{"reason":"compiler-message","message":{"level":"note","message":"did not finalize incremental compilation session directory `x`: Access is denied. (os error 5)","rendered":"note: did not finalize incremental compilation session directory `x`: Access is denied. (os error 5)\n"}}
+{"reason":"build-finished","success":true}"#;
+        let filtered = filter_test_ndjson(stdout);
+        assert!(
+            !filtered.contains("did not finalize"),
+            "incremental note should be dropped by default:\n{filtered}"
+        );
+        assert!(filtered.contains("build-finished"));
     }
 
     #[test]

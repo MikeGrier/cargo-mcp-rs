@@ -148,7 +148,7 @@
                 "cargo-mcp.showIncrementalCompilationNotes": {
                     "type": "boolean",
                     "default": false,
-                    "markdownDescription": "Show rustc's \"error finalizing incremental compilation session directory\" notes in tool output. **These notes are harmless** — they mean rustc could not reuse one incremental-compilation cache entry (typically because another process, such as an antivirus or indexer on Windows, briefly held a handle to the `target\\…\\incremental\\…-working` directory); the build itself succeeds and is idempotent, so re-running is always safe. Suppressed by default to reduce noise; enable this only if you want to see them for diagnostic purposes."
+                    "markdownDescription": "Show rustc's incremental-compilation-session finalize advisory in tool output — both the plain-text stderr form (`error finalizing incremental compilation session directory ...`) and the structured `compiler-message` JSON form used by `--message-format=json` tools like `cargo_test`/`cargo_nextest_run` (either the same wording or the newer `did not finalize incremental compilation session directory ...` text). **These notes are harmless** — they mean rustc could not reuse one incremental-compilation cache entry (typically because another process, such as an antivirus or indexer on Windows, briefly held a handle to the `target\\…\\incremental\\…-working` directory); the build itself succeeds and is idempotent, so re-running is always safe. Suppressed by default to reduce noise; enable this only if you want to see them for diagnostic purposes."
                 }
             }
         }
