@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.12.1](https://github.com/MikeGrier/cargo-mcp-rs/compare/v0.12.0...v0.12.1) (2026-08-05)
+
+
+### Bug Fixes
+
+* eliminate flaky incremental-note test dependency on global flag state ([efd6210](https://github.com/MikeGrier/cargo-mcp-rs/commit/efd6210254b6c1ea39763d6f085ceeaa3652cfbf))
+* suppress incremental-compilation-session notes in JSON compiler-message records ([9d719b5](https://github.com/MikeGrier/cargo-mcp-rs/commit/9d719b5f8a89dac8abe29a1630df79b38cb17524))
+* suppress incremental-compilation-session notes in JSON compiler-message records ([d61638b](https://github.com/MikeGrier/cargo-mcp-rs/commit/d61638b6532b61ac043cc1d34d10dd5ee14e4947))
+
 ## [0.12.0](https://github.com/MikeGrier/cargo-mcp-rs/compare/v0.11.0...v0.12.0) (2026-08-05)
 
 
