@@ -516,6 +516,11 @@ silently mis-route values if we reused `cargo_test`'s schema verbatim:
   still also expose the native `filter_expr` (nextest's `-E` DSL, strictly
   more expressive) and a positional `filter` substring for parity with
   `cargo_test`'s `test_name`.
+- `test_name`/`exact` (cargo_test's own substring/exact filter) are ALSO
+  accepted on `cargo_nextest_run`/`cargo_nextest_list`, translated into
+  `filter` (substring) or `test(=name)` (exact) — see "`test_name`/`exact`
+  and `filter` translations" below. The reverse direction is handled too:
+  `filter` is accepted on `cargo_test`, translated into `test_name`.
 
 ## Strict argument validation (unknown-key rejection)
 
@@ -540,11 +545,13 @@ dispatch, via `validate_known_args`:
   cross-tool keys are rejected, so strict validation is safe for real clients.
 - An unknown key produces an actionable error listing the valid parameters,
   plus a curated **cross-tool hint** (`cross_tool_hint`) for the common
-  confusions (`per_test_timeout_secs`/`test_name`/`doc` →
-  "that's a `cargo_test` parameter; nextest uses `filter`/`filter_expr`", and
-  the reverse), and a Levenshtein "did you mean `<closest>`?" suggestion for
-  typos. (`test_filter` used to be in this curated list too, but is now a
-  legitimate parameter on the nextest tools — see below.)
+  confusions that have no safe automatic translation (`jobs`/`profile` are
+  ambiguous which nextest knob they mean; `per_test_timeout_secs` and `doc`
+  have no nextest equivalent at all), and a Levenshtein "did you mean
+  `<closest>`?" suggestion for typos. (`test_filter` and `test_name`/`exact`
+  used to be in this curated list too, but are now legitimate parameters on
+  the nextest tools, translated automatically instead — see below. Likewise
+  `filter` on `cargo_test` — see below.)
 - Validation is centralised in the dispatcher rather than per-tool so it stays
   in lock-step with the schema automatically and cannot drift. Unit tests
   call the `call_*` functions directly, which is below the validation layer,
@@ -592,6 +599,49 @@ Implementation: `nextest::translate_test_filter` parses and validates the
 `run_ignored` into the same struct fields the native parameters populate —
 so the rest of `call_run` / `call_list`'s argv construction is unaware
 `test_filter` was ever involved.
+
+### `test_name`/`exact` and `filter` translations
+
+The same recurring-mistake pattern showed up for `cargo_test`'s
+`test_name`/`exact` pair (rejected as unknown on the nextest tools) and, in
+the opposite direction, nextest's own `filter` (rejected as unknown on
+`cargo_test`). Both are translated rather than just hinted at, for the same
+reason as `test_filter`: the underlying semantics line up exactly.
+
+On `cargo_nextest_run`/`cargo_nextest_list`:
+
+- `test_name` alone (substring match) → nextest's own `filter` positional
+  argument. No filterset expression is needed: nextest's plain `filter` is
+  already a libtest-compatible substring filter, so this is a direct
+  parameter rename, not a translation into a different mechanism.
+- `test_name` + `exact: true` → `test(=name)`, the filterset DSL's equality
+  matcher (`=string`), since a bare `filter` has no exact-match mode. The
+  name is escaped per the filterset escape-sequence grammar (`\`, `/`, `)`,
+  `,`) before being embedded — see `escape_filterset_matcher`.
+- `exact: true` without `test_name` is silently ignored, mirroring
+  `cargo_test`'s own behavior for the same case (see `build_doc_test_argv`):
+  the flag is meaningless without a name to match.
+- Supplying `test_name` alongside `filter`, `filter_expr`, or `test_filter`
+  is rejected as ambiguous, the same guard pattern as `apply_test_filter`.
+
+On `cargo_test`, the reverse: `filter` is accepted as an alias for
+`test_name` (`resolve_test_name`), since both are the same plain substring
+filter under different names. Supplying both `test_name` and `filter` is
+rejected as ambiguous.
+
+`filter_expr` is deliberately **not** given the same treatment in either
+direction: nextest's filterset DSL (boolean combinators, `package()`/
+`kind()`/`binary()` predicates, glob/regex matchers) cannot be mechanically
+reduced to libtest's single substring/exact name filter, so it stays a
+curated `cross_tool_hint` rejection on `cargo_test` rather than a
+translation. Likewise, `jobs`, `profile`, `per_test_timeout_secs`, and `doc`
+remain curated hints rather than translations — see "Flag remapping" above
+for why each is either ambiguous or has no nextest equivalent at all.
+
+Implementation: `nextest::translate_test_name` +
+`NextestOwnedOpts::apply_test_name` mirror `translate_test_filter` /
+`apply_test_filter`'s shape; `tools::resolve_test_name` handles the
+`cargo_test`-side `filter` alias.
 
 ### `working_directory` alias
 

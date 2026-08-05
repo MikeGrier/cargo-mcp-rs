@@ -400,6 +400,49 @@ fn translate_test_filter(
     Ok(Some((format!("test(/{pattern}/)"), include_ignored)))
 }
 
+/// Escape a literal string for embedding inside a nextest filterset name
+/// matcher (`=string`, `~string`, or the bare-word default). Per the
+/// filterset escape-sequence grammar, `\`, `/`, `)`, and `,` must be escaped;
+/// Rust test names cannot themselves contain most other metacharacters, but
+/// this covers the full escapable set defensively.
+fn escape_filterset_matcher(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(c, '\\' | '/' | ')' | ',') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Translate `cargo_test`'s `test_name` (+ optional `exact`) into the
+/// nextest-native equivalent, so callers reaching for `test_name` on
+/// `cargo_nextest_run`/`cargo_nextest_list` out of `cargo_test` habit get the
+/// expected selection instead of an "unknown parameter" error:
+///
+/// - `test_name` alone (substring match) becomes nextest's own bare `filter`
+///   positional argument, which is already a libtest-compatible substring
+///   filter — no filterset expression needed.
+/// - `test_name` + `exact: true` becomes `test(=name)`, the filterset
+///   equality matcher, since a bare positional `filter` has no exact-match
+///   mode.
+///
+/// Mirrors `cargo_test`'s own handling of `exact` without `test_name`: the
+/// flag is meaningless without a name to match, so it is silently ignored
+/// rather than rejected (see `build_doc_test_argv`).
+fn translate_test_name(args: &Value) -> Option<(Option<String>, Option<String>)> {
+    let name = opt_str(args, "test_name")?;
+    if opt_bool(args, "exact") {
+        Some((
+            None,
+            Some(format!("test(={})", escape_filterset_matcher(name))),
+        ))
+    } else {
+        Some((Some(name.to_owned()), None))
+    }
+}
+
 /// Extracted from `args` up front so borrowed `&str`s in `argv` outlive it.
 struct NextestOwnedOpts {
     cargo_profile: Option<String>,
@@ -458,6 +501,31 @@ impl NextestOwnedOpts {
         if include_ignored {
             self.run_ignored = Some("all".to_owned());
         }
+        Ok(())
+    }
+
+    /// Fold a translated `test_name`/`exact` (see [`translate_test_name`])
+    /// into this struct's `filter` / `filter_expr`, rejecting the call when
+    /// the caller also supplied `filter`, `filter_expr`, or `test_filter`
+    /// directly — ambiguous which selection should win.
+    fn apply_test_name(&mut self, args: &Value) -> Result<(), Box<dyn std::error::Error>> {
+        let Some((filter, filter_expr)) = translate_test_name(args) else {
+            return Ok(());
+        };
+        if self.filter.is_some() {
+            return Err("test_name is not supported together with filter on \
+                 cargo_nextest_run/cargo_nextest_list; test_name is automatically \
+                 translated into filter, so supplying both is ambiguous. Use just one."
+                .into());
+        }
+        if self.filter_expr.is_some() {
+            return Err("test_name is not supported together with filter_expr or \
+                 test_filter on cargo_nextest_run/cargo_nextest_list; use just one \
+                 selection mechanism."
+                .into());
+        }
+        self.filter = filter;
+        self.filter_expr = filter_expr;
         Ok(())
     }
 }
@@ -519,6 +587,7 @@ pub(crate) fn call_run(
     let o = CommonOpts::from_args(args);
     let mut nx = NextestOwnedOpts::from_args(args);
     nx.apply_test_filter(args)?;
+    nx.apply_test_name(args)?;
     validate_run_ignored(nx.run_ignored.as_deref())?;
 
     // nextest's `run` subcommand. We always ask cargo to emit JSON build
@@ -650,6 +719,7 @@ pub(crate) fn call_list(args: &Value) -> Result<ToolResult, Box<dyn std::error::
     let o = CommonOpts::from_args(args);
     let mut nx = NextestOwnedOpts::from_args(args);
     nx.apply_test_filter(args)?;
+    nx.apply_test_name(args)?;
     validate_list_type(nx.list_type.as_deref())?;
 
     // Always emit nextest's stable JSON discovery format. The tool's
@@ -949,6 +1019,99 @@ mod tests {
         match call_run(&args, None) {
             Err(e) => assert!(e.to_string().contains("filter_expr")),
             Ok(_) => panic!("expected test_filter + filter_expr to be rejected"),
+        }
+    }
+
+    #[test]
+    fn escape_filterset_matcher_escapes_special_characters() {
+        assert_eq!(escape_filterset_matcher("plain"), "plain");
+        assert_eq!(escape_filterset_matcher("a/b\\c)d,e"), "a\\/b\\\\c\\)d\\,e");
+    }
+
+    #[test]
+    fn translate_test_name_returns_none_when_absent() {
+        assert!(translate_test_name(&serde_json::json!({})).is_none());
+        assert!(
+            translate_test_name(&serde_json::json!({ "exact": true })).is_none(),
+            "exact without test_name is meaningless and ignored, mirroring cargo_test"
+        );
+    }
+
+    #[test]
+    fn translate_test_name_becomes_bare_filter_when_not_exact() {
+        let args = serde_json::json!({ "test_name": "mod::test_a" });
+        let (filter, filter_expr) = translate_test_name(&args).unwrap();
+        assert_eq!(filter.as_deref(), Some("mod::test_a"));
+        assert!(filter_expr.is_none());
+    }
+
+    #[test]
+    fn translate_test_name_becomes_equality_filterset_expr_when_exact() {
+        let args = serde_json::json!({ "test_name": "mod::test_a", "exact": true });
+        let (filter, filter_expr) = translate_test_name(&args).unwrap();
+        assert!(filter.is_none());
+        assert_eq!(filter_expr.as_deref(), Some("test(=mod::test_a)"));
+    }
+
+    #[test]
+    fn translate_test_name_escapes_exact_matcher() {
+        let args = serde_json::json!({ "test_name": "a/b", "exact": true });
+        let (_, filter_expr) = translate_test_name(&args).unwrap();
+        assert_eq!(filter_expr.as_deref(), Some("test(=a\\/b)"));
+    }
+
+    #[test]
+    fn apply_test_name_sets_filter_when_not_exact() {
+        let args = serde_json::json!({ "test_name": "x" });
+        let mut nx = NextestOwnedOpts::from_args(&args);
+        nx.apply_test_name(&args).unwrap();
+        assert_eq!(nx.filter.as_deref(), Some("x"));
+        assert!(nx.filter_expr.is_none());
+    }
+
+    #[test]
+    fn apply_test_name_sets_filter_expr_when_exact() {
+        let args = serde_json::json!({ "test_name": "x", "exact": true });
+        let mut nx = NextestOwnedOpts::from_args(&args);
+        nx.apply_test_name(&args).unwrap();
+        assert!(nx.filter.is_none());
+        assert_eq!(nx.filter_expr.as_deref(), Some("test(=x)"));
+    }
+
+    #[test]
+    fn apply_test_name_rejects_combination_with_filter() {
+        let args = serde_json::json!({ "test_name": "x", "filter": "y" });
+        let mut nx = NextestOwnedOpts::from_args(&args);
+        let err = nx.apply_test_name(&args).unwrap_err();
+        assert!(err.to_string().contains("filter"));
+    }
+
+    #[test]
+    fn apply_test_name_rejects_combination_with_filter_expr() {
+        let args = serde_json::json!({ "test_name": "x", "filter_expr": "test(y)" });
+        let mut nx = NextestOwnedOpts::from_args(&args);
+        let err = nx.apply_test_name(&args).unwrap_err();
+        assert!(err.to_string().contains("filter_expr"));
+    }
+
+    #[test]
+    fn apply_test_name_rejects_combination_with_test_filter() {
+        let args = serde_json::json!({ "test_name": "x", "test_filter": { "pattern": "y" } });
+        let mut nx = NextestOwnedOpts::from_args(&args);
+        // apply_test_filter runs first in the real call sites, folding
+        // test_filter into filter_expr; apply_test_name then sees that
+        // filter_expr occupied and rejects the ambiguous combination.
+        nx.apply_test_filter(&args).unwrap();
+        let err = nx.apply_test_name(&args).unwrap_err();
+        assert!(err.to_string().contains("test_filter"));
+    }
+
+    #[test]
+    fn call_run_rejects_test_name_with_filter() {
+        let args = serde_json::json!({ "test_name": "x", "filter": "y" });
+        match call_run(&args, None) {
+            Err(e) => assert!(e.to_string().contains("filter")),
+            Ok(_) => panic!("expected test_name + filter to be rejected"),
         }
     }
 
