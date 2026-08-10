@@ -1467,15 +1467,18 @@ pub(crate) const STDERR_REASON: &str = "x-cargo-mcp-stderr";
 
 /// Discriminator for the NDJSON record that wraps one line of test harness
 /// output (libtest's `running N tests`, `test foo ... ok`, `FAILED` lines,
-/// and any captured `println!` replays) in a `cargo_test` result.
-/// Each non-JSON stdout line is wrapped individually so the whole response
-/// remains a strict NDJSON stream parseable line-by-line.
+/// and any captured `println!` replays) in a `cargo_test` result. Each
+/// non-cargo line — plain text, or JSON without a recognised cargo `reason`
+/// (e.g. a test printing its own structured log) — is wrapped individually
+/// so the whole response remains a strict NDJSON stream parseable
+/// line-by-line.
 pub(crate) const TEST_OUTPUT_REASON: &str = "x-cargo-mcp-test-output";
 
 /// Discriminator for the NDJSON record that wraps one line of the executed
 /// program's own stdout in a `cargo_run` result. The program's output is
-/// arbitrary text (not libtest-shaped), so every non-JSON stdout line is
-/// wrapped individually, same as [`TEST_OUTPUT_REASON`] for `cargo_test`.
+/// arbitrary (not libtest-shaped) and may itself be JSON (e.g. structured
+/// logs), so every non-cargo line is wrapped individually, same as
+/// [`TEST_OUTPUT_REASON`] for `cargo_test`.
 pub(crate) const RUN_OUTPUT_REASON: &str = "x-cargo-mcp-run-output";
 
 /// Discriminator for the NDJSON record that wraps one line of the bench
@@ -6111,13 +6114,14 @@ mod tests {
 
     #[test]
     fn validate_known_args_cargo_run_accepts_bin_example_and_args() {
-        let args = serde_json::json!({
-            "bin": "mybin",
-            "example": "myex",
-            "args": ["--flag"],
-            "timeout_secs": 10,
-        });
-        assert!(validate_known_args("cargo_run", &args).is_ok());
+        // `bin` and `example` are each valid keys individually (checked
+        // separately here, not combined — `call_run` rejects that
+        // combination; see call_run_rejects_bin_with_example).
+        let with_bin =
+            serde_json::json!({ "bin": "mybin", "args": ["--flag"], "timeout_secs": 10 });
+        assert!(validate_known_args("cargo_run", &with_bin).is_ok());
+        let with_example = serde_json::json!({ "example": "myex" });
+        assert!(validate_known_args("cargo_run", &with_example).is_ok());
     }
 
     #[test]
@@ -6582,12 +6586,24 @@ mod tests {
     }
 
     #[test]
-    fn push_run_target_selection_emits_bin_and_example_only() {
-        let args = serde_json::json!({ "bin": "mybin", "example": "myex" });
+    fn push_run_target_selection_emits_bin_only() {
+        // `bin` and `example` are tested separately, never combined —
+        // `call_run` rejects that combination before this helper ever runs
+        // (see call_run_rejects_bin_with_example).
+        let args = serde_json::json!({ "bin": "mybin" });
         let o = CommonOpts::from_args(&args);
         let mut argv: Vec<&str> = vec!["run"];
         push_run_target_selection(&mut argv, &o);
-        assert_eq!(argv, vec!["run", "--bin", "mybin", "--example", "myex"]);
+        assert_eq!(argv, vec!["run", "--bin", "mybin"]);
+    }
+
+    #[test]
+    fn push_run_target_selection_emits_example_only() {
+        let args = serde_json::json!({ "example": "myex" });
+        let o = CommonOpts::from_args(&args);
+        let mut argv: Vec<&str> = vec!["run"];
+        push_run_target_selection(&mut argv, &o);
+        assert_eq!(argv, vec!["run", "--example", "myex"]);
     }
 
     #[test]
