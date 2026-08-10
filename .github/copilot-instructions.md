@@ -38,7 +38,9 @@ running in the wrong place.
 | `cargo_metadata` | `cargo metadata` |
 | `cargo_check` | `cargo check` |
 | `cargo_build` | `cargo build` |
+| `cargo_run` | `cargo run` |
 | `cargo_test` | `cargo test` |
+| `cargo_bench` | `cargo bench` |
 | `cargo_clippy` | `cargo clippy` |
 | `cargo_fmt_check` | `cargo fmt --check` |
 | `cargo_fmt` | `cargo fmt` |
