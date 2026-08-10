@@ -600,11 +600,21 @@ pub(crate) fn call_run(
 
     // nextest's `run` subcommand. We always ask cargo to emit JSON build
     // messages so the existing compiler-message / build-finished pipeline
-    // works unchanged for the build phase.
+    // works unchanged for the build phase. `--color never` suppresses ANSI
+    // sequences from nextest's own human-reporter output (its `--color`
+    // defaults to `auto` and reads `CARGO_TERM_COLOR`, which cargo-mcp
+    // already sets to `never`, but forwarding it explicitly makes the
+    // behaviour immune to a caller-supplied `env.CARGO_TERM_COLOR` override).
     //
     // `base` holds the selectors shared by the build (`--no-run`) and the
     // execution phase; the per-phase argv is derived from it below.
-    let mut base: Vec<&str> = vec!["nextest", "run", "--cargo-message-format=json"];
+    let mut base: Vec<&str> = vec![
+        "nextest",
+        "run",
+        "--cargo-message-format=json",
+        "--color",
+        "never",
+    ];
 
     // Nextest profile (selects per-test config from .config/nextest.toml).
     if let Some(p) = &nx.nextest_profile {
@@ -639,6 +649,10 @@ pub(crate) fn call_run(
     let (build_timeout, test_timeout) = tools::resolve_test_phase_timeouts(args)?;
 
     let mut on_progress = on_progress;
+    // Same up-front crate-count denominator cargo_check/build/test/clippy/doc
+    // use, so the build phase's progress notifications show a real total
+    // (e.g. `(3/120)`) instead of starting at `1/1`.
+    tools::emit_progress_total(&mut on_progress, wd, tc.as_deref());
 
     // ── Phase 1: build (`--no-run`) ──────────────────────────────────────────
     // Compile the test binaries up front so the build time is excluded from the
@@ -734,12 +748,18 @@ pub(crate) fn call_list(args: &Value) -> Result<ToolResult, Box<dyn std::error::
     // contract (and its NDJSON framing) depends on a single machine-
     // parseable payload line; exposing `--message-format human` or
     // `json-pretty` would break that, so we don't accept the knob at all.
+    // `--color never` suppresses ANSI sequences the same way as
+    // `cargo_nextest_run` (see the comment there for why it's forwarded
+    // explicitly rather than relying solely on the `CARGO_TERM_COLOR` env
+    // default).
     let mut argv: Vec<&str> = vec![
         "nextest",
         "list",
         "--message-format",
         "json",
         "--cargo-message-format=json",
+        "--color",
+        "never",
     ];
 
     if let Some(p) = &nx.nextest_profile {

@@ -3688,8 +3688,10 @@ fn compute_resolved_package_count(wd: Option<&str>, tc: Option<&str>) -> Option<
 /// Emit the up-front progress-total control record to the streaming callback,
 /// so the tracker can render an accurate denominator. Best-effort and only
 /// meaningful when a progress callback is active; no-op when metadata cannot
-/// be resolved.
-fn emit_progress_total(
+/// be resolved. Shared by `cargo_check`/`cargo_build`/`cargo_test`/
+/// `cargo_clippy`/`cargo_doc` in this module and `cargo_nextest_run` in
+/// `nextest.rs`.
+pub(crate) fn emit_progress_total(
     on_progress: &mut Option<&mut dyn FnMut(&str)>,
     wd: Option<&str>,
     tc: Option<&str>,
