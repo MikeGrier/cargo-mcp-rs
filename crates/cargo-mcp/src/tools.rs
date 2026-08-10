@@ -1362,8 +1362,9 @@ fn filter_test_ndjson(stdout: &str) -> String {
 }
 
 /// Like [`filter_test_ndjson`] but for `cargo run`'s output: the program's own
-/// stdout is arbitrary (not libtest-shaped) so every non-JSON line is wrapped
-/// in an [`RUN_OUTPUT_REASON`] record instead.
+/// stdout is arbitrary (not libtest-shaped), so every non-cargo line — plain
+/// text or the program's own JSON — is wrapped in a [`RUN_OUTPUT_REASON`]
+/// record instead.
 fn filter_run_ndjson(stdout: &str) -> String {
     filter_streamed_ndjson(stdout, RUN_OUTPUT_REASON)
 }
@@ -1378,11 +1379,14 @@ fn filter_bench_ndjson(stdout: &str) -> String {
 /// Shared implementation behind [`filter_test_ndjson`], [`filter_run_ndjson`],
 /// and [`filter_bench_ndjson`]: keeps compiler diagnostics (minus suppressed
 /// incremental-compilation notes, see [`compiler_message_is_incremental_note`])
-/// and the `build-finished` summary; drops dep-artifact / build-script noise
-/// already delivered via streaming progress; wraps every other non-blank line
-/// — the tool's own harness or program output — in an NDJSON record tagged
-/// with `wrap_reason` so the response stays a strict, line-by-line-parseable
-/// NDJSON stream.
+/// and the `build-finished` summary; drops only the known cargo noise records
+/// (`compiler-artifact`, `build-script-executed`) already delivered via
+/// streaming progress; wraps every other non-blank line — the tool's own
+/// harness or program output, **including JSON the program itself prints**
+/// (e.g. structured logs, which have no cargo `reason` discriminator or an
+/// unrecognised one) — in an NDJSON record tagged with `wrap_reason` so the
+/// response stays a strict, line-by-line-parseable NDJSON stream without
+/// silently losing legitimate program output.
 fn filter_streamed_ndjson(stdout: &str, wrap_reason: &str) -> String {
     stdout
         .lines()
@@ -1391,34 +1395,32 @@ fn filter_streamed_ndjson(stdout: &str, wrap_reason: &str) -> String {
                 return None;
             }
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-                // Same filtering as filter_build_ndjson: keep compiler
-                // diagnostics and the build-finished summary; drop artifact
-                // and build-script noise already delivered via streaming.
                 match v.get("reason").and_then(|r| r.as_str()) {
                     Some("compiler-message") => {
                         if !show_incremental_notes_enabled()
                             && compiler_message_is_incremental_note(&v)
                         {
-                            None
-                        } else {
-                            Some(line.to_owned())
+                            return None;
                         }
+                        return Some(line.to_owned());
                     }
-                    Some("build-finished") => Some(line.to_owned()),
-                    _ => None,
+                    Some("build-finished") => return Some(line.to_owned()),
+                    Some("compiler-artifact") | Some("build-script-executed") => return None,
+                    _ => {}
                 }
-            } else {
-                // Non-JSON line: harness text, captured test stdout, or (for
-                // cargo_run) the executed program's own stdout. Wrap in a
-                // custom NDJSON record so the stream stays parseable.
-                Some(
-                    serde_json::to_string(&serde_json::json!({
-                        "reason": wrap_reason,
-                        "text": line,
-                    }))
-                    .unwrap_or_else(|_| "{}".into()),
-                )
             }
+            // Non-JSON line (harness text, captured test stdout, or the
+            // executed program's own stdout) or a JSON line without a
+            // recognised cargo `reason` (e.g. structured logs the program
+            // itself prints). Wrap in a custom NDJSON record so the stream
+            // stays parseable without dropping the content.
+            Some(
+                serde_json::to_string(&serde_json::json!({
+                    "reason": wrap_reason,
+                    "text": line,
+                }))
+                .unwrap_or_else(|_| "{}".into()),
+            )
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -2406,8 +2408,20 @@ pub fn list() -> Value {
                         "description": OUTPUT_PATH_DESC
                     },
                     "package": { "type": "string", "description": RUN_PACKAGE_DESC },
-                    "bin": { "type": "string", "description": BIN_DESC },
-                    "example": { "type": "string", "description": EXAMPLE_DESC },
+                    "bin": {
+                        "type": "string",
+                        "description":
+                            "Select only the named binary target (--bin <NAME>). Not \
+                             supported together with `example` \u{2014} `cargo run` only ever \
+                             runs a single target."
+                    },
+                    "example": {
+                        "type": "string",
+                        "description":
+                            "Select only the named example target (--example <NAME>). Not \
+                             supported together with `bin` \u{2014} `cargo run` only ever runs \
+                             a single target."
+                    },
                     "args": {
                         "type": "array",
                         "items": { "type": "string" },
@@ -4357,6 +4371,13 @@ fn call_run(
     }
     let tc = toolchain_arg(args);
     let o = CommonOpts::from_args(args);
+    if o.bin.is_some() && o.example.is_some() {
+        return Err(
+            "bin and example are not supported together on cargo_run; `cargo run` only ever \
+             runs a single target. Pass just one."
+                .into(),
+        );
+    }
     let prog_args = opt_str_array(args, "args")?;
     // `cargo run` only ever runs one target, so package selection is just
     // `--package` — no `--workspace`/`--exclude` (there is nothing to run
@@ -5426,6 +5447,45 @@ mod tests {
         assert!(formatted.contains(r#""status":"success""#));
     }
 
+    #[test]
+    fn filter_run_ndjson_preserves_programs_own_json_output() {
+        // Regression test: a line the executed program itself prints as
+        // structured JSON (e.g. a logger) has no cargo `reason` discriminator
+        // (or an unrecognised one) and must be wrapped, not silently dropped,
+        // the same way a plain-text program stdout line would be.
+        let stdout = "{\"reason\":\"build-finished\",\"success\":true}\n\
+             {\"level\":\"info\",\"msg\":\"listening on :8080\"}\n\
+             {\"reason\":\"some-future-cargo-record\",\"detail\":1}\n";
+        let filtered = filter_run_ndjson(stdout);
+        assert!(
+            filtered.contains("listening on :8080"),
+            "program's own JSON output should be preserved, not dropped:\n{filtered}"
+        );
+        assert!(
+            filtered.contains("some-future-cargo-record"),
+            "unrecognised-reason JSON should be wrapped, not dropped:\n{filtered}"
+        );
+        let wrapped_count = filtered.matches(RUN_OUTPUT_REASON).count();
+        assert_eq!(
+            wrapped_count, 2,
+            "expected both non-cargo lines wrapped:\n{filtered}"
+        );
+    }
+
+    #[test]
+    fn filter_run_ndjson_still_drops_known_cargo_noise() {
+        // compiler-artifact / build-script-executed remain dropped: they are
+        // already delivered via streaming progress and are not the program's
+        // own output.
+        let stdout = "{\"reason\":\"compiler-artifact\",\"package_id\":\"foo\"}\n\
+             {\"reason\":\"build-script-executed\",\"package_id\":\"foo\"}\n\
+             {\"reason\":\"build-finished\",\"success\":true}\n";
+        let filtered = filter_run_ndjson(stdout);
+        assert!(!filtered.contains("compiler-artifact"));
+        assert!(!filtered.contains("build-script-executed"));
+        assert!(filtered.contains("build-finished"));
+    }
+
     /// The header must be a single, parseable JSON line ending in `\n`,
     /// with the documented `reason` discriminator and the argv/cwd echoed
     /// back so consumers can scan the output as pure NDJSON.
@@ -6313,6 +6373,20 @@ mod tests {
                 assert!(e.to_string().contains("filter"));
             }
             Ok(_) => panic!("expected test_name + filter to be rejected"),
+        }
+    }
+
+    #[test]
+    fn call_run_rejects_bin_with_example() {
+        // `cargo run` only ever runs a single target; rejected before any
+        // cargo subprocess is spawned (no working_dir needed).
+        let args = serde_json::json!({ "bin": "a", "example": "b" });
+        match call_run(&args, None) {
+            Err(e) => {
+                assert!(e.to_string().contains("bin"));
+                assert!(e.to_string().contains("example"));
+            }
+            Ok(_) => panic!("expected bin + example to be rejected"),
         }
     }
 
