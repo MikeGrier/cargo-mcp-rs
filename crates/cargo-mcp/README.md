@@ -738,8 +738,9 @@ overrides) in this priority order (first match wins):
    package — is the one used.
 3. **`$CARGO_HOME/bin/cargo[.exe]`** (default `~/.cargo/bin`) — only when
    `PATH` contains no `cargo`, e.g. a GUI-launched editor with a thin `PATH`.
-4. **Bare `cargo`** — last resort; the spawn will most likely fail with a
-   clear error.
+4. **Not found** — the tool call fails with a clear error. cargo-mcp never
+   spawns a bare `cargo`, since the OS would then re-search the relative
+   `PATH` entries skipped above.
 
 The resolved path and resolution step are logged (visible in VS Code's
 *MCP Logs: cargo* output channel) before each invocation.

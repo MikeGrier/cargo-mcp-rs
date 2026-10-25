@@ -64,7 +64,10 @@ pub(crate) enum NextestProbe {
 /// **Not cached.** A user who installs nextest mid-session should be able
 /// to retry immediately without restarting the MCP server.
 pub(crate) fn probe() -> NextestProbe {
-    let mut cmd = invoke::cargo_command();
+    // Unresolved cargo isn't a nextest problem; let the real run report it.
+    let Ok(mut cmd) = invoke::cargo_command() else {
+        return NextestProbe::Installed;
+    };
     cmd.args(["nextest", "--version"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())

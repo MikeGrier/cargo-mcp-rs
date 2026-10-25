@@ -4793,7 +4793,7 @@ fn call_diagnostic(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
     let rustc_program = toolchain
         .rustc
         .clone()
-        .unwrap_or_else(|| std::path::PathBuf::from("rustc"));
+        .or_else(|| invoke::search_path("rustc", &env).into_iter().next());
 
     // Capture failure as a string instead of failing the diagnostic — the
     // whole point is to report the truth.
@@ -4811,8 +4811,14 @@ fn call_diagnostic(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
         }),
         Err(e) => serde_json::json!({ "error": e.to_string() }),
     };
-    let cargo_version = version_of(&toolchain.cargo);
-    let rustc_version = version_of(&rustc_program);
+    let cargo_version = match toolchain.cargo_program() {
+        Ok(p) => version_of(p),
+        Err(e) => serde_json::json!({ "error": e.to_string() }),
+    };
+    let rustc_version = match &rustc_program {
+        Some(p) => version_of(p),
+        None => serde_json::json!({ "error": "rustc not found" }),
+    };
 
     let toolchain_file = invoke::find_toolchain_file(&wd_owned);
     let toolchain_contents = toolchain_file

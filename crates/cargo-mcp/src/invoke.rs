@@ -305,7 +305,7 @@ pub enum ResolutionSource {
     SiblingOfCargo,
     /// `$CARGO_HOME/bin` (or `~/.cargo/bin`), used only when `PATH` has no match.
     CargoHomeFallback,
-    /// Nothing found: `cargo` is spawned by bare name; `rustc` is not pinned.
+    /// Nothing found: spawning `cargo` errors; `rustc` is not pinned.
     Unresolved,
 }
 
@@ -365,28 +365,36 @@ fn exe_name(name: &str) -> String {
     }
 }
 
+/// Regular file the current process may execute (effective credentials on Unix).
 fn is_executable(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        path.metadata()
-            .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        use std::os::unix::ffi::OsStrExt;
+        let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+            return false;
+        };
+        // SAFETY: `c_path` is a valid NUL-terminated string that outlives the call.
+        unsafe {
+            libc::faccessat(
+                libc::AT_FDCWD,
+                c_path.as_ptr(),
+                libc::X_OK,
+                libc::AT_EACCESS,
+            ) == 0
+        }
     }
     #[cfg(not(unix))]
     {
-        path.is_file()
+        true
     }
 }
 
-/// Every match for `name` on `env`'s `PATH`, in `PATH` order (one per directory).
-///
-/// On Windows each directory is probed with the `PATHEXT` extensions. Relative
-/// `PATH` entries are skipped so resolution never depends on the working dir.
-pub fn search_path(name: &str, env: &EnvMap) -> Vec<PathBuf> {
-    let Some(path) = env_get(env, "PATH") else {
-        return Vec::new();
-    };
-    let exts: Vec<String> = if cfg!(windows) {
+/// Executable suffixes to probe: `PATHEXT` on Windows, none elsewhere.
+fn exec_extensions(env: &EnvMap) -> Vec<String> {
+    if cfg!(windows) {
         env_get(env, "PATHEXT")
             .and_then(OsStr::to_str)
             .filter(|s| !s.is_empty())
@@ -397,15 +405,31 @@ pub fn search_path(name: &str, env: &EnvMap) -> Vec<PathBuf> {
             .collect()
     } else {
         vec![String::new()]
-    };
-    std::env::split_paths(path)
+    }
+}
+
+fn find_in_dir(dir: &Path, name: &str, exts: &[String]) -> Option<PathBuf> {
+    exts.iter()
+        .map(|ext| dir.join(format!("{name}{ext}")))
+        .find(|p| is_executable(p))
+}
+
+/// Lazily yield each match for `name` on `env`'s `PATH`, in `PATH` order.
+///
+/// On Windows each directory is probed with the `PATHEXT` extensions. Relative
+/// `PATH` entries are skipped so resolution never depends on the working dir.
+fn path_matches<'a>(name: &'a str, env: &'a EnvMap) -> impl Iterator<Item = PathBuf> + 'a {
+    let exts = exec_extensions(env);
+    env_get(env, "PATH")
+        .into_iter()
+        .flat_map(std::env::split_paths)
         .filter(|dir| dir.is_absolute())
-        .filter_map(|dir| {
-            exts.iter()
-                .map(|ext| dir.join(format!("{name}{ext}")))
-                .find(|p| is_executable(p))
-        })
-        .collect()
+        .filter_map(move |dir| find_in_dir(&dir, name, &exts))
+}
+
+/// Every match for `name` on `env`'s `PATH`, in `PATH` order (one per directory).
+pub fn search_path(name: &str, env: &EnvMap) -> Vec<PathBuf> {
+    path_matches(name, env).collect()
 }
 
 /// Resolve the `cargo` / `rustc` pair against an explicit environment block.
@@ -415,7 +439,8 @@ pub fn search_path(name: &str, env: &EnvMap) -> Vec<PathBuf> {
 /// 2. The first `cargo` on `PATH` — so whatever toolchain manager the user put
 ///    first (rustup, a multiplexer, a distro package) is honoured.
 /// 3. `$CARGO_HOME/bin/cargo` (default `~/.cargo/bin`), only when `PATH` has none.
-/// 4. The bare name `cargo`.
+/// 4. Otherwise [`ResolutionSource::Unresolved`]; [`ResolvedToolchain::cargo_program`]
+///    then errors rather than letting the OS re-search the excluded entries.
 ///
 /// `rustc`: the `RUSTC` env var if set, otherwise the `rustc` next to the
 /// resolved `cargo`, otherwise none. Tying `rustc` to `cargo` keeps a stray
@@ -425,9 +450,9 @@ pub fn resolve_toolchain(env: &EnvMap) -> ResolvedToolchain {
     let (rustc, rustc_source) = if let Some(v) = env_get(env, "RUSTC").filter(|v| !v.is_empty()) {
         (Some(PathBuf::from(v)), ResolutionSource::Env)
     } else if let Some(sibling) = (cargo_source != ResolutionSource::Unresolved)
-        .then(|| cargo.parent().map(|d| d.join(exe_name("rustc"))))
+        .then(|| cargo.parent())
         .flatten()
-        .filter(|p| is_executable(p))
+        .and_then(|dir| find_in_dir(dir, "rustc", &exec_extensions(env)))
     {
         (Some(sibling), ResolutionSource::SiblingOfCargo)
     } else {
@@ -448,7 +473,7 @@ fn resolve_cargo_in(env: &EnvMap) -> (PathBuf, ResolutionSource) {
             return (p, ResolutionSource::Env);
         }
     }
-    if let Some(p) = search_path("cargo", env).into_iter().next() {
+    if let Some(p) = path_matches("cargo", env).next() {
         return (p, ResolutionSource::Path);
     }
     if let Some(home) = cargo_home_dir(env) {
@@ -458,6 +483,20 @@ fn resolve_cargo_in(env: &EnvMap) -> (PathBuf, ResolutionSource) {
         }
     }
     (PathBuf::from("cargo"), ResolutionSource::Unresolved)
+}
+
+impl ResolvedToolchain {
+    /// The `cargo` to spawn, or an error when none was found.
+    pub fn cargo_program(&self) -> std::io::Result<&Path> {
+        if self.cargo_source == ResolutionSource::Unresolved {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "cargo not found: no `cargo` in any absolute PATH entry and none in \
+                 $CARGO_HOME/bin. Set CARGO or fix PATH; run cargo_diagnostic for details.",
+            ));
+        }
+        Ok(&self.cargo)
+    }
 }
 
 /// Build the **complete** environment block for a subprocess, plus the
@@ -501,11 +540,11 @@ fn build_subprocess_env() -> EnvMap {
 /// Use this for ad-hoc cargo invocations (e.g. plugin probes) so per-call
 /// `env` overrides — such as an `env.PATH` adding `cargo-nextest`'s install
 /// dir — apply exactly as they would to a real cargo run.
-pub fn cargo_command() -> Command {
+pub fn cargo_command() -> std::io::Result<Command> {
     let (env, toolchain) = prepare_subprocess();
-    let mut cmd = Command::new(&toolchain.cargo);
+    let mut cmd = Command::new(toolchain.cargo_program()?);
     cmd.env_clear().envs(env);
-    cmd
+    Ok(cmd)
 }
 
 /// Compute the effective `CARGO_HOME` directory from `env`.
@@ -1450,7 +1489,7 @@ fn run_cargo_streaming_once(
     clear_incr_working_dirs(working_dir);
     let (env, toolchain) = prepare_subprocess();
     log_invocation(&toolchain, working_dir, args);
-    let mut cmd = Command::new(&toolchain.cargo);
+    let mut cmd = Command::new(toolchain.cargo_program()?);
     cmd.args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1759,7 +1798,7 @@ pub fn run_cargo_to_file(
 ) -> Result<CargoOutput, Box<dyn std::error::Error>> {
     let (env, toolchain) = prepare_subprocess();
     log_invocation(&toolchain, working_dir, args);
-    let mut cmd = Command::new(&toolchain.cargo);
+    let mut cmd = Command::new(toolchain.cargo_program()?);
     cmd.args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::from(dest_file)) // OS-level pipe → file, no heap buffer
@@ -2198,6 +2237,44 @@ mod tests {
         assert_eq!(tc.rustc, None);
     }
 
+    #[test]
+    fn unresolved_cargo_refuses_to_spawn_bare_name() {
+        let env = env_of(&[("PATH", OsStr::new(".tools"))]);
+
+        let tc = resolve_toolchain(&env);
+        assert_eq!(tc.cargo_source, ResolutionSource::Unresolved);
+        assert!(tc.cargo_program().is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_executable_cargo_is_skipped_for_later_path_entry() {
+        use std::os::unix::fs::PermissionsExt;
+        let first = unique_tempdir("noexec_first");
+        let blocked = write_fake_bin(&first, "cargo");
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let second = unique_tempdir("noexec_second");
+        let usable = write_fake_bin(&second, "cargo");
+        let path = path_of(&[&first, &second]);
+        let env = env_of(&[("PATH", &path)]);
+
+        assert_eq!(resolve_toolchain(&env).cargo, usable);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sibling_rustc_resolved_with_pathext() {
+        let dir = unique_tempdir("cmd_shims");
+        std::fs::write(dir.join("cargo.cmd"), b"@echo off\r\n").unwrap();
+        std::fs::write(dir.join("rustc.cmd"), b"@echo off\r\n").unwrap();
+        let path = path_of(&[&dir]);
+        let env = env_of(&[("PATH", &path), ("PATHEXT", OsStr::new(".EXE;.CMD"))]);
+
+        let tc = resolve_toolchain(&env);
+        assert_eq!(tc.rustc, Some(dir.join("rustc.cmd")));
+        assert_eq!(tc.rustc_source, ResolutionSource::SiblingOfCargo);
+    }
+
     #[cfg(windows)]
     #[test]
     fn pathext_and_case_insensitive_keys_on_windows() {
@@ -2321,17 +2398,21 @@ mod tests {
             "NO_COLOR",
         ]);
         let empty_home = unique_tempdir("apply_subprocess_env");
+        let bin = unique_tempdir("cargo_command_bin");
+        write_fake_bin(&bin, "cargo");
         guard.unset("RUSTC");
         guard.set("CARGO_HOME", &empty_home);
         guard.unset("CARGO_TERM_COLOR");
         guard.unset("NO_COLOR");
 
-        set_extra_env(vec![(
-            "CARGO_MCP_APPLY_PROBE_VAR".into(),
-            Some("hello".into()),
-        )]);
+        set_extra_env(vec![
+            ("CARGO_MCP_APPLY_PROBE_VAR".into(), Some("hello".into())),
+            ("CARGO".into(), None),
+            ("PATH".into(), Some(bin.display().to_string())),
+        ]);
         let cmd = cargo_command();
         set_extra_env(Vec::new());
+        let cmd = cmd.expect("fake cargo on PATH must resolve");
 
         // `Command::get_envs` returns the explicit block (`env_clear().envs(...)`).
         let envs: BTreeMap<OsString, Option<OsString>> = cmd
