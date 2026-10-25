@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.0](https://github.com/MikeGrier/cargo-mcp-rs/compare/v1.0.0...v1.1.0) (2026-10-25)
+
+
+### Features
+
+* nextest color/progress-total fixes + new cargo_run and cargo_bench tools ([689fac1](https://github.com/MikeGrier/cargo-mcp-rs/commit/689fac1f4d3bcf32e4b889a203245e46c88b9a8e))
+
 ## [1.0.0](https://github.com/MikeGrier/cargo-mcp-rs/compare/v0.12.1...v1.0.0) (2026-10-25)
 
 
