@@ -8,12 +8,12 @@
 //!
 //! ## Toolchain resolution
 //!
-//! The `cargo` binary is located via [`resolve_cargo_binary`] (and `rustc`
-//! via [`resolve_rustc_binary`]) using a three-tier strategy: the `CARGO`
-//! env var, then the rustup proxy at `$CARGO_HOME/bin/`, then a bare-name
-//! `PATH` lookup. Honouring the rustup proxy directly ensures
-//! `rust-toolchain.toml` is respected regardless of `PATH` ordering. See
-//! [`ResolutionSource`] and the `cargo_diagnostic` MCP tool for diagnostics.
+//! The `cargo` / `rustc` pair is located by [`resolve_toolchain`] against
+//! the child's effective environment: the `CARGO` env var, then the first
+//! `cargo` on `PATH`, then `$CARGO_HOME/bin/` as a fallback. `PATH` order is
+//! honoured so whichever toolchain manager the user put first (rustup, a
+//! multiplexer, ...) is used. See [`ResolutionSource`] and the
+//! `cargo_diagnostic` MCP tool for diagnostics.
 //!
 //! ## Cancellation
 //!
@@ -29,13 +29,10 @@
 //!   noise in MCP text responses.
 //! - `NO_COLOR=1` — belt-and-suspenders colour suppression for any tool in
 //!   the Cargo pipeline that respects the informal `NO_COLOR` convention.
-//! - `RUSTC=<resolved rustc>` — pinned to the rustc resolved by
-//!   [`resolve_rustc_binary`] (when not [`ResolutionSource::PathLookup`]) so
-//!   that `cargo` does not fall back to a stray `rustc` that happens to come
-//!   first on `PATH`. Without this, environments that prepend a non-rustup
-//!   `rustc` ahead of the rustup proxy bin dir would silently bypass
-//!   `rust-toolchain.toml` even though `cargo` itself is the rustup proxy.
-//!   Honoured only if the caller has not already set `RUSTC`.
+//! - `RUSTC=<rustc next to the resolved cargo>` — so `cargo` does not pick up
+//!   a stray `rustc` that comes earlier on `PATH` than the selected toolchain
+//!   manager. Skipped if `RUSTC` is already set, or if no `rustc` sits next
+//!   to `cargo`.
 //!
 //! Tool callers can layer additional `set`/`unset` operations on top via
 //! [`set_extra_env`]; the per-tool `env` parameter funnels through that
@@ -294,201 +291,274 @@ fn exit_due_only_to_incr_finalize(stdout: &str) -> bool {
 
 // ── toolchain resolution ──────────────────────────────────────────────────────
 
-/// Where the cargo (or rustc) binary path came from when resolved.
+/// Where a resolved `cargo` / `rustc` path came from.
 ///
-/// Used for diagnostic logging so users can tell *which* cargo cargo-mcp
-/// actually invoked when the wrong toolchain is in play.
+/// Reported in invocation logs and by `cargo_diagnostic` so users can tell
+/// *which* cargo cargo-mcp actually invoked when the wrong toolchain is in play.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResolutionSource {
-    /// `CARGO` (or `RUSTC`) environment variable pointed at an existing file.
-    CargoEnv,
-    /// Found at `$CARGO_HOME/bin/` (or `~/.cargo/bin/`) **with** a sibling
-    /// `rustup` binary — the canonical rustup proxy location. Invoking this
-    /// honours `rust-toolchain.toml`.
-    RustupProxy,
-    /// Found at the rustup-proxy location **without** a sibling `rustup`.
-    /// Treated as a regular cargo (toolchain file likely won't be honoured).
-    RustupProxyNoSibling,
-    /// No env override and no proxy on disk; fall back to a bare name and let
-    /// the OS resolve via `PATH` at spawn time.
-    PathLookup,
+    /// `CARGO` (or `RUSTC`) environment variable.
+    Env,
+    /// First match on the effective `PATH`.
+    Path,
+    /// `rustc` found next to the resolved `cargo`.
+    SiblingOfCargo,
+    /// `$CARGO_HOME/bin` (or `~/.cargo/bin`), used only when `PATH` has no match.
+    CargoHomeFallback,
+    /// Nothing found: spawning `cargo` errors; `rustc` is not pinned.
+    Unresolved,
 }
 
 impl ResolutionSource {
-    /// Numeric step (1, 2, or 3) matching the resolver's tier order.
+    /// Numeric tier (1 = env, 2 = PATH / sibling, 3 = CARGO_HOME, 4 = unresolved).
     pub fn step(self) -> u8 {
         match self {
-            Self::CargoEnv => 1,
-            Self::RustupProxy | Self::RustupProxyNoSibling => 2,
-            Self::PathLookup => 3,
+            Self::Env => 1,
+            Self::Path | Self::SiblingOfCargo => 2,
+            Self::CargoHomeFallback => 3,
+            Self::Unresolved => 4,
         }
     }
 }
 
-/// Resolve which `cargo` binary to invoke.
-///
-/// Three-tier resolution (first match wins):
-///
-/// 1. **`CARGO` env var** — if set and points to an existing file, use it.
-///    Standard cargo escape hatch; nested cargo invocations rely on it.
-/// 2. **Rustup proxy** at `$CARGO_HOME/bin/cargo[.exe]` (default
-///    `~/.cargo/bin/cargo[.exe]`). When present **with** a sibling `rustup`
-///    binary, this is the rustup proxy and invoking it honours
-///    `rust-toolchain.toml` regardless of `PATH` ordering.
-/// 3. **`PATH` lookup** — fall back to the bare name `"cargo"` and let the OS
-///    resolve it at spawn time.
-///
-/// The corresponding diagnostic surface is the `cargo_diagnostic` MCP tool,
-/// which reports the resolved path, the resolution step, and surrounding
-/// environment so toolchain-mismatch problems can be diagnosed in one shot.
-pub fn resolve_cargo_binary() -> (PathBuf, ResolutionSource) {
-    resolve_binary("cargo", "CARGO")
+/// The `cargo` / `rustc` pair a subprocess will use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedToolchain {
+    pub cargo: PathBuf,
+    pub cargo_source: ResolutionSource,
+    /// `None` when `RUSTC` is unset and no `rustc` sits next to `cargo`.
+    pub rustc: Option<PathBuf>,
+    pub rustc_source: ResolutionSource,
 }
 
-/// Resolve which `rustc` binary to invoke (used by `cargo_diagnostic`).
-///
-/// Mirrors [`resolve_cargo_binary`]: env var → rustup proxy → PATH.
-pub fn resolve_rustc_binary() -> (PathBuf, ResolutionSource) {
-    resolve_binary("rustc", "RUSTC")
-}
+/// An explicit environment block, as handed to the child process.
+pub type EnvMap = BTreeMap<OsString, OsString>;
 
-/// Inject `RUSTC=<resolved rustc>` into `cmd`'s environment so the spawned
-/// `cargo` does not fall back to a stray `rustc` from `PATH`.
-///
-/// Without this, an environment that prepends a non-rustup directory
-/// containing a plain `rustc.exe` ahead of `~/.cargo/bin` would cause cargo
-/// (even when *cargo* itself was correctly resolved to the rustup proxy) to
-/// invoke that stray `rustc`, silently bypassing `rust-toolchain.toml`. See
-/// the module-level "Environment" docs.
-///
-/// Behaviour:
-/// - If the user has already set `RUSTC` in the inherited environment, it is
-///   left alone (their explicit choice wins).
-/// - If [`resolve_rustc_binary`] returned [`ResolutionSource::PathLookup`],
-///   no override is set: there is no concrete path to pin, and forcing
-///   `RUSTC=rustc` would just re-run the same `PATH` lookup cargo would do
-///   anyway.
-/// - Otherwise (`RustupProxy` or `RustupProxyNoSibling`), set `RUSTC` to
-///   the resolved path. For the rustup proxy this defers toolchain
-///   selection to the proxy, which honours `rust-toolchain.toml`.
-fn apply_rustc_env_to_map(env: &mut BTreeMap<OsString, OsString>) {
-    if env.get(OsStr::new("RUSTC")).is_some_and(|v| !v.is_empty()) {
-        return;
+fn env_key_eq(key: &OsStr, name: &str) -> bool {
+    if cfg!(windows) {
+        key.to_str().is_some_and(|k| k.eq_ignore_ascii_case(name))
+    } else {
+        key == name
     }
-    let (rustc_path, source) = resolve_rustc_binary();
-    if matches!(source, ResolutionSource::PathLookup) {
-        return;
-    }
-    env.insert(OsString::from("RUSTC"), rustc_path.into_os_string());
 }
 
-/// Build the **complete** environment block to hand to the cargo subprocess
-/// at spawn time.
+/// Look up `name` in `env`, case-insensitively on Windows.
+pub fn env_get<'a>(env: &'a EnvMap, name: &str) -> Option<&'a OsStr> {
+    env.iter()
+        .find(|(k, _)| env_key_eq(k, name))
+        .map(|(_, v)| v.as_os_str())
+}
+
+/// Set (`Some`) or remove (`None`) `name`, replacing any case-variant key on Windows.
+fn env_set(env: &mut EnvMap, name: &str, value: Option<OsString>) {
+    env.retain(|k, _| !env_key_eq(k, name));
+    if let Some(v) = value {
+        env.insert(OsString::from(name), v);
+    }
+}
+
+fn exe_name(name: &str) -> String {
+    if cfg!(windows) {
+        format!("{name}.exe")
+    } else {
+        name.to_string()
+    }
+}
+
+/// Regular file the current process may execute (effective credentials on Unix).
+fn is_executable(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+            return false;
+        };
+        // SAFETY: `c_path` is a valid NUL-terminated string that outlives the call.
+        unsafe {
+            libc::faccessat(
+                libc::AT_FDCWD,
+                c_path.as_ptr(),
+                libc::X_OK,
+                libc::AT_EACCESS,
+            ) == 0
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+/// Executable suffixes to probe: `PATHEXT` on Windows, none elsewhere.
+fn exec_extensions(env: &EnvMap) -> Vec<String> {
+    if cfg!(windows) {
+        env_get(env, "PATHEXT")
+            .and_then(OsStr::to_str)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(".COM;.EXE;.BAT;.CMD")
+            .split(';')
+            .filter(|e| !e.is_empty())
+            .map(str::to_ascii_lowercase)
+            .collect()
+    } else {
+        vec![String::new()]
+    }
+}
+
+fn find_in_dir(dir: &Path, name: &str, exts: &[String]) -> Option<PathBuf> {
+    exts.iter()
+        .map(|ext| dir.join(format!("{name}{ext}")))
+        .find(|p| is_executable(p))
+}
+
+/// Lazily yield each match for `name` on `env`'s `PATH`, in `PATH` order.
 ///
-/// On Windows this becomes the explicit `lpEnvironment` argument to
-/// `CreateProcess`; on Unix it is the `envp` passed to `execvpe`. Callers
-/// install the block with `cmd.env_clear().envs(build_subprocess_env())` so
-/// the child sees exactly what we computed — no implicit merge between
-/// per-`Command` overrides and the parent's inherited block at spawn time.
+/// On Windows each directory is probed with the `PATHEXT` extensions. Relative
+/// `PATH` entries are skipped so resolution never depends on the working dir.
+fn path_matches<'a>(name: &'a str, env: &'a EnvMap) -> impl Iterator<Item = PathBuf> + 'a {
+    let exts = exec_extensions(env);
+    env_get(env, "PATH")
+        .into_iter()
+        .flat_map(std::env::split_paths)
+        .filter(|dir| dir.is_absolute())
+        .filter_map(move |dir| find_in_dir(&dir, name, &exts))
+}
+
+/// Every match for `name` on `env`'s `PATH`, in `PATH` order (one per directory).
+pub fn search_path(name: &str, env: &EnvMap) -> Vec<PathBuf> {
+    path_matches(name, env).collect()
+}
+
+/// Resolve the `cargo` / `rustc` pair against an explicit environment block.
+///
+/// `cargo`, first match wins:
+/// 1. `CARGO` env var, if it names an existing file.
+/// 2. The first `cargo` on `PATH` — so whatever toolchain manager the user put
+///    first (rustup, a multiplexer, a distro package) is honoured.
+/// 3. `$CARGO_HOME/bin/cargo` (default `~/.cargo/bin`), only when `PATH` has none.
+/// 4. Otherwise [`ResolutionSource::Unresolved`]; [`ResolvedToolchain::cargo_program`]
+///    then errors rather than letting the OS re-search the excluded entries.
+///
+/// `rustc`: the `RUSTC` env var if set, otherwise the `rustc` next to the
+/// resolved `cargo`, otherwise none. Tying `rustc` to `cargo` keeps a stray
+/// `rustc` earlier on `PATH` from bypassing the selected toolchain manager.
+pub fn resolve_toolchain(env: &EnvMap) -> ResolvedToolchain {
+    let (cargo, cargo_source) = resolve_cargo_in(env);
+    let (rustc, rustc_source) = if let Some(v) = env_get(env, "RUSTC").filter(|v| !v.is_empty()) {
+        (Some(PathBuf::from(v)), ResolutionSource::Env)
+    } else if let Some(sibling) = (cargo_source != ResolutionSource::Unresolved)
+        .then(|| cargo.parent())
+        .flatten()
+        .and_then(|dir| find_in_dir(dir, "rustc", &exec_extensions(env)))
+    {
+        (Some(sibling), ResolutionSource::SiblingOfCargo)
+    } else {
+        (None, ResolutionSource::Unresolved)
+    };
+    ResolvedToolchain {
+        cargo,
+        cargo_source,
+        rustc,
+        rustc_source,
+    }
+}
+
+fn resolve_cargo_in(env: &EnvMap) -> (PathBuf, ResolutionSource) {
+    if let Some(v) = env_get(env, "CARGO").filter(|v| !v.is_empty()) {
+        let p = PathBuf::from(v);
+        if p.is_file() {
+            return (p, ResolutionSource::Env);
+        }
+    }
+    if let Some(p) = path_matches("cargo", env).next() {
+        return (p, ResolutionSource::Path);
+    }
+    if let Some(home) = cargo_home_dir(env) {
+        let p = home.join("bin").join(exe_name("cargo"));
+        if is_executable(&p) {
+            return (p, ResolutionSource::CargoHomeFallback);
+        }
+    }
+    (PathBuf::from("cargo"), ResolutionSource::Unresolved)
+}
+
+impl ResolvedToolchain {
+    /// The `cargo` to spawn, or an error when none was found.
+    pub fn cargo_program(&self) -> std::io::Result<&Path> {
+        if self.cargo_source == ResolutionSource::Unresolved {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "cargo not found: no `cargo` in any absolute PATH entry and none in \
+                 $CARGO_HOME/bin. Set CARGO or fix PATH; run cargo_diagnostic for details.",
+            ));
+        }
+        Ok(&self.cargo)
+    }
+}
+
+/// Build the **complete** environment block for a subprocess, plus the
+/// toolchain resolved against it.
+///
+/// Callers install the block with `cmd.env_clear().envs(env)` so the child
+/// sees exactly what we computed — no implicit merge with the parent's
+/// inherited block at spawn time.
 ///
 /// Layering, in order (later entries win):
 /// 1. The parent process's current environment ([`std::env::vars_os`]).
 /// 2. cargo-mcp's built-in defaults (`CARGO_TERM_COLOR=never`, `NO_COLOR=1`).
-/// 3. The `RUSTC` pin from [`apply_rustc_env_to_map`].
-/// 4. Per-call overrides from [`set_extra_env`] (set or unset).
-fn build_subprocess_env() -> BTreeMap<OsString, OsString> {
-    let mut env: BTreeMap<OsString, OsString> = std::env::vars_os().collect();
-    env.insert(OsString::from("CARGO_TERM_COLOR"), OsString::from("never"));
-    env.insert(OsString::from("NO_COLOR"), OsString::from("1"));
-    apply_rustc_env_to_map(&mut env);
+/// 3. Per-call overrides from [`set_extra_env`] (set or unset).
+/// 4. `RUSTC=<rustc next to cargo>`, unless `RUSTC` is already set or the
+///    per-call overrides explicitly unset it.
+///
+/// Resolution runs after step 3 so a per-call `env.PATH` selects the cargo.
+pub fn prepare_subprocess() -> (EnvMap, ResolvedToolchain) {
+    let mut env: EnvMap = std::env::vars_os().collect();
+    env_set(&mut env, "CARGO_TERM_COLOR", Some("never".into()));
+    env_set(&mut env, "NO_COLOR", Some("1".into()));
     apply_extra_env_to_map(&mut env);
-    env
-}
-
-/// Install the same explicit environment block on `cmd` that
-/// [`run_cargo`] / [`run_cargo_streaming_with_timeout`] would install on
-/// the cargo child process — including the caller's per-call `env`
-/// overrides previously installed via [`set_extra_env`].
-///
-/// Use this for ad-hoc external commands (e.g. plugin probes) that
-/// should honour the same PATH / CARGO_HOME / RUSTC layering as a real
-/// cargo invocation; without it, those commands inherit the cargo-mcp
-/// server's parent env and miss per-call overrides — so a caller who
-/// added `cargo-nextest`'s install dir to `env.PATH` would still see
-/// the probe report it as missing.
-pub fn apply_subprocess_env(cmd: &mut Command) {
-    cmd.env_clear().envs(build_subprocess_env());
-}
-
-fn resolve_binary(name: &str, env_var: &str) -> (PathBuf, ResolutionSource) {
-    // Step 1: explicit env var override.
-    if let Some(v) = std::env::var_os(env_var)
-        && !v.is_empty()
-    {
-        let p = PathBuf::from(&v);
-        if p.is_file() {
-            return (p, ResolutionSource::CargoEnv);
-        }
-        // Set but not a file — fall through (don't error, don't honour).
-    }
-
-    // Step 2: rustup proxy at CARGO_HOME/bin or ~/.cargo/bin.
-    if let Some(cargo_home) = cargo_home_dir() {
-        let bin_name = if cfg!(windows) {
-            format!("{name}.exe")
-        } else {
-            name.to_string()
-        };
-        let path = cargo_home.join("bin").join(&bin_name);
-        if path.is_file() {
-            let rustup_name = if cfg!(windows) {
-                "rustup.exe"
-            } else {
-                "rustup"
-            };
-            let sibling = cargo_home.join("bin").join(rustup_name);
-            let source = if sibling.exists() {
-                ResolutionSource::RustupProxy
-            } else {
-                ResolutionSource::RustupProxyNoSibling
-            };
-            return (path, source);
+    let mut toolchain = resolve_toolchain(&env);
+    if toolchain.rustc_source == ResolutionSource::SiblingOfCargo {
+        if extra_env_unsets("RUSTC") {
+            toolchain.rustc = None;
+            toolchain.rustc_source = ResolutionSource::Unresolved;
+        } else if let Some(rustc) = &toolchain.rustc {
+            env_set(&mut env, "RUSTC", Some(rustc.clone().into_os_string()));
         }
     }
-
-    // Step 3: bare name — PATH lookup happens at spawn time.
-    (PathBuf::from(name), ResolutionSource::PathLookup)
+    (env, toolchain)
 }
 
-/// Compute the effective `CARGO_HOME` directory.
+fn build_subprocess_env() -> EnvMap {
+    prepare_subprocess().0
+}
+
+/// A `Command` for the resolved `cargo` with the full subprocess env installed.
 ///
-/// Honours the `CARGO_HOME` env var if set and non-empty, otherwise
-/// `~/.cargo` (`%USERPROFILE%\.cargo` on Windows).
-pub fn cargo_home_dir() -> Option<PathBuf> {
-    if let Some(v) = std::env::var_os("CARGO_HOME")
-        && !v.is_empty()
-    {
+/// Use this for ad-hoc cargo invocations (e.g. plugin probes) so per-call
+/// `env` overrides — such as an `env.PATH` adding `cargo-nextest`'s install
+/// dir — apply exactly as they would to a real cargo run.
+pub fn cargo_command() -> std::io::Result<Command> {
+    let (env, toolchain) = prepare_subprocess();
+    let mut cmd = Command::new(toolchain.cargo_program()?);
+    cmd.env_clear().envs(env);
+    Ok(cmd)
+}
+
+/// Compute the effective `CARGO_HOME` directory from `env`.
+///
+/// Honours `CARGO_HOME` if set and non-empty, otherwise `~/.cargo`
+/// (`%USERPROFILE%\.cargo` on Windows).
+pub fn cargo_home_dir(env: &EnvMap) -> Option<PathBuf> {
+    if let Some(v) = env_get(env, "CARGO_HOME").filter(|v| !v.is_empty()) {
         return Some(PathBuf::from(v));
     }
-    user_home_dir().map(|h| h.join(".cargo"))
-}
-
-/// Best-effort home directory: `%USERPROFILE%` on Windows, `$HOME` elsewhere.
-///
-/// Returns `None` if neither is set (unusual; resolver then falls through to
-/// PATH lookup rather than panicking).
-pub fn user_home_dir() -> Option<PathBuf> {
-    #[cfg(windows)]
-    let var = "USERPROFILE";
-    #[cfg(not(windows))]
-    let var = "HOME";
-    std::env::var_os(var).and_then(|v| {
-        if v.is_empty() {
-            None
-        } else {
-            Some(PathBuf::from(v))
-        }
-    })
+    let home_var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    env_get(env, home_var)
+        .filter(|v| !v.is_empty())
+        .map(|h| PathBuf::from(h).join(".cargo"))
 }
 
 /// Walk `start` and its ancestors looking for `rust-toolchain.toml` (or the
@@ -511,26 +581,32 @@ pub fn find_toolchain_file(start: &Path) -> Option<PathBuf> {
 ///
 /// Routed through the MCP `notifications/message` channel so the client
 /// displays it at the intended level (`info` for the invocation record,
-/// `warning` for the no-sibling-rustup advisory) in its MCP output pane,
-/// rather than as untyped stderr output.
-fn log_invocation(path: &Path, source: ResolutionSource, working_dir: Option<&str>, args: &[&str]) {
+/// `warning` when no `rustc` could be tied to the chosen `cargo`) in its MCP
+/// output pane, rather than as untyped stderr output.
+fn log_invocation(toolchain: &ResolvedToolchain, working_dir: Option<&str>, args: &[&str]) {
     emit_mcp_log(
         "info",
         &format!(
-            "invoking {} (source={:?}, step={}) cwd={:?} args={:?}",
-            path.display(),
-            source,
-            source.step(),
+            "invoking {} (source={:?}, step={}) rustc={} (source={:?}) cwd={:?} args={:?}",
+            toolchain.cargo.display(),
+            toolchain.cargo_source,
+            toolchain.cargo_source.step(),
+            toolchain
+                .rustc
+                .as_ref()
+                .map_or_else(|| "<unpinned>".into(), |p| p.display().to_string()),
+            toolchain.rustc_source,
             working_dir.unwrap_or("."),
             args,
         ),
     );
-    if matches!(source, ResolutionSource::RustupProxyNoSibling) {
+    if toolchain.rustc.is_none() {
         emit_mcp_log(
             "warning",
             &format!(
-                "{} exists but no sibling rustup found — rust-toolchain.toml may not be honoured",
-                path.display(),
+                "no rustc next to {} and RUSTC is unset — cargo will take rustc from PATH, \
+                 which may belong to a different toolchain manager",
+                toolchain.cargo.display(),
             ),
         );
     }
@@ -695,31 +771,32 @@ thread_local! {
 /// Pass the parsed `env` map before spawning a cargo subprocess and an
 /// empty `Vec` after it returns. The subprocess runners merge these
 /// operations into the explicit env block built by
-/// [`build_subprocess_env`] **after** the built-in defaults
-/// (`CARGO_TERM_COLOR`, `NO_COLOR`, `RUSTC`), so a caller-supplied
-/// value wins over the default.
+/// [`prepare_subprocess`] **after** the built-in defaults
+/// (`CARGO_TERM_COLOR`, `NO_COLOR`), so a caller-supplied value wins, and
+/// **before** toolchain resolution, so a per-call `PATH` selects the cargo.
 pub fn set_extra_env(env: ExtraEnv) {
     EXTRA_ENV.with(|e| *e.borrow_mut() = env);
 }
 
 /// Merge the current thread's extra env operations into `env`.
 ///
-/// Called by [`build_subprocess_env`] last so caller-supplied values
-/// override every prior layer (inherited env, built-in defaults, RUSTC
-/// pin). `None` values map to a remove from the map.
-fn apply_extra_env_to_map(env: &mut BTreeMap<OsString, OsString>) {
+/// Called by [`prepare_subprocess`] after the inherited env and built-in
+/// defaults so caller-supplied values win. `None` values remove the key.
+fn apply_extra_env_to_map(env: &mut EnvMap) {
     EXTRA_ENV.with(|e| {
         for (k, v) in e.borrow().iter() {
-            match v {
-                Some(val) => {
-                    env.insert(OsString::from(k), OsString::from(val));
-                }
-                None => {
-                    env.remove(OsStr::new(k));
-                }
-            }
+            env_set(env, k, v.as_ref().map(OsString::from));
         }
     });
+}
+
+/// Whether the current thread's extra env explicitly removes `name`.
+fn extra_env_unsets(name: &str) -> bool {
+    EXTRA_ENV.with(|e| {
+        e.borrow()
+            .iter()
+            .any(|(k, v)| v.is_none() && env_key_eq(OsStr::new(k), name))
+    })
 }
 
 // ── output types ──────────────────────────────────────────────────────────────
@@ -1410,15 +1487,15 @@ fn run_cargo_streaming_once(
     on_stdout_line: &mut dyn FnMut(&str),
 ) -> Result<CargoOutput, Box<dyn std::error::Error>> {
     clear_incr_working_dirs(working_dir);
-    let (cargo_path, source) = resolve_cargo_binary();
-    log_invocation(&cargo_path, source, working_dir, args);
-    let mut cmd = Command::new(&cargo_path);
+    let (env, toolchain) = prepare_subprocess();
+    log_invocation(&toolchain, working_dir, args);
+    let mut cmd = Command::new(toolchain.cargo_program()?);
     cmd.args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .env_clear()
-        .envs(build_subprocess_env());
+        .envs(env);
 
     if let Some(dir) = working_dir {
         cmd.current_dir(dir);
@@ -1719,15 +1796,15 @@ pub fn run_cargo_to_file(
     dest_file: std::fs::File,
     timeout: Option<Duration>,
 ) -> Result<CargoOutput, Box<dyn std::error::Error>> {
-    let (cargo_path, source) = resolve_cargo_binary();
-    log_invocation(&cargo_path, source, working_dir, args);
-    let mut cmd = Command::new(&cargo_path);
+    let (env, toolchain) = prepare_subprocess();
+    log_invocation(&toolchain, working_dir, args);
+    let mut cmd = Command::new(toolchain.cargo_program()?);
     cmd.args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::from(dest_file)) // OS-level pipe → file, no heap buffer
         .stderr(Stdio::piped())
         .env_clear()
-        .envs(build_subprocess_env());
+        .envs(env);
 
     if let Some(dir) = working_dir {
         cmd.current_dir(dir);
@@ -1987,6 +2064,11 @@ mod tests {
         std::fs::create_dir_all(dir).unwrap();
         let path = dir.join(bin_name(name));
         std::fs::write(&path, b"#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
         path
     }
 
@@ -2019,184 +2101,233 @@ mod tests {
         assert_eq!(stderr, original, "hint must not fire on unrelated errors");
     }
 
+    fn env_of(pairs: &[(&str, &OsStr)]) -> EnvMap {
+        pairs
+            .iter()
+            .map(|(k, v)| (OsString::from(k), v.to_os_string()))
+            .collect()
+    }
+
+    fn path_of(dirs: &[&Path]) -> OsString {
+        std::env::join_paths(dirs).unwrap()
+    }
+
     #[test]
     fn cargo_env_var_honoured_when_pointing_at_existing_file() {
-        let _g = ENV_LOCK.lock().unwrap();
-        let guard = EnvGuard::snapshot(&["CARGO", "CARGO_HOME", "HOME", "USERPROFILE"]);
         let dir = unique_tempdir("cargo_env");
         let fake = write_fake_bin(&dir, "my-cargo");
-        guard.set("CARGO", &fake);
+        let env = env_of(&[("CARGO", fake.as_os_str())]);
 
-        let (path, source) = resolve_cargo_binary();
-        assert_eq!(path, fake);
-        assert_eq!(source, ResolutionSource::CargoEnv);
-        assert_eq!(source.step(), 1);
+        let tc = resolve_toolchain(&env);
+        assert_eq!(tc.cargo, fake);
+        assert_eq!(tc.cargo_source, ResolutionSource::Env);
+        assert_eq!(tc.cargo_source.step(), 1);
     }
 
     #[test]
     fn cargo_env_var_pointing_at_missing_file_is_skipped() {
-        let _g = ENV_LOCK.lock().unwrap();
-        let guard = EnvGuard::snapshot(&["CARGO", "CARGO_HOME", "HOME", "USERPROFILE"]);
         let dir = unique_tempdir("cargo_env_missing");
-        guard.set("CARGO", dir.join("does-not-exist"));
-        // No CARGO_HOME / HOME → should fall through to PathLookup.
-        guard.unset("CARGO_HOME");
-        guard.unset("HOME");
-        guard.unset("USERPROFILE");
+        let missing = dir.join("does-not-exist");
+        let env = env_of(&[("CARGO", missing.as_os_str())]);
 
-        let (path, source) = resolve_cargo_binary();
-        assert_eq!(source, ResolutionSource::PathLookup);
-        assert_eq!(path, PathBuf::from("cargo"));
+        let tc = resolve_toolchain(&env);
+        assert_eq!(tc.cargo_source, ResolutionSource::Unresolved);
+        assert_eq!(tc.cargo, PathBuf::from("cargo"));
+        assert_eq!(tc.rustc, None, "unresolved cargo must not pin a rustc");
     }
 
     #[test]
-    fn rustup_proxy_with_sibling_is_preferred_over_path() {
-        let _g = ENV_LOCK.lock().unwrap();
-        let guard = EnvGuard::snapshot(&["CARGO", "CARGO_HOME", "HOME", "USERPROFILE"]);
-        let cargo_home = unique_tempdir("cargo_home");
-        let bin_dir = cargo_home.join("bin");
-        let cargo_path = write_fake_bin(&bin_dir, "cargo");
-        write_fake_bin(&bin_dir, "rustup");
-        guard.unset("CARGO");
-        guard.set("CARGO_HOME", &cargo_home);
+    fn path_wins_over_cargo_home_and_pins_sibling_rustc() {
+        let mux = unique_tempdir("mux");
+        let mux_cargo = write_fake_bin(&mux, "cargo");
+        let mux_rustc = write_fake_bin(&mux, "rustc");
+        let home = unique_tempdir("cargo_home");
+        let home_bin = home.join("bin");
+        write_fake_bin(&home_bin, "cargo");
+        write_fake_bin(&home_bin, "rustc");
+        write_fake_bin(&home_bin, "rustup");
+        let path = path_of(&[&mux, &home_bin]);
+        let env = env_of(&[("PATH", &path), ("CARGO_HOME", home.as_os_str())]);
 
-        let (path, source) = resolve_cargo_binary();
-        assert_eq!(path, cargo_path);
-        assert_eq!(source, ResolutionSource::RustupProxy);
-        assert_eq!(source.step(), 2);
+        let tc = resolve_toolchain(&env);
+        assert_eq!(tc.cargo, mux_cargo);
+        assert_eq!(tc.cargo_source, ResolutionSource::Path);
+        assert_eq!(tc.rustc, Some(mux_rustc));
+        assert_eq!(tc.rustc_source, ResolutionSource::SiblingOfCargo);
     }
 
     #[test]
-    fn rustup_proxy_without_sibling_emits_no_sibling_variant() {
-        let _g = ENV_LOCK.lock().unwrap();
-        let guard = EnvGuard::snapshot(&["CARGO", "CARGO_HOME", "HOME", "USERPROFILE"]);
-        let cargo_home = unique_tempdir("cargo_home_nosib");
-        let bin_dir = cargo_home.join("bin");
-        let cargo_path = write_fake_bin(&bin_dir, "cargo");
-        // Note: no sibling rustup written.
-        guard.unset("CARGO");
-        guard.set("CARGO_HOME", &cargo_home);
+    fn path_order_is_respected() {
+        let first = unique_tempdir("path_first");
+        let second = unique_tempdir("path_second");
+        let first_cargo = write_fake_bin(&first, "cargo");
+        write_fake_bin(&second, "cargo");
+        let path = path_of(&[&first, &second]);
+        let env = env_of(&[("PATH", &path)]);
 
-        let (path, source) = resolve_cargo_binary();
-        assert_eq!(path, cargo_path);
-        assert_eq!(source, ResolutionSource::RustupProxyNoSibling);
-        assert_eq!(source.step(), 2);
+        let tc = resolve_toolchain(&env);
+        assert_eq!(tc.cargo, first_cargo);
+        assert_eq!(search_path("cargo", &env).len(), 2);
     }
 
     #[test]
-    fn no_proxy_falls_back_to_path_lookup() {
-        let _g = ENV_LOCK.lock().unwrap();
-        let guard = EnvGuard::snapshot(&["CARGO", "CARGO_HOME", "HOME", "USERPROFILE"]);
-        let empty_home = unique_tempdir("empty_home");
-        // No bin/cargo under this home.
-        guard.unset("CARGO");
-        guard.set("CARGO_HOME", &empty_home);
+    fn stray_rustc_earlier_on_path_is_not_pinned() {
+        let stray = unique_tempdir("stray_rustc");
+        write_fake_bin(&stray, "rustc");
+        let mux = unique_tempdir("mux_after_stray");
+        write_fake_bin(&mux, "cargo");
+        let mux_rustc = write_fake_bin(&mux, "rustc");
+        let path = path_of(&[&stray, &mux]);
+        let env = env_of(&[("PATH", &path)]);
 
-        let (path, source) = resolve_cargo_binary();
-        assert_eq!(path, PathBuf::from("cargo"));
-        assert_eq!(source, ResolutionSource::PathLookup);
-        assert_eq!(source.step(), 3);
+        let tc = resolve_toolchain(&env);
+        assert_eq!(tc.rustc, Some(mux_rustc));
     }
 
     #[test]
-    fn unset_home_does_not_panic() {
-        let _g = ENV_LOCK.lock().unwrap();
-        let guard = EnvGuard::snapshot(&["CARGO", "CARGO_HOME", "HOME", "USERPROFILE"]);
-        guard.unset("CARGO");
-        guard.unset("CARGO_HOME");
-        guard.unset("HOME");
-        guard.unset("USERPROFILE");
+    fn cargo_home_used_only_when_path_has_no_cargo() {
+        let empty = unique_tempdir("empty_path_dir");
+        let home = unique_tempdir("cargo_home_fallback");
+        let home_bin = home.join("bin");
+        let home_cargo = write_fake_bin(&home_bin, "cargo");
+        let home_rustc = write_fake_bin(&home_bin, "rustc");
+        let path = path_of(&[&empty]);
+        let env = env_of(&[("PATH", &path), ("CARGO_HOME", home.as_os_str())]);
 
-        let (path, source) = resolve_cargo_binary();
-        assert_eq!(path, PathBuf::from("cargo"));
-        assert_eq!(source, ResolutionSource::PathLookup);
+        let tc = resolve_toolchain(&env);
+        assert_eq!(tc.cargo, home_cargo);
+        assert_eq!(tc.cargo_source, ResolutionSource::CargoHomeFallback);
+        assert_eq!(tc.cargo_source.step(), 3);
+        assert_eq!(tc.rustc, Some(home_rustc));
     }
 
     #[test]
-    fn rustc_resolution_mirrors_cargo() {
-        let _g = ENV_LOCK.lock().unwrap();
-        let guard = EnvGuard::snapshot(&["RUSTC", "CARGO_HOME", "HOME", "USERPROFILE"]);
-        let cargo_home = unique_tempdir("rustc_home");
-        let bin_dir = cargo_home.join("bin");
-        let rustc_path = write_fake_bin(&bin_dir, "rustc");
-        write_fake_bin(&bin_dir, "rustup");
-        guard.unset("RUSTC");
-        guard.set("CARGO_HOME", &cargo_home);
+    fn no_sibling_rustc_leaves_rustc_unpinned() {
+        let dir = unique_tempdir("cargo_only");
+        write_fake_bin(&dir, "cargo");
+        let elsewhere = unique_tempdir("rustc_elsewhere");
+        write_fake_bin(&elsewhere, "rustc");
+        let path = path_of(&[&dir, &elsewhere]);
+        let env = env_of(&[("PATH", &path)]);
 
-        let (path, source) = resolve_rustc_binary();
-        assert_eq!(path, rustc_path);
-        assert_eq!(source, ResolutionSource::RustupProxy);
-    }
-
-    /// Build the same env block a spawn site would, then read the `RUSTC`
-    /// override that `apply_rustc_env_to_map` placed in it. Returns `None`
-    /// if no override is present — distinguished from inherited values via
-    /// the snapshot-then-mutate pattern in the call sites below.
-    fn rustc_in_env(env: &BTreeMap<OsString, OsString>) -> Option<PathBuf> {
-        env.get(OsStr::new("RUSTC")).map(PathBuf::from)
+        let tc = resolve_toolchain(&env);
+        assert_eq!(tc.cargo_source, ResolutionSource::Path);
+        assert_eq!(tc.rustc, None);
+        assert_eq!(tc.rustc_source, ResolutionSource::Unresolved);
     }
 
     #[test]
-    fn apply_rustc_env_pins_rustup_proxy_path() {
-        let _g = ENV_LOCK.lock().unwrap();
-        let guard = EnvGuard::snapshot(&["RUSTC", "CARGO_HOME", "HOME", "USERPROFILE"]);
-        let cargo_home = unique_tempdir("apply_rustc_proxy");
-        let bin_dir = cargo_home.join("bin");
-        let rustc_path = write_fake_bin(&bin_dir, "rustc");
-        write_fake_bin(&bin_dir, "rustup");
-        guard.unset("RUSTC");
-        guard.set("CARGO_HOME", &cargo_home);
+    fn rustc_env_var_wins_over_sibling() {
+        let dir = unique_tempdir("rustc_env");
+        write_fake_bin(&dir, "cargo");
+        write_fake_bin(&dir, "rustc");
+        let path = path_of(&[&dir]);
+        let env = env_of(&[("PATH", &path), ("RUSTC", OsStr::new("/explicit/rustc"))]);
 
-        // Start from an empty map so we test the helper's pin behaviour in
-        // isolation rather than the snapshot of the test process's env.
-        let mut env: BTreeMap<OsString, OsString> = BTreeMap::new();
-        apply_rustc_env_to_map(&mut env);
-        assert_eq!(rustc_in_env(&env), Some(rustc_path));
+        let tc = resolve_toolchain(&env);
+        assert_eq!(tc.rustc, Some(PathBuf::from("/explicit/rustc")));
+        assert_eq!(tc.rustc_source, ResolutionSource::Env);
     }
 
     #[test]
-    fn apply_rustc_env_skips_when_rustc_already_set_by_user() {
-        let _g = ENV_LOCK.lock().unwrap();
-        let guard = EnvGuard::snapshot(&["RUSTC", "CARGO_HOME", "HOME", "USERPROFILE"]);
-        // User-provided RUSTC takes precedence — we must not override it
-        // (even if it points at a non-existent file; that's the user's call).
-        guard.set("RUSTC", "/explicit/user/rustc");
-        let cargo_home = unique_tempdir("apply_rustc_userset");
-        let bin_dir = cargo_home.join("bin");
-        write_fake_bin(&bin_dir, "rustc");
-        write_fake_bin(&bin_dir, "rustup");
-        guard.set("CARGO_HOME", &cargo_home);
+    fn empty_env_does_not_panic() {
+        let tc = resolve_toolchain(&EnvMap::new());
+        assert_eq!(tc.cargo, PathBuf::from("cargo"));
+        assert_eq!(tc.cargo_source, ResolutionSource::Unresolved);
+        assert_eq!(tc.rustc, None);
+    }
 
-        // Seed the map with the user's RUSTC the way build_subprocess_env
-        // would (via std::env::vars_os).
-        let mut env: BTreeMap<OsString, OsString> = BTreeMap::new();
-        env.insert(
-            OsString::from("RUSTC"),
-            OsString::from("/explicit/user/rustc"),
-        );
-        apply_rustc_env_to_map(&mut env);
+    #[test]
+    fn unresolved_cargo_refuses_to_spawn_bare_name() {
+        let env = env_of(&[("PATH", OsStr::new(".tools"))]);
+
+        let tc = resolve_toolchain(&env);
+        assert_eq!(tc.cargo_source, ResolutionSource::Unresolved);
+        assert!(tc.cargo_program().is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_executable_cargo_is_skipped_for_later_path_entry() {
+        use std::os::unix::fs::PermissionsExt;
+        let first = unique_tempdir("noexec_first");
+        let blocked = write_fake_bin(&first, "cargo");
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let second = unique_tempdir("noexec_second");
+        let usable = write_fake_bin(&second, "cargo");
+        let path = path_of(&[&first, &second]);
+        let env = env_of(&[("PATH", &path)]);
+
+        assert_eq!(resolve_toolchain(&env).cargo, usable);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sibling_rustc_resolved_with_pathext() {
+        let dir = unique_tempdir("cmd_shims");
+        std::fs::write(dir.join("cargo.cmd"), b"@echo off\r\n").unwrap();
+        std::fs::write(dir.join("rustc.cmd"), b"@echo off\r\n").unwrap();
+        let path = path_of(&[&dir]);
+        let env = env_of(&[("PATH", &path), ("PATHEXT", OsStr::new(".EXE;.CMD"))]);
+
+        let tc = resolve_toolchain(&env);
+        assert_eq!(tc.rustc, Some(dir.join("rustc.cmd")));
+        assert_eq!(tc.rustc_source, ResolutionSource::SiblingOfCargo);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pathext_and_case_insensitive_keys_on_windows() {
+        let dir = unique_tempdir("pathext");
+        std::fs::write(dir.join("cargo.cmd"), b"@echo off\r\n").unwrap();
+        let path = path_of(&[&dir]);
+
+        let env = env_of(&[("Path", &path), ("PathExt", OsStr::new(".EXE;.CMD"))]);
+        assert_eq!(resolve_toolchain(&env).cargo, dir.join("cargo.cmd"));
+
+        let env = env_of(&[("Path", &path), ("PATHEXT", OsStr::new(".EXE"))]);
         assert_eq!(
-            rustc_in_env(&env),
-            Some(PathBuf::from("/explicit/user/rustc")),
-            "must not override user-set RUSTC"
+            resolve_toolchain(&env).cargo_source,
+            ResolutionSource::Unresolved
         );
     }
 
     #[test]
-    fn apply_rustc_env_skips_for_path_lookup() {
+    fn prepare_subprocess_honours_per_call_path_and_pins_sibling_rustc() {
         let _g = ENV_LOCK.lock().unwrap();
-        let guard = EnvGuard::snapshot(&["RUSTC", "CARGO_HOME", "HOME", "USERPROFILE"]);
-        let empty_home = unique_tempdir("apply_rustc_path");
+        let guard = EnvGuard::snapshot(&["RUSTC", "CARGO"]);
         guard.unset("RUSTC");
-        guard.set("CARGO_HOME", &empty_home);
-        // No bin/rustc under this home → resolver returns PathLookup.
+        guard.unset("CARGO");
+        let dir = unique_tempdir("per_call_path");
+        let cargo = write_fake_bin(&dir, "cargo");
+        let rustc = write_fake_bin(&dir, "rustc");
 
-        let mut env: BTreeMap<OsString, OsString> = BTreeMap::new();
-        apply_rustc_env_to_map(&mut env);
-        assert!(
-            rustc_in_env(&env).is_none(),
-            "PathLookup must not pin a concrete RUSTC path"
-        );
+        set_extra_env(vec![("PATH".into(), Some(dir.display().to_string()))]);
+        let (env, tc) = prepare_subprocess();
+        set_extra_env(Vec::new());
+
+        assert_eq!(tc.cargo, cargo);
+        assert_eq!(env_get(&env, "RUSTC"), Some(rustc.as_os_str()));
+    }
+
+    #[test]
+    fn prepare_subprocess_per_call_rustc_unset_blocks_pin() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let guard = EnvGuard::snapshot(&["RUSTC", "CARGO"]);
+        guard.unset("CARGO");
+        let dir = unique_tempdir("per_call_rustc_unset");
+        write_fake_bin(&dir, "cargo");
+        write_fake_bin(&dir, "rustc");
+
+        set_extra_env(vec![
+            ("PATH".into(), Some(dir.display().to_string())),
+            ("RUSTC".into(), None),
+        ]);
+        let (env, tc) = prepare_subprocess();
+        set_extra_env(Vec::new());
+
+        assert_eq!(env_get(&env, "RUSTC"), None);
+        assert_eq!(tc.rustc, None);
     }
 
     #[test]
@@ -2211,8 +2342,7 @@ mod tests {
             "NO_COLOR",
             "RUSTFLAGS",
         ]);
-        // Park the resolver in PathLookup so we don't pin RUSTC and complicate
-        // the assertion — we only care about the defaults + extra-env wiring.
+        // Only the defaults + extra-env wiring is under test here.
         let empty_home = unique_tempdir("build_env");
         guard.unset("RUSTC");
         guard.set("CARGO_HOME", &empty_home);
@@ -2253,13 +2383,11 @@ mod tests {
     }
 
     #[test]
-    fn apply_subprocess_env_installs_explicit_block_on_external_command() {
-        // Regression: ad-hoc external commands (plugin probes etc.) that
-        // route through `apply_subprocess_env` must see the same env block
-        // we install on a real cargo child — including the caller's
-        // per-call `set_extra_env` overrides. Without it, a caller who
-        // adds the install dir to `env.PATH` would still see plugin
-        // probes report "missing".
+    fn cargo_command_installs_explicit_block() {
+        // Regression: ad-hoc cargo commands (plugin probes etc.) must see the
+        // same env block as a real cargo child — including per-call
+        // `set_extra_env` overrides — or an `env.PATH` adding the plugin's
+        // install dir would still see the probe report "missing".
         let _g = ENV_LOCK.lock().unwrap();
         let guard = EnvGuard::snapshot(&[
             "RUSTC",
@@ -2270,21 +2398,23 @@ mod tests {
             "NO_COLOR",
         ]);
         let empty_home = unique_tempdir("apply_subprocess_env");
+        let bin = unique_tempdir("cargo_command_bin");
+        write_fake_bin(&bin, "cargo");
         guard.unset("RUSTC");
         guard.set("CARGO_HOME", &empty_home);
         guard.unset("CARGO_TERM_COLOR");
         guard.unset("NO_COLOR");
 
-        set_extra_env(vec![(
-            "CARGO_MCP_APPLY_PROBE_VAR".into(),
-            Some("hello".into()),
-        )]);
-        let mut cmd = Command::new("does-not-need-to-exist");
-        apply_subprocess_env(&mut cmd);
+        set_extra_env(vec![
+            ("CARGO_MCP_APPLY_PROBE_VAR".into(), Some("hello".into())),
+            ("CARGO".into(), None),
+            ("PATH".into(), Some(bin.display().to_string())),
+        ]);
+        let cmd = cargo_command();
         set_extra_env(Vec::new());
+        let cmd = cmd.expect("fake cargo on PATH must resolve");
 
-        // `Command::get_envs` returns the explicit env block we installed
-        // (since `apply_subprocess_env` does `env_clear().envs(...)`).
+        // `Command::get_envs` returns the explicit block (`env_clear().envs(...)`).
         let envs: BTreeMap<OsString, Option<OsString>> = cmd
             .get_envs()
             .map(|(k, v)| (k.to_os_string(), v.map(|s| s.to_os_string())))

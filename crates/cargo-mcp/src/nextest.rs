@@ -14,7 +14,7 @@
 //! remapping (`cargo_profile` vs `nextest_profile`, `build_jobs` vs
 //! `test_threads`, etc.).
 
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use regex::Regex;
 use serde_json::Value;
@@ -48,12 +48,10 @@ pub(crate) enum NextestProbe {
 /// Probe whether `cargo nextest` is available by running
 /// `cargo nextest --version` with stdout/stderr suppressed.
 ///
-/// Uses the same cargo binary cargo-mcp would invoke for any other tool
-/// (via [`invoke::resolve_cargo_binary`]) and the same explicit
-/// environment block (built-in defaults + RUSTC pin + the caller's
-/// per-call `env` overrides installed by the dispatcher via
-/// [`invoke::set_extra_env`], applied via
-/// [`invoke::apply_subprocess_env`]). Without that env layering a
+/// Uses [`invoke::cargo_command`], so the probe runs the same cargo with the
+/// same explicit environment block (built-in defaults + RUSTC pin + the
+/// caller's per-call `env` overrides installed by the dispatcher via
+/// [`invoke::set_extra_env`]) as any other tool. Without that env layering a
 /// caller who passes `env.PATH` / `env.CARGO_HOME` to make the plugin
 /// discoverable for the real run/list would still see the probe report
 /// it as missing.
@@ -66,9 +64,10 @@ pub(crate) enum NextestProbe {
 /// **Not cached.** A user who installs nextest mid-session should be able
 /// to retry immediately without restarting the MCP server.
 pub(crate) fn probe() -> NextestProbe {
-    let (cargo_path, _src) = invoke::resolve_cargo_binary();
-    let mut cmd = Command::new(&cargo_path);
-    invoke::apply_subprocess_env(&mut cmd);
+    // Unresolved cargo isn't a nextest problem; let the real run report it.
+    let Ok(mut cmd) = invoke::cargo_command() else {
+        return NextestProbe::Installed;
+    };
     cmd.args(["nextest", "--version"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
