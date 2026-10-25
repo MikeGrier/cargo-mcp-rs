@@ -4789,14 +4789,19 @@ fn call_diagnostic(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
         None => std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
     };
 
-    let (cargo_path, cargo_source) = invoke::resolve_cargo_binary();
-    let (rustc_path, rustc_source) = invoke::resolve_rustc_binary();
+    let (env, toolchain) = invoke::prepare_subprocess();
+    let rustc_program = toolchain
+        .rustc
+        .clone()
+        .unwrap_or_else(|| std::path::PathBuf::from("rustc"));
 
-    // Run `cargo --version --verbose`. Capture failure as a string instead of
-    // failing the diagnostic — the whole point is to report the truth.
-    let cargo_version = match Command::new(&cargo_path)
+    // Capture failure as a string instead of failing the diagnostic — the
+    // whole point is to report the truth.
+    let version_of = |program: &std::path::Path| match Command::new(program)
         .args(["--version", "--verbose"])
         .current_dir(&wd_owned)
+        .env_clear()
+        .envs(&env)
         .output()
     {
         Ok(o) => serde_json::json!({
@@ -4806,50 +4811,54 @@ fn call_diagnostic(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
         }),
         Err(e) => serde_json::json!({ "error": e.to_string() }),
     };
-    let rustc_version = match Command::new(&rustc_path)
-        .args(["--version", "--verbose"])
-        .current_dir(&wd_owned)
-        .output()
-    {
-        Ok(o) => serde_json::json!({
-            "exit_code": o.status.code().unwrap_or(-1),
-            "stdout": String::from_utf8_lossy(&o.stdout).to_string(),
-            "stderr": String::from_utf8_lossy(&o.stderr).to_string(),
-        }),
-        Err(e) => serde_json::json!({ "error": e.to_string() }),
-    };
+    let cargo_version = version_of(&toolchain.cargo);
+    let rustc_version = version_of(&rustc_program);
 
     let toolchain_file = invoke::find_toolchain_file(&wd_owned);
     let toolchain_contents = toolchain_file
         .as_ref()
         .and_then(|p| std::fs::read_to_string(p).ok());
 
-    fn env_or_unset(key: &str) -> Value {
-        match std::env::var(key) {
-            Ok(v) => Value::String(v),
-            Err(_) => Value::Null,
-        }
-    }
+    let paths = |v: Vec<std::path::PathBuf>| -> Vec<String> {
+        v.iter().map(|p| p.display().to_string()).collect()
+    };
+    let cargo_home_cargo = invoke::cargo_home_dir(&env).map(|h| {
+        h.join("bin")
+            .join(if cfg!(windows) { "cargo.exe" } else { "cargo" })
+    });
+    let env_or_unset = |key: &str| -> Value {
+        invoke::env_get(&env, key)
+            .map(|v| Value::String(v.to_string_lossy().into_owned()))
+            .unwrap_or(Value::Null)
+    };
 
     let report = serde_json::json!({
         "working_dir": wd_owned.display().to_string(),
         "cargo": {
-            "path": cargo_path.display().to_string(),
-            "source": format!("{:?}", cargo_source),
-            "step": cargo_source.step(),
+            "path": toolchain.cargo.display().to_string(),
+            "source": format!("{:?}", toolchain.cargo_source),
+            "step": toolchain.cargo_source.step(),
             "version": cargo_version,
         },
         "rustc": {
-            "path": rustc_path.display().to_string(),
-            "source": format!("{:?}", rustc_source),
-            "step": rustc_source.step(),
+            "path": toolchain.rustc.as_ref().map(|p| p.display().to_string()),
+            "source": format!("{:?}", toolchain.rustc_source),
+            "pinned_via_RUSTC": toolchain.rustc_source == invoke::ResolutionSource::SiblingOfCargo,
             "version": rustc_version,
+        },
+        "path_matches": {
+            "cargo": paths(invoke::search_path("cargo", &env)),
+            "rustc": paths(invoke::search_path("rustc", &env)),
+        },
+        "cargo_home_fallback": {
+            "path": cargo_home_cargo.as_ref().map(|p| p.display().to_string()),
+            "exists": cargo_home_cargo.as_ref().is_some_and(|p| p.is_file()),
         },
         "toolchain_file": {
             "path": toolchain_file.as_ref().map(|p| p.display().to_string()),
             "contents": toolchain_contents,
         },
-        "env": {
+        "subprocess_env": {
             "PATH": env_or_unset("PATH"),
             "CARGO": env_or_unset("CARGO"),
             "RUSTC": env_or_unset("RUSTC"),

@@ -725,47 +725,43 @@ Use this whenever a cargo command appears to use the wrong toolchain.
 
 ## Toolchain resolution
 
-When cargo-mcp spawns `cargo`, it resolves the binary in this priority order
-(first match wins):
+When cargo-mcp spawns `cargo`, it resolves the binary against the child
+process's effective environment (the inherited env plus any per-call `env`
+overrides) in this priority order (first match wins):
 
 1. **`CARGO` environment variable** — if set and points to an existing file,
    that path is used. This matches cargo's own behaviour for nested
    invocations and lets you override the choice explicitly.
-2. **Rustup proxy** at `$CARGO_HOME/bin/cargo[.exe]` (default
-   `~/.cargo/bin/cargo[.exe]` — `%USERPROFILE%\.cargo\bin\cargo.exe` on
-   Windows). When found **with** a sibling `rustup` binary, this is the rustup
-   proxy and invoking it honours `rust-toolchain.toml` regardless of `PATH`
-   ordering. If the sibling rustup is missing, cargo-mcp logs a warning and
-   falls back to using the binary anyway.
-3. **`PATH` lookup** — if neither of the above produces a result, cargo-mcp
-   spawns the bare name `cargo` and lets the OS resolve it.
+2. **`PATH`** — the first `cargo` found by walking `PATH` in order (honouring
+   `PATHEXT` on Windows; relative entries are skipped). Whichever toolchain
+   manager you put first on `PATH` — rustup, a multiplexer, a distro
+   package — is the one used.
+3. **`$CARGO_HOME/bin/cargo[.exe]`** (default `~/.cargo/bin`) — only when
+   `PATH` contains no `cargo`, e.g. a GUI-launched editor with a thin `PATH`.
+4. **Bare `cargo`** — last resort; the spawn will most likely fail with a
+   clear error.
 
-The resolved path and resolution step are written to the cargo-mcp server's
-stderr (visible in VS Code's *MCP Logs: cargo* output channel) before each
-invocation.
+The resolved path and resolution step are logged (visible in VS Code's
+*MCP Logs: cargo* output channel) before each invocation.
 
 ### `rustc` is pinned alongside `cargo`
 
-Resolving only `cargo` is not enough on systems where a non-rustup directory
-containing a stray `rustc` is prepended to `PATH` ahead of the rustup proxy
-bin dir. In that situation cargo (even when correctly invoked as the rustup
-proxy) would still spawn the stray `rustc` via its own `PATH` lookup,
-silently bypassing `rust-toolchain.toml`.
+Resolving only `cargo` is not enough on systems where a directory containing
+a stray `rustc` comes earlier on `PATH` than the selected toolchain manager:
+cargo would spawn that stray `rustc` via its own `PATH` lookup.
 
-To prevent this, cargo-mcp resolves `rustc` (unless `RUSTC` is already set
-in cargo-mcp's environment) with the same env → proxy → PATH order, and
-injects `RUSTC=<resolved rustc>` into the spawned cargo's environment. The
-injection is also skipped if resolution fell through to the PATH-lookup tier
-— there is no concrete path to pin, so the spawned cargo's normal PATH-based
-`rustc` lookup applies.
-
-When `RUSTC` is pinned to the rustup proxy `rustc`, the proxy itself defers
-toolchain selection to `rust-toolchain.toml`.
+To prevent this, unless `RUSTC` is already set, cargo-mcp injects
+`RUSTC=<rustc next to the resolved cargo>` into the spawned cargo's
+environment, so `cargo` and `rustc` always come from the same place. If no
+`rustc` sits next to the resolved `cargo`, nothing is pinned and a warning is
+logged. A per-call `env: { "RUSTC": null }` also suppresses the pin.
 
 If you suspect the wrong toolchain is being used, call the `cargo_diagnostic`
-tool — it returns the resolved paths, `cargo --version --verbose` output, the
-location and contents of any `rust-toolchain.toml` found by walking ancestor
-directories, and the relevant env vars in a single report.
+tool — it returns the resolved `cargo`/`rustc` and their sources, every
+`cargo`/`rustc` match on `PATH` in order, whether the `$CARGO_HOME/bin`
+fallback exists, `--version --verbose` output, the location and contents of
+any `rust-toolchain.toml` found by walking ancestor directories, and the
+relevant variables of the environment the child process will receive.
 
 ---
 
