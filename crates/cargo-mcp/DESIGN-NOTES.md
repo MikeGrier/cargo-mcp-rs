@@ -978,4 +978,102 @@ matching `compiler-message` record when `show_incremental_notes_enabled()`
 is `false` (the default), so the same CLI flag / VS Code setting now gates
 both the stderr text and the JSON record forms consistently.
 
+## `cargo_run` and `cargo_bench`
+
+### Context
+
+A survey of which built-in `cargo` subcommands are missing from the tool
+surface, scoped to what a developer would actually reach for mid-Copilot-
+session (rather than registry/credential operations like `login`/`yank`/
+`owner`, which stay intentionally out of scope), turned up one clear gap:
+there was no way to *run* the project at all. `cargo bench` was the other
+plausible addition — related to `cargo_test` in spirit (same compile step,
+same "did the code work" question) but a genuinely distinct subcommand:
+`cargo test --benches` only compiles and executes benches as ordinary
+tests with no timing output, so it cannot substitute for real benchmark
+measurements.
+
+There is no nextest equivalent for either: nextest is exclusively a
+`#[test]` runner (it already can't run doctests, for the same reason —
+[nextest#16](https://github.com/nextest-rs/nextest/issues/16)) and has no
+benchmark-harness support at all.
+
+### `cargo_run`: reduced argument surface, `readOnlyHint` caveat
+
+`cargo run --help` accepts a much smaller flag set than every other
+build-graph tool here: package selection is `--package` only (no
+`--workspace`/`--exclude` — there is no "run everything" for a command
+that executes exactly one target), and target selection is `--bin`/
+`--example` only (no `--lib`/`--tests`/`--benches`/`--all-targets` —
+running "all" targets at once is meaningless). `push_run_target_selection`
+and an inline `--package`-only push in `call_run` model this reduced
+surface directly, rather than reusing `push_package_selection`/
+`push_target_selection` and silently ignoring properties those helpers
+would otherwise accept; the `cargo_run` JSON schema also only declares
+`package`/`bin`/`example`, so passing e.g. `workspace: true` is rejected
+by `validate_known_args` as an unknown parameter instead of a silent
+no-op.
+
+The tool's `readOnlyHint`/`destructiveHint` annotations follow the same
+convention as `cargo_test` (`readOnlyHint: true` — neither modifies the
+project's own source files), but the description explicitly calls out
+that the *executed program* can have arbitrary side effects, since that
+is a meaningfully different risk profile from every other tool here,
+which only compiles.
+
+### `cargo_run`'s timeout default
+
+Every other tool's `timeout_secs` defaults to "no timeout" when omitted —
+reasonable for `cargo_build`/`cargo_check`, which always terminate on
+their own. `cargo_run` executes arbitrary compiled code, which may not
+terminate at all (a server, an interactive prompt, a `loop {}`). Leaving
+this genuinely unbounded by default would mean an agent's first `cargo_run`
+call against an unfamiliar binary could hang the tool call indefinitely.
+
+Resolution: absent an explicit `timeout_secs`, `call_run` falls back first
+to the server-wide `default_test_timeout()` (the same
+`cargo-mcp.test.timeoutSecs` setting `cargo_test` uses, when configured),
+then to a hard-coded 30-second fallback (`DEFAULT_RUN_TIMEOUT_SECS`) — the
+same two-tier fallback pattern already used for `test_filter`'s per-test
+watchdog. This is implemented via `opt_timeout_explicit` (not the plain
+`opt_timeout`) so the three states stay distinguishable: absent → default
+applies; explicit `0` → genuinely wait forever (the caller opted out on
+purpose); positive → that budget.
+
+### `cargo_bench`: reduced compilation options
+
+`cargo bench --help` has no `--release`/`--keep-going` (release-like
+optimizations are implied by the bench profile already) — omitted from
+`push_bench_compilation_options` and from the `cargo_bench` schema for the
+same "reject, don't silently ignore" reason as `cargo_run`'s narrower
+surface above. Package selection, target selection, and manifest options
+are otherwise identical to `cargo_test`'s, so those reuse
+`push_package_selection`/`push_target_selection`/`push_manifest_options`
+unchanged. `bench_name` mirrors `cargo bench`'s bare `[BENCHNAME]`
+positional (no `--`, unlike `args`, which is nextest/test-style forwarded
+after `--`).
+
+### Output shape: shared with `cargo_test`, not duplicated per tool
+
+Both tools' output is compiler diagnostics (JSON) interleaved with the
+executed program's or bench harness's own text — structurally identical to
+`cargo_test`'s "wrap non-JSON lines" problem. Rather than duplicating
+`filter_test_ndjson`/`format_test_output` two more times (the path
+`nextest.rs` took for its own equivalent), the NDJSON-filtering core was
+extracted into `filter_streamed_ndjson(stdout, wrap_reason)` and the
+trailer/stderr assembly into `assemble_streamed_output(header, filtered,
+out)`; `filter_test_ndjson`/`format_test_output` became one-line callers
+of the shared helpers alongside the new `filter_run_ndjson`/
+`format_run_output` and `filter_bench_ndjson`/`format_bench_output`. Their
+public signatures are unchanged, so `bisect.rs`/`test_filter.rs`'s
+existing calls to `format_test_output` needed no changes.
+
+### Retry-safety
+
+`bench` was added to `IDEMPOTENT_SUBCOMMANDS` — benchmarks are expected to
+be side-effect-free the same way tests are. `run` was deliberately **not**
+added: the executed program's side effects are unknown to cargo-mcp, so a
+retry after a transient file-busy error cannot be assumed safe the way it
+can for a pure compile step.
+
 

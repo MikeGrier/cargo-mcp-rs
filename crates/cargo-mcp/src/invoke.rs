@@ -121,12 +121,16 @@ pub fn set_clear_incr_working(enabled: bool) {
 /// - `fix` — modifies source files. A partial first attempt could leave the
 ///   tree in a half-edited state; we don't want to redo edits on top of that.
 /// - `update` — mutates `Cargo.lock`. Same partial-state concern.
+/// - `run` — executes arbitrary compiled code, which can have arbitrary
+///   side effects (writes files, network calls, mutates external state);
+///   unlike every other entry here, a retry cannot be assumed side-effect-free.
 ///
 /// `clean` is included because deleting an already-(partially-)deleted
 /// directory tree is a true no-op: the end state matches the goal regardless
-/// of how many times it runs.
+/// of how many times it runs. `bench` is included on the same footing as
+/// `test` — benchmarks are expected to be side-effect-free like tests.
 const IDEMPOTENT_SUBCOMMANDS: &[&str] = &[
-    "check", "build", "test", "clippy", "fmt", "doc", "tree", "clean", "metadata",
+    "check", "build", "test", "bench", "clippy", "fmt", "doc", "tree", "clean", "metadata",
 ];
 
 /// Returns `true` iff the cargo subcommand is in [`IDEMPOTENT_SUBCOMMANDS`].

@@ -194,6 +194,18 @@ build/execute split, so their single `build-finished` is a real compile
 and reads `Cargo test: doc test [profile] finished` instead. This is what
 appears as the collapsed summary line in the VS Code chat history.
 
+**`cargo_run`** and **`cargo_bench`** follow the same "wrap non-JSON
+output lines" pattern as `cargo_test`, since the executed program (or
+bench harness / criterion reporter) writes arbitrary plain text, not
+JSON. `cargo_run`'s program stdout/stderr lines are wrapped as
+`{"reason":"x-cargo-mcp-run-output","text":"..."}`; `cargo_bench`'s
+harness output is wrapped as
+`{"reason":"x-cargo-mcp-bench-output","text":"..."}`. Both are otherwise
+shaped exactly like the `cargo_test` output above (invocation header,
+compiler diagnostics, `build-finished`, wrapped output lines, status
+trailer, optional stderr record) — just a single compile-then-run phase
+rather than `cargo_test`'s separate build/execute split.
+
 For **text-mode tools** (`fmt`, `tree`, `clean`, `update`, `fix`, `add`,
 `remove`, `publish`) only the first line (the invocation header) is
 JSON; the body that follows is the cargo child's combined stdout/stderr
@@ -213,7 +225,9 @@ list.
 | `cargo_metadata` | Workspace/package structure, dependencies, features, resolved graph (JSON) |
 | `cargo_check` | Fast compile-error checking without producing binaries (NDJSON) |
 | `cargo_build` | Full compilation; diagnostics + build status (NDJSON) |
+| `cargo_run` | Build (if needed) and execute a binary/example target, forwarding `args` to the program (NDJSON + program stdout/stderr). Defaults to a safety-net `timeout_secs` since the program can run indefinitely — pass `timeout_secs: 0` to wait forever. |
 | `cargo_test` | Run tests with optional filters; compilation JSON + harness output |
+| `cargo_bench` | Compile and run benchmark targets, with an optional `bench_name` filter and `args` forwarded to the bench binary (NDJSON + harness output) |
 | `cargo_clippy` | Lint analysis with suggested fixes (NDJSON) |
 | `cargo_fmt_check` | Verify formatting without modifying files; returns diff |
 | `cargo_fmt` | Auto-format source code in place |

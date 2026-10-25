@@ -230,7 +230,9 @@ actionable error instead of running in the wrong place.\n\n\
 | `cargo_metadata` | `cargo metadata` |\n\
 | `cargo_check` | `cargo check` |\n\
 | `cargo_build` | `cargo build` |\n\
+| `cargo_run` | `cargo run` |\n\
 | `cargo_test` | `cargo test` |\n\
+| `cargo_bench` | `cargo bench` |\n\
 | `cargo_clippy` | `cargo clippy` |\n\
 | `cargo_fmt_check` | `cargo fmt --check` |\n\
 | `cargo_fmt` | `cargo fmt` |\n\
@@ -566,6 +568,23 @@ const TEST_DOC_DESC: &str = "If true, run only documentation tests (--doc). Defa
 const NO_RUN_DESC: &str = "If true, compile the tests but do not run them (--no-run). \
      Default: false. Not supported together with `doc: true` — cargo has no way to compile \
      doctests without running them.";
+
+// `cargo_run` / `cargo_bench` specific.
+const RUN_PACKAGE_DESC: &str = "Run the target from the named package within the workspace \
+     (--package <SPEC>). Omit to run the current directory's package.";
+const PROGRAM_ARGS_DESC: &str = "Arguments to forward to the program after `--` \
+     (e.g. [\"--flag\", \"value\"]). Omit for none.";
+const BENCH_NAME_DESC: &str = "Filter: only run benchmarks whose name contains this string. \
+     Passed as a bare positional argument (no `--`) ahead of any `args`.";
+const BENCH_NO_FAIL_FAST_DESC: &str = "If true, run all benchmarks even if some fail. \
+     Default: false (stop after first failure).";
+const NO_RUN_BENCH_DESC: &str =
+    "If true, compile the benchmarks but do not run them (--no-run). Default: false.";
+const RUN_TIMEOUT_DESC: &str = "Optional wall-clock budget in seconds. Unlike cargo_build/ \
+     cargo_check, the executed program can run indefinitely (e.g. it starts a server or waits \
+     on input), so — unless you explicitly pass 0 to wait forever — this defaults to a \
+     safety-net budget (the cargo-mcp server default test timeout when configured, otherwise \
+     30 seconds) rather than never timing out. Pass a positive value for a different budget.";
 
 // Toolchain override (valid for every subcommand)
 const TOOLCHAIN_DESC: &str = "Rustup toolchain to run this command with, passed as a leading \
@@ -945,6 +964,22 @@ fn push_doc_target_selection<'a>(argv: &mut Vec<&'a str>, args: &Value, o: &'a C
     }
 }
 
+/// Append the target-selection flags supported by `cargo run`: `--bin`,
+/// `--example`. Unlike every other build-graph command, `cargo run` executes
+/// exactly one target, so it has no `--lib`/`--bins`/`--examples`/`--tests`/
+/// `--test`/`--benches`/`--bench`/`--all-targets` — running "all" targets at
+/// once is meaningless.
+fn push_run_target_selection<'a>(argv: &mut Vec<&'a str>, o: &'a CommonOpts) {
+    if let Some(b) = &o.bin {
+        argv.push("--bin");
+        argv.push(b);
+    }
+    if let Some(e) = &o.example {
+        argv.push("--example");
+        argv.push(e);
+    }
+}
+
 /// Append cargo's feature-selection flags: `--features <list>`,
 /// `--all-features`, and `--no-default-features`. Accepted by every
 /// build-graph command (check, build, test, clippy, doc, tree).
@@ -986,6 +1021,34 @@ pub(crate) fn push_compilation_options<'a>(
     }
     if keep_going && opt_bool(args, "keep_going") {
         argv.push("--keep-going");
+    }
+    if let Some(t) = &o.target {
+        argv.push("--target");
+        argv.push(t);
+    }
+    if let Some(d) = &o.target_dir {
+        argv.push("--target-dir");
+        argv.push(d);
+    }
+    if opt_bool(args, "timings") {
+        argv.push("--timings");
+    }
+}
+
+/// Append the reduced compilation-option flags supported by `cargo bench`:
+/// `--profile <NAME>`, `--jobs <N>`, `--target <TRIPLE>`, `--target-dir <DIR>`,
+/// `--timings`. Unlike every other build-graph command, `cargo bench --help`
+/// has no `--release` or `--keep-going` — the schema deliberately omits both
+/// properties (rather than silently accepting and dropping them) so passing
+/// either is rejected as an unknown parameter instead of a silent no-op.
+fn push_bench_compilation_options<'a>(argv: &mut Vec<&'a str>, args: &Value, o: &'a CommonOpts) {
+    if let Some(p) = &o.profile {
+        argv.push("--profile");
+        argv.push(p);
+    }
+    if let Some(j) = &o.jobs {
+        argv.push("--jobs");
+        argv.push(j);
     }
     if let Some(t) = &o.target {
         argv.push("--target");
@@ -1231,6 +1294,32 @@ fn opt_env(args: &Value) -> Result<invoke::ExtraEnv, Box<dyn std::error::Error>>
     Ok(out)
 }
 
+/// Extract an optional array-of-strings parameter (e.g. `args`) from JSON
+/// args. Missing or `null` returns an empty `Vec`. Any other shape — a
+/// non-array value, or an array containing a non-string element — is
+/// rejected rather than silently coerced or skipped.
+fn opt_str_array(args: &Value, key: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let Some(v) = args.get(key) else {
+        return Ok(Vec::new());
+    };
+    if v.is_null() {
+        return Ok(Vec::new());
+    }
+    let Some(arr) = v.as_array() else {
+        return Err(format!("{key} must be an array of strings, got {v}").into());
+    };
+    arr.iter()
+        .map(|el| {
+            el.as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| -> Box<dyn std::error::Error> {
+                    format!("{key} must be an array of strings; found non-string element {el}")
+                        .into()
+                })
+        })
+        .collect()
+}
+
 /// Filter `--message-format=json` NDJSON output to keep only actionable lines.
 ///
 /// Retains only `compiler-message` lines (errors and warnings) and the
@@ -1269,6 +1358,36 @@ fn filter_build_ndjson(stdout: &str) -> String {
 /// is a JSON object — so consumers can parse it with a single line-by-line
 /// JSON parser while still seeing the test output.
 fn filter_test_ndjson(stdout: &str) -> String {
+    filter_streamed_ndjson(stdout, TEST_OUTPUT_REASON)
+}
+
+/// Like [`filter_test_ndjson`] but for `cargo run`'s output: the program's own
+/// stdout is arbitrary (not libtest-shaped), so every non-cargo line — plain
+/// text or the program's own JSON — is wrapped in a [`RUN_OUTPUT_REASON`]
+/// record instead.
+fn filter_run_ndjson(stdout: &str) -> String {
+    filter_streamed_ndjson(stdout, RUN_OUTPUT_REASON)
+}
+
+/// Like [`filter_test_ndjson`] but for `cargo bench`'s output (the bench
+/// harness's `test bench_name ... bench: N ns/iter` lines, or a custom
+/// harness like criterion's own reporter), wrapped in [`BENCH_OUTPUT_REASON`].
+fn filter_bench_ndjson(stdout: &str) -> String {
+    filter_streamed_ndjson(stdout, BENCH_OUTPUT_REASON)
+}
+
+/// Shared implementation behind [`filter_test_ndjson`], [`filter_run_ndjson`],
+/// and [`filter_bench_ndjson`]: keeps compiler diagnostics (minus suppressed
+/// incremental-compilation notes, see [`compiler_message_is_incremental_note`])
+/// and the `build-finished` summary; drops only the known cargo noise records
+/// (`compiler-artifact`, `build-script-executed`) already delivered via
+/// streaming progress; wraps every other non-blank line — the tool's own
+/// harness or program output, **including JSON the program itself prints**
+/// (e.g. structured logs, which have no cargo `reason` discriminator or an
+/// unrecognised one) — in an NDJSON record tagged with `wrap_reason` so the
+/// response stays a strict, line-by-line-parseable NDJSON stream without
+/// silently losing legitimate program output.
+fn filter_streamed_ndjson(stdout: &str, wrap_reason: &str) -> String {
     stdout
         .lines()
         .filter_map(|line| {
@@ -1276,33 +1395,32 @@ fn filter_test_ndjson(stdout: &str) -> String {
                 return None;
             }
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-                // Same filtering as filter_build_ndjson: keep compiler
-                // diagnostics and the build-finished summary; drop artifact
-                // and build-script noise already delivered via streaming.
                 match v.get("reason").and_then(|r| r.as_str()) {
                     Some("compiler-message") => {
                         if !show_incremental_notes_enabled()
                             && compiler_message_is_incremental_note(&v)
                         {
-                            None
-                        } else {
-                            Some(line.to_owned())
+                            return None;
                         }
+                        return Some(line.to_owned());
                     }
-                    Some("build-finished") => Some(line.to_owned()),
-                    _ => None,
+                    Some("build-finished") => return Some(line.to_owned()),
+                    Some("compiler-artifact") | Some("build-script-executed") => return None,
+                    _ => {}
                 }
-            } else {
-                // Non-JSON line: libtest harness text or captured test stdout.
-                // Wrap in a custom NDJSON record so the stream stays parseable.
-                Some(
-                    serde_json::to_string(&serde_json::json!({
-                        "reason": TEST_OUTPUT_REASON,
-                        "text": line,
-                    }))
-                    .unwrap_or_else(|_| "{}".into()),
-                )
             }
+            // Non-JSON line (harness text, captured test stdout, or the
+            // executed program's own stdout) or a JSON line without a
+            // recognised cargo `reason` (e.g. structured logs the program
+            // itself prints). Wrap in a custom NDJSON record so the stream
+            // stays parseable without dropping the content.
+            Some(
+                serde_json::to_string(&serde_json::json!({
+                    "reason": wrap_reason,
+                    "text": line,
+                }))
+                .unwrap_or_else(|_| "{}".into()),
+            )
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -1349,10 +1467,24 @@ pub(crate) const STDERR_REASON: &str = "x-cargo-mcp-stderr";
 
 /// Discriminator for the NDJSON record that wraps one line of test harness
 /// output (libtest's `running N tests`, `test foo ... ok`, `FAILED` lines,
-/// and any captured `println!` replays) in a `cargo_test` result.
-/// Each non-JSON stdout line is wrapped individually so the whole response
-/// remains a strict NDJSON stream parseable line-by-line.
+/// and any captured `println!` replays) in a `cargo_test` result. Each
+/// non-cargo line — plain text, or JSON without a recognised cargo `reason`
+/// (e.g. a test printing its own structured log) — is wrapped individually
+/// so the whole response remains a strict NDJSON stream parseable
+/// line-by-line.
 pub(crate) const TEST_OUTPUT_REASON: &str = "x-cargo-mcp-test-output";
+
+/// Discriminator for the NDJSON record that wraps one line of the executed
+/// program's own stdout in a `cargo_run` result. The program's output is
+/// arbitrary (not libtest-shaped) and may itself be JSON (e.g. structured
+/// logs), so every non-cargo line is wrapped individually, same as
+/// [`TEST_OUTPUT_REASON`] for `cargo_test`.
+pub(crate) const RUN_OUTPUT_REASON: &str = "x-cargo-mcp-run-output";
+
+/// Discriminator for the NDJSON record that wraps one line of the bench
+/// harness's output (or a custom harness's own reporter, e.g. criterion) in
+/// a `cargo_bench` result.
+pub(crate) const BENCH_OUTPUT_REASON: &str = "x-cargo-mcp-bench-output";
 
 /// Format a [`CargoOutput`] from a `--message-format=json` invocation.
 ///
@@ -1422,6 +1554,30 @@ fn format_json_output(out: &CargoOutput, argv: &[&str], wd: Option<&str>) -> Str
 pub(crate) fn format_test_output(out: &CargoOutput, argv: &[&str], wd: Option<&str>) -> String {
     let header = invocation_header(argv, wd);
     let filtered = filter_test_ndjson(&out.stdout);
+    assemble_streamed_output(header, &filtered, out)
+}
+
+/// Like [`format_test_output`] but for `cargo run` — the program's own
+/// stdout/stderr in place of libtest harness output. Same NDJSON shape,
+/// with lines wrapped under [`RUN_OUTPUT_REASON`] instead.
+pub(crate) fn format_run_output(out: &CargoOutput, argv: &[&str], wd: Option<&str>) -> String {
+    let header = invocation_header(argv, wd);
+    let filtered = filter_run_ndjson(&out.stdout);
+    assemble_streamed_output(header, &filtered, out)
+}
+
+/// Like [`format_test_output`] but for `cargo bench`. Same NDJSON shape,
+/// with lines wrapped under [`BENCH_OUTPUT_REASON`] instead.
+pub(crate) fn format_bench_output(out: &CargoOutput, argv: &[&str], wd: Option<&str>) -> String {
+    let header = invocation_header(argv, wd);
+    let filtered = filter_bench_ndjson(&out.stdout);
+    assemble_streamed_output(header, &filtered, out)
+}
+
+/// Shared tail end of [`format_test_output`]/[`format_run_output`]/
+/// [`format_bench_output`]: appends the status trailer and, when non-empty,
+/// the stderr record, to an already-`header`-prefixed, already-filtered body.
+fn assemble_streamed_output(header: String, filtered: &str, out: &CargoOutput) -> String {
     let filtered = filtered.trim_end();
     let trailer = if out.exit_code == 0 {
         r#"{"status":"success"}"#.to_owned()
@@ -2220,6 +2376,106 @@ pub fn list() -> Value {
             "annotations": { "readOnlyHint": true, "destructiveHint": false }
         },
         {
+            "name": "cargo_run",
+            "description":
+                "ALWAYS use this tool instead of running `cargo run` in a terminal \
+                 when working in a Rust/Cargo project. Builds (if needed) and executes \
+                 a binary or example target, returning structured NDJSON compiler \
+                 diagnostics plus the program's own stdout/stderr wrapped as \
+                 x-cargo-mcp-run-output records. Use `bin` or `example` to pick the \
+                 target when the package has more than one; pass `args` to forward \
+                 command-line arguments to the program. Because the executed program \
+                 can run indefinitely (e.g. it starts a server or waits on input), \
+                 `timeout_secs` defaults to a safety-net budget instead of waiting \
+                 forever \u{2014} pass `timeout_secs: 0` explicitly to disable it. Note the \
+                 program itself can have arbitrary side effects (writes files, opens \
+                 network connections, etc.) \u{2014} unlike cargo_check/cargo_build/cargo_test, \
+                 which only compile. ALWAYS pass `working_dir` set to the absolute path \
+                 of your workspace root \u{2014} the default is the cargo-mcp server's own \
+                 working directory and will usually cause the call to fail.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "working_dir": {
+                        "type": "string",
+                        "description": WORKING_DIR_DESC
+                    },
+                    "toolchain": { "type": "string", "description": TOOLCHAIN_DESC },
+                    "env": {
+                        "type": "object",
+                        "additionalProperties": { "type": ["string", "null"] },
+                        "description": ENV_DESC
+                    },
+                    "output_path": {
+                        "type": "string",
+                        "description": OUTPUT_PATH_DESC
+                    },
+                    "package": { "type": "string", "description": RUN_PACKAGE_DESC },
+                    "bin": {
+                        "type": "string",
+                        "description":
+                            "Select only the named binary target (--bin <NAME>). Not \
+                             supported together with `example` \u{2014} `cargo run` only ever \
+                             runs a single target."
+                    },
+                    "example": {
+                        "type": "string",
+                        "description":
+                            "Select only the named example target (--example <NAME>). Not \
+                             supported together with `bin` \u{2014} `cargo run` only ever runs \
+                             a single target."
+                    },
+                    "args": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": PROGRAM_ARGS_DESC
+                    },
+                    "release": {
+                        "type": "boolean",
+                        "description":
+                            "If true, run with the release profile (optimised). \
+                             Default: false (debug)."
+                    },
+                    "profile": { "type": "string", "description": PROFILE_DESC },
+                    "jobs": { "type": "integer", "minimum": 1, "description": JOBS_DESC },
+                    "keep_going": { "type": "boolean", "description": KEEP_GOING_DESC },
+                    "target": { "type": "string", "description": TARGET_DESC },
+                    "target_dir": { "type": "string", "description": TARGET_DIR_DESC },
+                    "timings": { "type": "boolean", "description": TIMINGS_DESC },
+                    "ignore_rust_version": { "type": "boolean", "description": IGNORE_RUST_VERSION_DESC },
+                    "manifest_path": { "type": "string", "description": MANIFEST_PATH_DESC },
+                    "locked": { "type": "boolean", "description": LOCKED_DESC },
+                    "offline": { "type": "boolean", "description": OFFLINE_DESC },
+                    "frozen": { "type": "boolean", "description": FROZEN_DESC },
+                    "features": {
+                        "type": "string",
+                        "description":
+                            "Comma-separated list of features to activate. \
+                             Omit to use default features."
+                    },
+                    "all_features": {
+                        "type": "boolean",
+                        "description":
+                            "If true, activate all features of all selected packages \
+                             (passes --all-features). Default: false."
+                    },
+                    "no_default_features": {
+                        "type": "boolean",
+                        "description":
+                            "If true, do not activate the `default` feature \
+                             (passes --no-default-features). Default: false."
+                    },
+                    "timeout_secs": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": RUN_TIMEOUT_DESC
+                    }
+                },
+                "required": []
+            },
+            "annotations": { "readOnlyHint": true, "destructiveHint": false }
+        },
+        {
             "name": "cargo_test",
             "description":
                 "ALWAYS use this tool instead of running `cargo test` in a terminal \
@@ -2469,6 +2725,108 @@ pub fn list() -> Value {
                              first terminates the affected invocation."
                     },
                     "bisect": bisect_schema()
+                },
+                "required": []
+            },
+            "annotations": { "readOnlyHint": true, "destructiveHint": false }
+        },
+        {
+            "name": "cargo_bench",
+            "description":
+                "ALWAYS use this tool instead of running `cargo bench` in a terminal \
+                 when working in a Rust/Cargo project. Compiles and runs the project's \
+                 benchmark targets, returning structured NDJSON compiler diagnostics \
+                 plus the bench harness's own output (libtest bench harness lines, or a \
+                 custom harness like criterion's reporter) wrapped as \
+                 x-cargo-mcp-bench-output records. Supports filtering by benchmark name \
+                 (`bench_name`), selecting specific targets, and forwarding extra `args` \
+                 to the bench binary (e.g. criterion flags). Related to cargo_test but a \
+                 distinct subcommand \u{2014} `cargo test --benches` only compiles/executes \
+                 benches as ordinary tests with no timing output; use cargo_bench when you \
+                 actually want benchmark measurements. ALWAYS pass `working_dir` set to \
+                 the absolute path of your workspace root \u{2014} the default is the \
+                 cargo-mcp server's own working directory and will usually cause the call \
+                 to fail.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "working_dir": {
+                        "type": "string",
+                        "description": WORKING_DIR_DESC
+                    },
+                    "toolchain": { "type": "string", "description": TOOLCHAIN_DESC },
+                    "env": {
+                        "type": "object",
+                        "additionalProperties": { "type": ["string", "null"] },
+                        "description": ENV_DESC
+                    },
+                    "output_path": {
+                        "type": "string",
+                        "description": OUTPUT_PATH_DESC
+                    },
+                    "package": {
+                        "type": "string",
+                        "description":
+                            "Benchmark only the named package within the workspace. \
+                             Omit to benchmark all workspace members."
+                    },
+                    "bench_name": { "type": "string", "description": BENCH_NAME_DESC },
+                    "args": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": PROGRAM_ARGS_DESC
+                    },
+                    "no_fail_fast": { "type": "boolean", "description": BENCH_NO_FAIL_FAST_DESC },
+                    "no_run": { "type": "boolean", "description": NO_RUN_BENCH_DESC },
+                    "workspace": { "type": "boolean", "description": WORKSPACE_DESC },
+                    "exclude": { "type": "string", "description": EXCLUDE_DESC },
+                    "lib": { "type": "boolean", "description": LIB_DESC },
+                    "bins": { "type": "boolean", "description": BINS_DESC },
+                    "bin": { "type": "string", "description": BIN_DESC },
+                    "examples": { "type": "boolean", "description": EXAMPLES_DESC },
+                    "example": { "type": "string", "description": EXAMPLE_DESC },
+                    "tests": { "type": "boolean", "description": TESTS_DESC },
+                    "test": { "type": "string", "description": TEST_TARGET_DESC },
+                    "benches": { "type": "boolean", "description": BENCHES_DESC },
+                    "bench": { "type": "string", "description": BENCH_DESC },
+                    "all_targets": { "type": "boolean", "description": ALL_TARGETS_DESC },
+                    "profile": { "type": "string", "description": PROFILE_DESC },
+                    "jobs": { "type": "integer", "minimum": 1, "description": JOBS_DESC },
+                    "target": { "type": "string", "description": TARGET_DESC },
+                    "target_dir": { "type": "string", "description": TARGET_DIR_DESC },
+                    "timings": { "type": "boolean", "description": TIMINGS_DESC },
+                    "ignore_rust_version": { "type": "boolean", "description": IGNORE_RUST_VERSION_DESC },
+                    "manifest_path": { "type": "string", "description": MANIFEST_PATH_DESC },
+                    "locked": { "type": "boolean", "description": LOCKED_DESC },
+                    "offline": { "type": "boolean", "description": OFFLINE_DESC },
+                    "frozen": { "type": "boolean", "description": FROZEN_DESC },
+                    "features": {
+                        "type": "string",
+                        "description":
+                            "Comma-separated list of features to activate. \
+                             Omit to use default features."
+                    },
+                    "all_features": {
+                        "type": "boolean",
+                        "description":
+                            "If true, activate all features of all selected packages \
+                             (passes --all-features). Default: false."
+                    },
+                    "no_default_features": {
+                        "type": "boolean",
+                        "description":
+                            "If true, do not activate the `default` feature \
+                             (passes --no-default-features). Default: false."
+                    },
+                    "timeout_secs": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description":
+                            "Optional wall-clock budget in seconds. When the budget elapses, \
+                             cargo and the entire subprocess tree are terminated and the call \
+                             returns a timeout error. 0 or omitted means no timeout \
+                             (the default)."
+                    }
                 },
                 "required": []
             },
@@ -3548,7 +3906,9 @@ fn tool_requires_manifest(name: &str) -> bool {
         "cargo_metadata"
             | "cargo_check"
             | "cargo_build"
+            | "cargo_run"
             | "cargo_test"
+            | "cargo_bench"
             | "cargo_clippy"
             | "cargo_fmt_check"
             | "cargo_fmt"
@@ -3688,8 +4048,10 @@ fn compute_resolved_package_count(wd: Option<&str>, tc: Option<&str>) -> Option<
 /// Emit the up-front progress-total control record to the streaming callback,
 /// so the tracker can render an accurate denominator. Best-effort and only
 /// meaningful when a progress callback is active; no-op when metadata cannot
-/// be resolved.
-fn emit_progress_total(
+/// be resolved. Shared by `cargo_check`/`cargo_build`/`cargo_run`/`cargo_test`/
+/// `cargo_bench`/`cargo_clippy`/`cargo_doc` in this module and
+/// `cargo_nextest_run` in `nextest.rs`.
+pub(crate) fn emit_progress_total(
     on_progress: &mut Option<&mut dyn FnMut(&str)>,
     wd: Option<&str>,
     tc: Option<&str>,
@@ -3711,7 +4073,9 @@ pub fn tool_names() -> Vec<&'static str> {
         "cargo_metadata",
         "cargo_check",
         "cargo_build",
+        "cargo_run",
         "cargo_test",
+        "cargo_bench",
         "cargo_clippy",
         "cargo_fmt_check",
         "cargo_fmt",
@@ -3813,7 +4177,9 @@ fn call_inner(
         "cargo_metadata" => call_metadata(args).map(ToolResult::text_ok),
         "cargo_check" => call_check(args, on_progress),
         "cargo_build" => call_build(args, on_progress),
+        "cargo_run" => call_run(args, on_progress),
         "cargo_test" => call_test(args, on_progress),
+        "cargo_bench" => call_bench(args, on_progress),
         "cargo_clippy" => call_clippy(args, on_progress),
         "cargo_fmt_check" => call_fmt_check(args),
         "cargo_fmt" => call_fmt(args),
@@ -3966,6 +4332,85 @@ fn call_build(
     let out = run_cargo_maybe_streaming(&argv, wd, opt_timeout(args)?, None, on_progress)?;
     let is_error = out.exit_code != 0;
     let body = format_json_output(&out, &argv, wd);
+    let text = write_output_path_and_summarize(body, output_path, wd, SummaryKind::Build)?;
+    Ok(ToolResult::Text { text, is_error })
+}
+
+/// Hard-coded fallback for `cargo_run`'s timeout when neither the caller nor
+/// the server-wide test-timeout default supplies one. Mirrors the pattern
+/// used for `test_filter`'s per-test watchdog fallback: a sensible default is
+/// applied rather than leaving the run genuinely unbounded, since — unlike
+/// `cargo_build`/`cargo_check` — the executed program can run indefinitely
+/// (e.g. it starts a server or waits on stdin).
+const DEFAULT_RUN_TIMEOUT_SECS: u64 = 30;
+
+/// Resolve `cargo_run`'s effective timeout. Three states, same convention as
+/// [`opt_timeout_explicit`]: absent → falls back to the server-wide
+/// `default_test_timeout()` when configured, else [`DEFAULT_RUN_TIMEOUT_SECS`]
+/// — unlike every other tool, `cargo_run` never treats "absent" as "wait
+/// forever" (see the `cargo_run` design notes for why). Explicit `0` still
+/// means "wait forever" — the caller opted out of the safety net on purpose.
+/// Explicit positive value is used unclamped.
+fn resolve_run_timeout(
+    args: &Value,
+) -> Result<Option<std::time::Duration>, Box<dyn std::error::Error>> {
+    Ok(match opt_timeout_explicit(args)? {
+        Some(explicit) => explicit,
+        None => Some(
+            default_test_timeout()
+                .unwrap_or(std::time::Duration::from_secs(DEFAULT_RUN_TIMEOUT_SECS)),
+        ),
+    })
+}
+
+fn call_run(
+    args: &Value,
+    on_progress: Option<&mut dyn FnMut(&str)>,
+) -> Result<ToolResult, Box<dyn std::error::Error>> {
+    let wd = opt_str(args, "working_dir");
+    let output_path = opt_str(args, "output_path");
+    if let Some(p) = output_path {
+        validate_relative_output_path(p, wd)?;
+    }
+    let tc = toolchain_arg(args);
+    let o = CommonOpts::from_args(args);
+    if o.bin.is_some() && o.example.is_some() {
+        return Err(
+            "bin and example are not supported together on cargo_run; `cargo run` only ever \
+             runs a single target. Pass just one."
+                .into(),
+        );
+    }
+    let prog_args = opt_str_array(args, "args")?;
+    // `cargo run` only ever runs one target, so package selection is just
+    // `--package` — no `--workspace`/`--exclude` (there is nothing to run
+    // "all of").
+    let mut argv: Vec<&str> = vec!["run", "--message-format=json"];
+    if let Some(p) = &o.package {
+        argv.push("--package");
+        argv.push(p);
+    }
+    push_run_target_selection(&mut argv, &o);
+    push_feature_flags(&mut argv, args, &o);
+    push_compilation_options(&mut argv, args, &o, true);
+    push_manifest_options(&mut argv, args, &o, true);
+    if let Some(ref t) = tc {
+        argv.insert(0, t);
+    }
+    if !prog_args.is_empty() {
+        argv.push("--");
+        for a in &prog_args {
+            argv.push(a);
+        }
+    }
+
+    let timeout = resolve_run_timeout(args)?;
+
+    let mut on_progress = on_progress;
+    emit_progress_total(&mut on_progress, wd, tc.as_deref());
+    let out = run_cargo_maybe_streaming(&argv, wd, timeout, None, on_progress)?;
+    let is_error = out.exit_code != 0;
+    let body = format_run_output(&out, &argv, wd);
     let text = write_output_path_and_summarize(body, output_path, wd, SummaryKind::Build)?;
     Ok(ToolResult::Text { text, is_error })
 }
@@ -4197,6 +4642,55 @@ fn call_test_unfiltered(
     let is_error = exec_out.exit_code != 0;
     let body = format_test_output(&combined, &exec_argv, wd);
     let text = write_output_path_and_summarize(body, output_path, wd, SummaryKind::Test)?;
+    Ok(ToolResult::Text { text, is_error })
+}
+
+fn call_bench(
+    args: &Value,
+    on_progress: Option<&mut dyn FnMut(&str)>,
+) -> Result<ToolResult, Box<dyn std::error::Error>> {
+    let wd = opt_str(args, "working_dir");
+    let output_path = opt_str(args, "output_path");
+    if let Some(p) = output_path {
+        validate_relative_output_path(p, wd)?;
+    }
+    let tc = toolchain_arg(args);
+    let o = CommonOpts::from_args(args);
+    let bench_name = opt_str(args, "bench_name").map(str::to_owned);
+    let prog_args = opt_str_array(args, "args")?;
+    let mut argv: Vec<&str> = vec!["bench", "--message-format=json"];
+    push_package_selection(&mut argv, args, &o);
+    push_target_selection(&mut argv, args, &o);
+    push_feature_flags(&mut argv, args, &o);
+    push_bench_compilation_options(&mut argv, args, &o);
+    push_manifest_options(&mut argv, args, &o, true);
+    if opt_bool(args, "no_fail_fast") {
+        argv.push("--no-fail-fast");
+    }
+    if opt_bool(args, "no_run") {
+        argv.push("--no-run");
+    }
+    if let Some(ref t) = tc {
+        argv.insert(0, t);
+    }
+    // `[BENCHNAME]` is a bare positional (no `--`); forwarded program `args`
+    // (for the bench binary / a custom harness like criterion) go after `--`.
+    if let Some(n) = &bench_name {
+        argv.push(n);
+    }
+    if !prog_args.is_empty() {
+        argv.push("--");
+        for a in &prog_args {
+            argv.push(a);
+        }
+    }
+
+    let mut on_progress = on_progress;
+    emit_progress_total(&mut on_progress, wd, tc.as_deref());
+    let out = run_cargo_maybe_streaming(&argv, wd, opt_timeout(args)?, None, on_progress)?;
+    let is_error = out.exit_code != 0;
+    let body = format_bench_output(&out, &argv, wd);
+    let text = write_output_path_and_summarize(body, output_path, wd, SummaryKind::Build)?;
     Ok(ToolResult::Text { text, is_error })
 }
 
@@ -4949,6 +5443,67 @@ mod tests {
         );
     }
 
+    #[test]
+    fn format_run_output_wraps_program_stdout() {
+        let stdout = "{\"reason\":\"build-finished\",\"success\":true}\nhello from the program\n";
+        let out = fake_output(0, stdout, "");
+        let formatted = format_run_output(&out, &["run"], None);
+        assert_pure_ndjson(&formatted);
+        assert!(formatted.contains(RUN_OUTPUT_REASON));
+        assert!(formatted.contains("hello from the program"));
+        assert!(formatted.contains(r#""status":"success""#));
+    }
+
+    #[test]
+    fn format_bench_output_wraps_harness_output() {
+        let stdout = "{\"reason\":\"build-finished\",\"success\":true}\ntest my_bench ... bench: 100 ns/iter (+/- 5)\n";
+        let out = fake_output(0, stdout, "");
+        let formatted = format_bench_output(&out, &["bench"], None);
+        assert_pure_ndjson(&formatted);
+        assert!(formatted.contains(BENCH_OUTPUT_REASON));
+        assert!(formatted.contains("ns/iter"));
+        assert!(formatted.contains(r#""status":"success""#));
+    }
+
+    #[test]
+    fn filter_run_ndjson_preserves_programs_own_json_output() {
+        // Regression test: a line the executed program itself prints as
+        // structured JSON (e.g. a logger) has no cargo `reason` discriminator
+        // (or an unrecognised one) and must be wrapped, not silently dropped,
+        // the same way a plain-text program stdout line would be.
+        let stdout = "{\"reason\":\"build-finished\",\"success\":true}\n\
+             {\"level\":\"info\",\"msg\":\"listening on :8080\"}\n\
+             {\"reason\":\"some-future-cargo-record\",\"detail\":1}\n";
+        let filtered = filter_run_ndjson(stdout);
+        assert!(
+            filtered.contains("listening on :8080"),
+            "program's own JSON output should be preserved, not dropped:\n{filtered}"
+        );
+        assert!(
+            filtered.contains("some-future-cargo-record"),
+            "unrecognised-reason JSON should be wrapped, not dropped:\n{filtered}"
+        );
+        let wrapped_count = filtered.matches(RUN_OUTPUT_REASON).count();
+        assert_eq!(
+            wrapped_count, 2,
+            "expected both non-cargo lines wrapped:\n{filtered}"
+        );
+    }
+
+    #[test]
+    fn filter_run_ndjson_still_drops_known_cargo_noise() {
+        // compiler-artifact / build-script-executed remain dropped: they are
+        // already delivered via streaming progress and are not the program's
+        // own output.
+        let stdout = "{\"reason\":\"compiler-artifact\",\"package_id\":\"foo\"}\n\
+             {\"reason\":\"build-script-executed\",\"package_id\":\"foo\"}\n\
+             {\"reason\":\"build-finished\",\"success\":true}\n";
+        let filtered = filter_run_ndjson(stdout);
+        assert!(!filtered.contains("compiler-artifact"));
+        assert!(!filtered.contains("build-script-executed"));
+        assert!(filtered.contains("build-finished"));
+    }
+
     /// The header must be a single, parseable JSON line ending in `\n`,
     /// with the documented `reason` discriminator and the argv/cwd echoed
     /// back so consumers can scan the output as pure NDJSON.
@@ -5365,6 +5920,51 @@ mod tests {
         set_default_test_timeout(None);
     }
 
+    // ── resolve_run_timeout (cargo_run) tests ─────────────────────────────────
+    // Unlike every other tool's plain `opt_timeout`, `cargo_run` never treats
+    // "absent" as "wait forever" — see the `cargo_run` design notes.
+
+    #[test]
+    fn resolve_run_timeout_absent_falls_back_to_server_default_when_set() {
+        let _g = DEFAULT_TIMEOUT_TEST_LOCK.lock().unwrap();
+        set_default_test_timeout(Some(45));
+        let args = serde_json::json!({});
+        assert_eq!(
+            resolve_run_timeout(&args).unwrap(),
+            Some(std::time::Duration::from_secs(45))
+        );
+        set_default_test_timeout(None);
+    }
+
+    #[test]
+    fn resolve_run_timeout_absent_uses_hard_coded_fallback_without_server_default() {
+        let _g = DEFAULT_TIMEOUT_TEST_LOCK.lock().unwrap();
+        set_default_test_timeout(None);
+        let args = serde_json::json!({});
+        assert_eq!(
+            resolve_run_timeout(&args).unwrap(),
+            Some(std::time::Duration::from_secs(DEFAULT_RUN_TIMEOUT_SECS))
+        );
+    }
+
+    #[test]
+    fn resolve_run_timeout_explicit_zero_waits_forever_even_with_server_default() {
+        let _g = DEFAULT_TIMEOUT_TEST_LOCK.lock().unwrap();
+        set_default_test_timeout(Some(45));
+        let args = serde_json::json!({"timeout_secs": 0});
+        assert_eq!(resolve_run_timeout(&args).unwrap(), None);
+        set_default_test_timeout(None);
+    }
+
+    #[test]
+    fn resolve_run_timeout_explicit_positive_value_wins() {
+        let args = serde_json::json!({"timeout_secs": 120});
+        assert_eq!(
+            resolve_run_timeout(&args).unwrap(),
+            Some(std::time::Duration::from_secs(120))
+        );
+    }
+
     #[test]
     fn call_test_rejects_doc_with_test_timeout_secs() {
         let args = serde_json::json!({"doc": true, "test_timeout_secs": 30});
@@ -5528,6 +6128,52 @@ mod tests {
     }
 
     #[test]
+    fn validate_known_args_cargo_run_accepts_bin_example_and_args() {
+        // `bin` and `example` are each valid keys individually (checked
+        // separately here, not combined — `call_run` rejects that
+        // combination; see call_run_rejects_bin_with_example).
+        let with_bin =
+            serde_json::json!({ "bin": "mybin", "args": ["--flag"], "timeout_secs": 10 });
+        assert!(validate_known_args("cargo_run", &with_bin).is_ok());
+        let with_example = serde_json::json!({ "example": "myex" });
+        assert!(validate_known_args("cargo_run", &with_example).is_ok());
+    }
+
+    #[test]
+    fn validate_known_args_cargo_run_rejects_workspace_and_all_targets() {
+        // `cargo run` only ever runs one target; `--workspace`/`--all-targets`
+        // don't exist for it, so these must be rejected rather than silently
+        // dropped.
+        let err = validate_known_args("cargo_run", &serde_json::json!({ "workspace": true }))
+            .unwrap_err();
+        assert!(err.to_string().contains("workspace"));
+        let err = validate_known_args("cargo_run", &serde_json::json!({ "all_targets": true }))
+            .unwrap_err();
+        assert!(err.to_string().contains("all_targets"));
+    }
+
+    #[test]
+    fn validate_known_args_cargo_bench_accepts_bench_name_and_args() {
+        let args = serde_json::json!({
+            "bench_name": "my_bench",
+            "args": ["--save-baseline", "main"],
+            "all_targets": true,
+        });
+        assert!(validate_known_args("cargo_bench", &args).is_ok());
+    }
+
+    #[test]
+    fn validate_known_args_cargo_bench_rejects_release_and_keep_going() {
+        // cargo bench --help has no --release/--keep-going.
+        let err = validate_known_args("cargo_bench", &serde_json::json!({ "release": true }))
+            .unwrap_err();
+        assert!(err.to_string().contains("release"));
+        let err = validate_known_args("cargo_bench", &serde_json::json!({ "keep_going": true }))
+            .unwrap_err();
+        assert!(err.to_string().contains("keep_going"));
+    }
+
+    #[test]
     fn normalize_working_directory_alias_renames_to_working_dir() {
         let args = serde_json::json!({ "working_directory": "/ws", "package": "foo" });
         let normalized = normalize_working_directory_alias(&args);
@@ -5584,6 +6230,13 @@ mod tests {
         let args = serde_json::json!({ "working_dir": "/definitely/not/a/crate" });
         assert!(ensure_manifest_discoverable("cargo_setup", &args).is_ok());
         assert!(ensure_manifest_discoverable("cargo_diagnostic", &args).is_ok());
+    }
+
+    #[test]
+    fn ensure_manifest_discoverable_requires_manifest_for_run_and_bench() {
+        let args = serde_json::json!({ "working_dir": "/definitely/not/a/crate" });
+        assert!(ensure_manifest_discoverable("cargo_run", &args).is_err());
+        assert!(ensure_manifest_discoverable("cargo_bench", &args).is_err());
     }
 
     #[test]
@@ -5739,6 +6392,20 @@ mod tests {
                 assert!(e.to_string().contains("filter"));
             }
             Ok(_) => panic!("expected test_name + filter to be rejected"),
+        }
+    }
+
+    #[test]
+    fn call_run_rejects_bin_with_example() {
+        // `cargo run` only ever runs a single target; rejected before any
+        // cargo subprocess is spawned (no working_dir needed).
+        let args = serde_json::json!({ "bin": "a", "example": "b" });
+        match call_run(&args, None) {
+            Err(e) => {
+                assert!(e.to_string().contains("bin"));
+                assert!(e.to_string().contains("example"));
+            }
+            Ok(_) => panic!("expected bin + example to be rejected"),
         }
     }
 
@@ -5933,6 +6600,61 @@ mod tests {
         assert!(with.contains(&"--ignore-rust-version"));
     }
 
+    #[test]
+    fn push_run_target_selection_emits_bin_only() {
+        // `bin` and `example` are tested separately, never combined —
+        // `call_run` rejects that combination before this helper ever runs
+        // (see call_run_rejects_bin_with_example).
+        let args = serde_json::json!({ "bin": "mybin" });
+        let o = CommonOpts::from_args(&args);
+        let mut argv: Vec<&str> = vec!["run"];
+        push_run_target_selection(&mut argv, &o);
+        assert_eq!(argv, vec!["run", "--bin", "mybin"]);
+    }
+
+    #[test]
+    fn push_run_target_selection_emits_example_only() {
+        let args = serde_json::json!({ "example": "myex" });
+        let o = CommonOpts::from_args(&args);
+        let mut argv: Vec<&str> = vec!["run"];
+        push_run_target_selection(&mut argv, &o);
+        assert_eq!(argv, vec!["run", "--example", "myex"]);
+    }
+
+    #[test]
+    fn push_run_target_selection_omits_absent_targets() {
+        let args = serde_json::json!({});
+        let o = CommonOpts::from_args(&args);
+        let mut argv: Vec<&str> = vec!["run"];
+        push_run_target_selection(&mut argv, &o);
+        assert_eq!(argv, vec!["run"]);
+    }
+
+    #[test]
+    fn push_bench_compilation_options_emits_supported_flags_only() {
+        // cargo bench --help has no --release/--keep-going; confirm neither
+        // ever gets pushed even when the caller supplies `release: true`.
+        let args = serde_json::json!({
+            "release": true,
+            "profile": "dist",
+            "jobs": 4,
+            "target": "x86_64-unknown-linux-gnu",
+            "target_dir": "out",
+            "timings": true,
+        });
+        let o = CommonOpts::from_args(&args);
+        let mut argv: Vec<&str> = vec!["bench"];
+        push_bench_compilation_options(&mut argv, &args, &o);
+        assert!(!argv.contains(&"--release"));
+        assert!(!argv.contains(&"--keep-going"));
+        assert!(argv.contains(&"--profile"));
+        assert!(argv.contains(&"dist"));
+        assert!(argv.contains(&"--jobs"));
+        assert!(argv.contains(&"--target"));
+        assert!(argv.contains(&"--target-dir"));
+        assert!(argv.contains(&"--timings"));
+    }
+
     // ── opt_env tests ────────────────────────────────────────────────────────
 
     #[test]
@@ -6001,6 +6723,41 @@ mod tests {
         assert!(opt_env(&bad_key).is_err());
         let bad_val = serde_json::json!({ "env": { "K": "x\u{0000}y" } });
         assert!(opt_env(&bad_val).is_err());
+    }
+
+    // ── opt_str_array tests (cargo_run's / cargo_bench's `args`) ─────────────
+
+    #[test]
+    fn opt_str_array_absent_returns_empty() {
+        let args = serde_json::json!({});
+        assert_eq!(opt_str_array(&args, "args").unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn opt_str_array_null_returns_empty() {
+        let args = serde_json::json!({ "args": null });
+        assert_eq!(opt_str_array(&args, "args").unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn opt_str_array_parses_strings() {
+        let args = serde_json::json!({ "args": ["--flag", "value"] });
+        assert_eq!(
+            opt_str_array(&args, "args").unwrap(),
+            vec!["--flag".to_owned(), "value".to_owned()]
+        );
+    }
+
+    #[test]
+    fn opt_str_array_rejects_non_array() {
+        let args = serde_json::json!({ "args": "--flag" });
+        assert!(opt_str_array(&args, "args").is_err());
+    }
+
+    #[test]
+    fn opt_str_array_rejects_non_string_element() {
+        let args = serde_json::json!({ "args": ["ok", 5] });
+        assert!(opt_str_array(&args, "args").is_err());
     }
 
     // ── output_path: path validation ─────────────────────────────────────────
@@ -6650,6 +7407,55 @@ mod tests {
         let names = tool_names();
         assert!(names.contains(&"cargo_nextest_run"));
         assert!(names.contains(&"cargo_nextest_list"));
+    }
+
+    #[test]
+    fn tool_names_includes_run_and_bench() {
+        let names = tool_names();
+        assert!(names.contains(&"cargo_run"));
+        assert!(names.contains(&"cargo_bench"));
+    }
+
+    #[test]
+    fn list_includes_run_and_bench_schemas() {
+        let v = list();
+        let arr = v.as_array().expect("list() must return a JSON array");
+        let names: Vec<&str> = arr
+            .iter()
+            .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
+            .collect();
+        assert!(names.contains(&"cargo_run"), "names: {names:?}");
+        assert!(names.contains(&"cargo_bench"), "names: {names:?}");
+
+        // cargo_run must not expose workspace-wide selectors (it only ever
+        // runs one target).
+        let run = arr
+            .iter()
+            .find(|t| t.get("name").and_then(|n| n.as_str()) == Some("cargo_run"))
+            .expect("cargo_run entry");
+        let run_props = run
+            .pointer("/inputSchema/properties")
+            .and_then(|p| p.as_object())
+            .expect("cargo_run inputSchema.properties");
+        assert!(!run_props.contains_key("workspace"));
+        assert!(!run_props.contains_key("all_targets"));
+        assert!(run_props.contains_key("bin"));
+        assert!(run_props.contains_key("args"));
+
+        // cargo_bench must not expose --release/--keep-going (unsupported by
+        // `cargo bench`).
+        let bench = arr
+            .iter()
+            .find(|t| t.get("name").and_then(|n| n.as_str()) == Some("cargo_bench"))
+            .expect("cargo_bench entry");
+        let bench_props = bench
+            .pointer("/inputSchema/properties")
+            .and_then(|p| p.as_object())
+            .expect("cargo_bench inputSchema.properties");
+        assert!(!bench_props.contains_key("release"));
+        assert!(!bench_props.contains_key("keep_going"));
+        assert!(bench_props.contains_key("bench_name"));
+        assert!(bench_props.contains_key("args"));
     }
 
     #[test]
