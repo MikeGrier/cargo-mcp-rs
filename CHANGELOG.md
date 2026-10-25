@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.0.0](https://github.com/MikeGrier/cargo-mcp-rs/compare/v0.12.1...v1.0.0) (2026-10-25)
+
+
+### ⚠ BREAKING CHANGES
+
+* **invoke:** a cargo earlier on PATH than ~/.cargo/bin (e.g. a toolchain multiplexer) is now used instead of the rustup proxy. Set CARGO to override. The cargo_diagnostic report key "env" is renamed to "subprocess_env".
+
+### Bug Fixes
+
+* **invoke:** address review feedback on cargo/rustc resolution ([b3d638a](https://github.com/MikeGrier/cargo-mcp-rs/commit/b3d638a92bfc1f088d97eb9f384ae545ddf0f874))
+* **invoke:** honour PATH order when resolving cargo/rustc ([80177fd](https://github.com/MikeGrier/cargo-mcp-rs/commit/80177fd2201d0604101e59666ba0f92fb2ef6121))
+
 ## [0.12.1](https://github.com/MikeGrier/cargo-mcp-rs/compare/v0.12.0...v0.12.1) (2026-08-05)
 
 
